@@ -1,0 +1,260 @@
+use super::*;
+use tower_protocol::{Capabilities, Secret};
+
+fn record(id: &str, native: Option<&str>, pid: Option<u32>) -> AgentRecord {
+    AgentRecord {
+        id: id.into(),
+        display_name: None,
+        node: "node".into(),
+        harness: "codex".into(),
+        mode: None,
+        ownership: "registered".into(),
+        trust: "weak".into(),
+        native_session_id: native.map(str::to_owned),
+        pid,
+        pid_start_time: pid.map(|_| 1),
+        cwd: "~/work/x".into(),
+        status: "unknown".into(),
+        status_detail: None,
+        caps: Capabilities::unavailable("not_implemented"),
+        pool_session: None,
+        attach_count: 0,
+        sources: vec!["cli".into()],
+        registered_at: 100,
+        updated_at: 100,
+        last_seen: 100,
+        revision: 0,
+        labels: Default::default(),
+        task_refs: Vec::new(),
+        sync_state: "synced".into(),
+    }
+}
+fn setup() -> (tempfile::TempDir, LocalStore) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = LocalStore::open(&dir.path().join("db")).unwrap();
+    store.initialize("host", "node").unwrap();
+    (dir, store)
+}
+fn rule(id: &str, action: &str) -> Rule {
+    Rule {
+        id: id.into(),
+        from: "*".into(),
+        to: "*".into(),
+        action: action.into(),
+        created_by: "human".into(),
+        created_at: 1,
+    }
+}
+fn update(id: &str, seq: u64, status: &str) -> UpdateParams {
+    UpdateParams {
+        id: id.into(),
+        token: Secret("unused-by-store".into()),
+        seq,
+        status: Some(status.into()),
+        display_name: Patch::Missing,
+        detail: Patch::Missing,
+    }
+}
+#[test]
+fn identity_is_stable_and_conflicts_do_not_merge() {
+    let (_dir, s) = setup();
+    s.register_test(record("first", None, Some(42)), b"hash")
+        .unwrap();
+    let merged = s
+        .register_test(record("discarded", Some("native"), Some(42)), b"other-hash")
+        .unwrap();
+    assert!(!merged.created);
+    assert_eq!(merged.agent.record.id, "first");
+    assert_eq!(merged.agent.token_hash, b"hash");
+    s.register_test(record("second", Some("other"), Some(43)), b"second")
+        .unwrap();
+    assert!(
+        s.register_test(record("conflict", Some("native"), Some(43)), b"bad")
+            .is_err()
+    );
+    assert_eq!(s.agents(&AgentFilter::default()).unwrap().len(), 2);
+    // Reused PID is a new process, never a match for the former identity.
+    let mut reused = record("reused", None, Some(42));
+    reused.pid_start_time = Some(2);
+    assert!(s.register_test(reused, b"new").unwrap().created);
+}
+#[test]
+fn existing_owned_identity_cannot_be_replaced_by_registration() {
+    let (_dir, s) = setup();
+    let mut owned = record("owned", Some("thread"), Some(42));
+    owned.ownership = "owned".into();
+    owned.trust = "strong".into();
+    owned.sources = vec!["launcher".into()];
+    s.register_test(owned, b"owner").unwrap();
+    let result = s
+        .register_test(record("external", Some("thread"), Some(42)), b"external")
+        .unwrap();
+    assert_eq!(result.agent.record.id, "owned");
+    assert_eq!(result.agent.record.ownership, "owned");
+    assert_eq!(result.agent.token_hash, b"owner");
+}
+#[test]
+fn partial_update_and_stale_source_order_preserve_newer_state() {
+    let (_dir, s) = setup();
+    s.register_test(record("a", Some("thread"), None), b"hash")
+        .unwrap();
+    let mut u = update("a", 10, "working");
+    u.display_name = Patch::Set("name".into());
+    u.detail = Patch::Set(Value::Object(
+        [("model".into(), Value::String("model".into()))].into(),
+    ));
+    s.update(&u, 200).unwrap();
+    u.seq = 11;
+    u.display_name = Patch::Clear;
+    u.detail = Patch::Set(Value::Object(
+        [("last_tool".into(), Value::String("Bash".into()))].into(),
+    ));
+    let revision = s.update(&u, 201).unwrap().revision;
+    let result = s.update(&update("a", 9, "idle"), 202).unwrap();
+    assert!(!result.applied);
+    assert_eq!(result.revision, revision);
+    let current = s.agent("a").unwrap();
+    assert_eq!(current.record.status, "working");
+    assert_eq!(current.record.display_name, None);
+    let Some(Value::Object(detail)) = current.record.status_detail else {
+        panic!("missing detail")
+    };
+    assert_eq!(detail.len(), 2);
+    assert!(
+        s.update(&update("a", u64::MAX, "waiting_approval"), 203)
+            .unwrap()
+            .applied
+    );
+    s.mark_unconfirmed(204).unwrap();
+    assert_eq!(s.agent("a").unwrap().seq, u64::MAX);
+    assert_eq!(s.agent("a").unwrap().record.status, "unknown");
+}
+#[test]
+fn policy_snapshot_is_atomic_separate_and_durable() {
+    let (dir, s) = setup();
+    s.put_rule(rule("local", "allow")).unwrap();
+    s.set_enrollment("allgather", Some("remote-node")).unwrap();
+    assert!(s.apply_policy(5, &[rule("remote", "deny")]).unwrap());
+    assert!(!s.apply_policy(5, &[rule("remote", "deny")]).unwrap());
+    assert!(s.apply_policy(4, &[]).is_err());
+    assert!(s.apply_policy(5, &[]).is_err());
+    assert!(
+        s.apply_policy(6, &[rule("duplicate", "allow"), rule("duplicate", "deny")])
+            .is_err()
+    );
+    let before = s.rules().unwrap();
+    assert_eq!(before.policy_revision, Some(5));
+    assert_eq!(before.allgather_rules[0].action, "deny");
+    s.replace_rules(&[]).unwrap();
+    drop(s);
+    let s = LocalStore::open(&dir.path().join("db")).unwrap();
+    let host = s.initialize("host", "new-random-name").unwrap();
+    assert_eq!(host.mode, "allgather");
+    assert_eq!(host.node_name, "remote-node");
+    let rules = s.rules().unwrap();
+    assert!(rules.local_rules.is_empty());
+    assert_eq!(rules.allgather_rules, before.allgather_rules);
+    s.set_enrollment("standalone", None).unwrap();
+    assert_eq!(s.host().unwrap().node_name, "node");
+}
+#[test]
+fn expiration_uses_confirmed_end_and_protects_active_and_pending_recovery() {
+    let (_dir, s) = setup();
+    for id in ["ended", "active", "pending"] {
+        let mut r = record(id, None, None);
+        r.ownership = "owned".into();
+        s.register_test(r, b"hash").unwrap();
+    }
+    s.unregister("ended", 200).unwrap();
+    s.unregister("pending", 200).unwrap();
+    s.set_recovery_pending("pending", true).unwrap();
+    s.unregister("ended", 500).unwrap();
+    assert_eq!(s.agent("ended").unwrap().ended_at, Some(200));
+    assert!(s.expire(1199, 1000).unwrap().is_empty());
+    assert_eq!(s.expire(1200, 1000).unwrap(), vec!["ended"]);
+    assert!(s.agent("active").is_ok());
+    assert!(s.agent("pending").is_ok());
+    // Explicit registration before expiry wins over the cleanup transaction.
+    s.register_test(record("candidate", Some("reg"), None), b"hash")
+        .unwrap();
+    s.unregister("candidate", 100).unwrap();
+    s.register_test(record("ignored", Some("reg"), None), b"new")
+        .unwrap();
+    assert!(s.expire(1_000_000, 1000).unwrap().is_empty());
+    assert!(s.agent("candidate").is_ok());
+}
+#[test]
+fn token_names_are_unique_and_revocation_is_immediate() {
+    let (_dir, s) = setup();
+    let info = TokenInfo {
+        name: "test".into(),
+        scope: vec!["read".into()],
+        created_at: 10,
+        expires_at: Some(20),
+    };
+    s.issue_token(info.clone(), b"digest").unwrap();
+    assert!(s.issue_token(info, b"second").is_err());
+    assert_eq!(s.tokens().unwrap().len(), 1);
+    s.revoke_token("test").unwrap();
+    assert!(s.tokens().unwrap().is_empty());
+}
+
+#[test]
+fn registration_guard_rejects_a_different_resolved_identity_without_mutation() {
+    let (_dir, store) = setup();
+    store.register_test(record("a", None, None), b"a").unwrap();
+    store
+        .register_test(record("b", Some("native-b"), Some(42)), b"b")
+        .unwrap();
+    let before = store.agent("b").unwrap().record;
+    let mut candidate = record("new", None, Some(42));
+    candidate.display_name = Some("unauthorized change".into());
+    assert!(store.register(candidate, b"other", "a").is_err());
+    assert_eq!(store.agent("b").unwrap().record, before);
+    assert_eq!(store.agent("b").unwrap().token_hash, b"b");
+    assert!(
+        store
+            .register(record("new", None, None), b"other", "a")
+            .is_err()
+    );
+    assert_eq!(store.agents(&AgentFilter::default()).unwrap().len(), 2);
+}
+
+#[test]
+fn version_one_database_migrates_with_credentials_and_identity_intact() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(include_str!("schema.sql")).unwrap();
+    conn.pragma_update(None, "user_version", 1).unwrap();
+    let agent = record("existing", Some("native"), None);
+    conn.execute("INSERT INTO agents(id,harness,native_id,ownership,public_json,token_hash) VALUES(?1,?2,?3,?4,?5,?6)", params![agent.id,agent.harness,agent.native_session_id,agent.ownership,serde_json::to_string(&agent).unwrap(), b"credential".as_slice()]).unwrap();
+    drop(conn);
+    let store = LocalStore::open(&path).unwrap();
+    assert_eq!(
+        store.agent_by_token_hash(b"credential").unwrap().record,
+        agent
+    );
+    assert_eq!(
+        store
+            .agent_by_native_id("codex", "native")
+            .unwrap()
+            .record
+            .id,
+        "existing"
+    );
+    assert!(matches!(
+        store.agent_by_token_hash(b"wrong"),
+        Err(Error::NotFound)
+    ));
+    drop(store);
+    assert!(LocalStore::open(&path).is_ok());
+}
+
+impl LocalStore {
+    fn register_test(&self, candidate: AgentRecord, hash: &[u8]) -> Result<Registration> {
+        let target = self.registration_target(&candidate)?;
+        let expected = target.map_or_else(|| candidate.id.clone(), |a| a.record.id);
+        self.register(candidate, hash, &expected)
+    }
+}

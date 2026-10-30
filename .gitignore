@@ -1,0 +1,14 @@
+/target/
+/.direnv/
+/result
+/result-*
+.env
+.env.*
+!.env.example
+.DS_Store
+*.rs.bk
+/.agents/
+/.aws/
+/.codex/
+/AGENTS.local.md
+/CLAUDE.local.md

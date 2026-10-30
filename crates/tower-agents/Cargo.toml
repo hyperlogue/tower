@@ -1,0 +1,11 @@
+[package]
+name = "tower-agents"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Agent launchers, harness adapters, hooks, and resume support."
+
+[lints]
+workspace = true

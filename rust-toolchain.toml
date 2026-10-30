@@ -1,0 +1,5 @@
+# Keep this version aligned with fenix in flake.lock. CI checks the match.
+[toolchain]
+channel = "1.98.1"
+profile = "minimal"
+components = ["clippy", "rustfmt", "rust-src"]

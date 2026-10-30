@@ -1,0 +1,23 @@
+[package]
+name = "tower"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Command-line, MCP, and hook entry points for tower."
+
+[lints]
+workspace = true
+
+[dependencies]
+tower-protocol.workspace = true
+tower-pal.workspace = true
+towerd.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+rusqlite.workspace = true

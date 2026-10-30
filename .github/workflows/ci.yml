@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  lint:
+    name: Format and lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # Action revisions follow the existing captain-miao CI baseline.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+
+      - name: Expose the pinned Rust toolchain for the cache
+        run: |
+          rustc_path=$(nix develop --command bash -c 'command -v rustc')
+          dirname "$rustc_path" >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Verify toolchain pin
+        run: nix develop --command bash scripts/check-toolchain.sh
+
+      - name: Check Rust formatting
+        run: nix develop --command cargo fmt --all --check
+
+      - name: Check Nix formatting
+        run: nix fmt -- --check .
+
+      - name: Check workflow and shell scripts
+        run: |
+          nix develop --command actionlint
+          nix develop --command shellcheck scripts/*.sh
+          bash -n .envrc
+
+      - name: Clippy
+        run: nix develop --command cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Check Nix flake
+        run: nix flake check --print-build-logs
+
+  test:
+    name: Build and test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify Apple Silicon runner
+        if: runner.os == 'macOS'
+        run: test "$(uname -m)" = arm64
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+
+      - name: Expose the pinned Rust toolchain for the cache
+        run: |
+          rustc_path=$(nix develop --command bash -c 'command -v rustc')
+          dirname "$rustc_path" >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.os }}
+
+      - name: Build
+        run: nix develop --command cargo build --workspace --all-targets --locked
+
+      - name: Test
+        run: nix develop --command cargo test --workspace --locked
