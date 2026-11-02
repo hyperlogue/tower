@@ -16,7 +16,6 @@ terminal = ["nix/term"]
 
 [dependencies]
 tokio.workspace = true
-thiserror.workspace = true
 tempfile.workspace = true
 fs2 = "0.4"
 signal-hook = "0.3"

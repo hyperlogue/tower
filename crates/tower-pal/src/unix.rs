@@ -15,13 +15,6 @@ pub type IpcStream = UnixStream;
 pub fn uid() -> u32 {
     rustix::process::geteuid().as_raw()
 }
-pub fn secure_socket(path: &Path) -> io::Result<()> {
-    let m = fs::symlink_metadata(path)?;
-    if !m.file_type().is_socket() || m.uid() != uid() {
-        return Err(denied("unexpected socket owner or type"));
-    }
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-}
 fn denied(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, message)
 }
@@ -252,20 +245,9 @@ pub fn detach_runtime(paths: &Paths) -> io::Result<()> {
     detach_log(paths, "runtime.log")
 }
 pub fn start_runtime() -> io::Result<()> {
-    let status = Command::new(super::executable()?)
-        .args(["__runtime", "run", "--detach"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env_remove("TOWER_AGENT_TOKEN")
-        .env_remove("TOWER_AGENT_ID")
-        .env_remove("TOWER_BEARER_TOKEN")
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other("runtime startup failed"))
-    }
+    let mut command = Command::new(super::executable()?);
+    command.args(["__runtime", "run", "--detach"]);
+    start_background(command)
 }
 #[cfg(feature = "terminal")]
 pub fn detach_pool(paths: &Paths) -> io::Result<()> {
@@ -304,43 +286,7 @@ pub fn connect_blocking(path: &Path) -> io::Result<BlockingIpcStream> {
 
 #[cfg(feature = "terminal")]
 pub fn start_pool() -> io::Result<()> {
-    let paths = Paths::discover()?;
-    let mut command = if cfg!(target_os = "linux")
-        && paths
-            .config_home
-            .join("systemd/user/tower-pool.service")
-            .is_file()
-    {
-        let mut c = Command::new("systemctl");
-        c.args(["--user", "--no-block", "start", "tower-pool.service"]);
-        c
-    } else if cfg!(target_os = "macos")
-        && paths
-            .home
-            .join("Library/LaunchAgents/io.tower.tower-pool.plist")
-            .is_file()
-    {
-        let mut c = Command::new("launchctl");
-        c.args(["kickstart", &format!("gui/{}/io.tower.tower-pool", uid())]);
-        c
-    } else {
-        let mut c = Command::new(super::executable()?);
-        c.args(["__pool", "run", "--detach"]);
-        c
-    };
-    let status = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .env_remove("TOWER_AGENT_TOKEN")
-        .env_remove("TOWER_AGENT_ID")
-        .env_remove("TOWER_BEARER_TOKEN")
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other("pool startup failed"))
-    }
+    start_service(&Paths::discover()?, "tower-pool", "__pool")
 }
 pub async fn shutdown_signal() -> io::Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
@@ -352,23 +298,35 @@ pub async fn shutdown_signal() -> io::Result<()> {
 
 /// Prefer installed jobs. A fallback is detached from the terminal, not its cgroup.
 pub fn start_daemon(paths: &Paths) -> io::Result<()> {
-    let unit = paths.config_home.join("systemd/user/towerd.service");
-    let launch_job = paths
-        .home
-        .join("Library/LaunchAgents/io.tower.towerd.plist");
-    let mut command = if cfg!(target_os = "linux") && unit.is_file() {
-        let mut c = Command::new("systemctl");
-        c.args(["--user", "--no-block", "start", "towerd.service"]);
-        c
-    } else if cfg!(target_os = "macos") && launch_job.is_file() {
-        let mut c = Command::new("launchctl");
-        c.args(["kickstart", &format!("gui/{}/io.tower.towerd", uid())]);
-        c
+    start_service(paths, "towerd", "daemon")
+}
+fn start_service(paths: &Paths, name: &str, entry: &str) -> io::Result<()> {
+    let unit = format!("{name}.service");
+    let job = format!("io.tower.{name}");
+    let command = if cfg!(target_os = "linux")
+        && paths.config_home.join("systemd/user").join(&unit).is_file()
+    {
+        let mut command = Command::new("systemctl");
+        command.args(["--user", "--no-block", "start", &unit]);
+        command
+    } else if cfg!(target_os = "macos")
+        && paths
+            .home
+            .join("Library/LaunchAgents")
+            .join(format!("{job}.plist"))
+            .is_file()
+    {
+        let mut command = Command::new("launchctl");
+        command.args(["kickstart", &format!("gui/{}/{job}", uid())]);
+        command
     } else {
-        let mut c = Command::new(super::executable()?);
-        c.args(["daemon", "run", "--detach"]);
-        c
+        let mut command = Command::new(super::executable()?);
+        command.args([entry, "run", "--detach"]);
+        command
     };
+    start_background(command)
+}
+fn start_background(mut command: Command) -> io::Result<()> {
     let status = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -380,10 +338,11 @@ pub fn start_daemon(paths: &Paths) -> io::Result<()> {
         .env_remove("CODEX_THREAD_ID")
         .env_remove("CODEX_SESSION_ID")
         .status()?;
-    if !status.success() {
-        return Err(io::Error::other("daemon startup command failed"));
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other("background process startup failed"))
     }
-    Ok(())
 }
 
 pub fn process_identity(pid: u32) -> io::Result<ProcessIdentity> {

@@ -1,7 +1,7 @@
 use super::*;
-use tower_store::LocalStore;
+use tower_store::Store;
 
-fn setup() -> (tempfile::TempDir, Arc<LocalStore>, Service) {
+fn setup() -> (tempfile::TempDir, Arc<Store>, Service) {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
     let paths = Paths {
@@ -16,7 +16,7 @@ fn setup() -> (tempfile::TempDir, Arc<LocalStore>, Service) {
     };
     paths.prepare().unwrap();
     tower_pal::private_file(&paths.database, true).unwrap();
-    let store = Arc::new(LocalStore::open(&paths.database).unwrap());
+    let store = Arc::new(Store::open(&paths.database).unwrap());
     let service = Service::new(
         paths,
         store.clone(),

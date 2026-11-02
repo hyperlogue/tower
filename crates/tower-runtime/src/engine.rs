@@ -1,10 +1,11 @@
+use crate::requests::{LiveRequest, Requests};
 use crate::{
     Binding, Journal, Result, error, internal, millis, parse_time, random_id, timestamp, wire,
 };
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, VecDeque},
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::Duration,
 };
 use tokio::{
@@ -13,16 +14,6 @@ use tokio::{
 };
 use tower_protocol::{ExecutionCommand, ExecutionError, ExecutionResult, RuntimeRequest};
 
-pub(crate) struct LiveRequest {
-    pub wire: RuntimeRequest,
-    pub after_sequence: u64,
-    pub method: String,
-    pub consumed: bool,
-    pub announced: Option<(String, u64)>,
-    pub deny_decision: String,
-    pub peer_retired: Option<tokio::time::Instant>,
-}
-pub(crate) type Requests = Arc<Mutex<BTreeMap<String, LiveRequest>>>;
 pub(crate) enum Control {
     Command(ExecutionCommand),
     Stop(String),
@@ -43,7 +34,7 @@ pub(crate) fn channels() -> (
         Arc::new(Handle {
             normal,
             control,
-            requests: Arc::new(Mutex::new(BTreeMap::new())),
+            requests: Requests::default(),
         }),
         n,
         c,
@@ -63,50 +54,6 @@ fn failure(code: &str, stage: &str, effect: bool) -> ExecutionError {
         .into(),
         stage: stage.into(),
         may_have_effect: effect,
-    }
-}
-pub(crate) fn validate_reply(request: &LiveRequest, p: &Value) -> Result<Value> {
-    if request.consumed
-        || p["source_request_id"] != request.wire.source_request_id
-        || p["request_revision"] != request.wire.request_revision
-        || p["generation"] != request.wire.generation
-    {
-        return Err(error("stale_request", "Request is no longer live"));
-    }
-    let r = &p["response"];
-    if request.wire.kind == "elicitation" {
-        let payload = serde_json::to_value(&request.wire.payload).map_err(internal)?;
-        return crate::controls::answer(&request.method, &payload, r);
-    }
-    let option = if r.pointer("/outcome/outcome").and_then(Value::as_str) == Some("cancelled") {
-        "reject_once"
-    } else if r.pointer("/outcome/outcome").and_then(Value::as_str) == Some("selected") {
-        r.pointer("/outcome/optionId")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-    } else {
-        ""
-    };
-    let payload = serde_json::to_value(&request.wire.payload).map_err(internal)?;
-    if !payload["options"]
-        .as_array()
-        .is_some_and(|a| a.iter().any(|o| o["optionId"] == option))
-    {
-        return Err(error(
-            "invalid_response",
-            "Choose a current offered permission option",
-        ));
-    }
-    let allow = option == "allow_once";
-    match request.method.as_str() {
-        "session/request_permission" => Ok(r.clone()),
-        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
-            Ok(json!({"decision":if allow{"accept"}else{&request.deny_decision}}))
-        }
-        _ => Err(error(
-            "unsupported",
-            "Native request has no supported reply",
-        )),
     }
 }
 pub(crate) fn cleanup_command(c: &ExecutionCommand) -> bool {
@@ -196,15 +143,9 @@ pub(crate) async fn run(
             },
         );
     }
-    if let Ok(mut requests) = handle.requests.lock() {
-        for request in requests.values_mut() {
-            request.wire.state = "stale".into();
-            request.wire.payload = tower_protocol::Value::Object(Default::default());
-            request.wire.request_revision += 1;
-            request.consumed = true;
-        }
-    }
+    let _ = handle.requests.retire_all();
 }
+
 struct Process {
     child: tokio::process::Child,
     identity: tower_pal::ProcessIdentity,
@@ -225,18 +166,28 @@ impl Drop for Process {
         self.reader.abort();
     }
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResponseKind {
+    Initialize,
+    Session,
+    PromptStart,
+    PromptEnd,
+    Cancel,
+}
+
 struct State<'a> {
     journal: &'a Journal,
     binding: &'a Binding,
     handle: &'a Handle,
     native: String,
+    resume_native: Option<String>,
     acp: String,
     metadata: Value,
     active: Option<String>,
     stop_command: Option<String>,
     streamed: std::collections::HashSet<String>,
     turn: Option<String>,
-    pending: BTreeMap<String, (String, String)>,
+    pending: BTreeMap<String, (String, ResponseKind)>,
     counter: u64,
     queue: VecDeque<ExecutionCommand>,
     dropped: u64,
@@ -254,7 +205,11 @@ struct BufferedText {
 impl State<'_> {
     fn ready(&self) -> bool {
         if self.binding.protocol == "acp" {
-            !self.acp.is_empty() && !self.pending.values().any(|(_, kind)| kind == "session")
+            !self.acp.is_empty()
+                && !self
+                    .pending
+                    .values()
+                    .any(|(_, kind)| *kind == ResponseKind::Session)
         } else {
             !self.native.is_empty()
         }
@@ -402,31 +357,20 @@ impl State<'_> {
         method: &str,
         params: Value,
         command: &str,
-        kind: &str,
+        kind: ResponseKind,
     ) -> Result<()> {
         self.counter += 1;
         let id = format!("tower-{}", self.counter);
-        self.pending
-            .insert(id.clone(), (command.into(), kind.into()));
+        self.pending.insert(id.clone(), (command.into(), kind));
         wire::json_line(
             input,
             &json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
         )
         .await
     }
-    fn stale_requests(&self) -> Result<()> {
-        let mut requests = self.handle.requests.lock().map_err(internal)?;
-        for r in requests.values_mut().filter(|r| r.wire.state == "pending") {
-            r.wire.state = "stale".into();
-            r.wire.payload = tower_protocol::Value::Object(Default::default());
-            r.wire.request_revision += 1;
-            r.consumed = true;
-        }
-        Ok(())
-    }
     fn end_turn(&mut self, reason: &str) -> Result<()> {
         if let Some(command) = self.active.take() {
-            self.stale_requests()?;
+            self.handle.requests.retire_all()?;
             self.append(
                 "turn_end",
                 json!({"stop_reason":reason}),
@@ -483,7 +427,7 @@ async fn run_inner(
     let mut env = env;
     let native_home = tower_agents::Harness::parse(&b.harness)
         .and_then(|h| tower_agents::inventory::namespace(h, &env));
-    if b.resume_session_id.is_some() {
+    let resume_native = if b.resume_session_id.is_some() {
         let previous = journal
             .bindings(Some(&b.namespace()))?
             .into_iter()
@@ -514,7 +458,10 @@ async fn run_inner(
                 "Native history location changed since the previous execution",
             ));
         }
-    }
+        metadata["native_session_id"].as_str().map(str::to_owned)
+    } else {
+        None
+    };
     for key in [
         "TOWER_AGENT_TOKEN",
         "TOWER_BEARER_TOKEN",
@@ -608,6 +555,7 @@ async fn run_inner(
         binding: b,
         handle,
         native: String::new(),
+        resume_native,
         acp: String::new(),
         metadata: json!({"pid":identity.pid,"pid_start_time":identity.start_time,"boot_id":tower_pal::boot_id().map_err(internal)?,"native_home":native_home}),
         active: None,
@@ -633,7 +581,7 @@ async fn run_inner(
         "initialize",
         init,
         &launch.command_id,
-        "initialize",
+        ResponseKind::Initialize,
     )
     .await?;
     let mut tick = tokio::time::interval(Duration::from_millis(100));
@@ -643,7 +591,7 @@ async fn run_inner(
             command=control.recv()=>{
                 match command {
                     Some(Control::Stop(reason)) => {
-                        s.stale_requests()?;
+                        s.handle.requests.retire_all()?;
                         let _ = tower_pal::kill_protocol_group(identity);
                         process.child.wait().await.map_err(internal)?;
                         let terminated = group_terminated(identity).await;
@@ -668,22 +616,7 @@ async fn run_inner(
                 }
             }
             _=tick.tick()=>{
-                if s.handle
-                    .requests
-                    .lock()
-                    .map_err(internal)?
-                    .values()
-                    .any(|r| {
-                        !r.consumed
-                            && r.peer_retired
-                                .is_some_and(|at| at.elapsed() >= Duration::from_secs(30))
-                    })
-                {
-                    return Err(error(
-                        "private_reply_lost",
-                        "The peer retired a request without a native reply",
-                    ));
-                }
+                s.handle.requests.check_reply_timeout()?;
                 if s.text
                     .as_ref()
                     .is_some_and(|b| b.since.elapsed() >= Duration::from_millis(50))
@@ -702,7 +635,7 @@ async fn run_inner(
             }
         }
     }}.await;
-    s.stale_requests()?;
+    s.handle.requests.retire_all()?;
     let _ = input.shutdown().await;
     let _ = tower_pal::kill_protocol_group(identity);
     let reaped = tokio::time::timeout(Duration::from_secs(5), process.child.wait())
@@ -809,7 +742,7 @@ async fn dispatch(
                             params["collaborationMode"] = json!({"mode":mode,"settings":{"model":model,"reasoning_effort":config.get("effort").or_else(||s.metadata.get("effort")),"developer_instructions":null}});
                         }
                     }
-                    s.rpc(input, "turn/start", params, &c.command_id, "prompt_start")
+                    s.rpc(input, "turn/start", params, &c.command_id, ResponseKind::PromptStart)
                         .await?;
                 } else {
                     s.rpc(
@@ -817,13 +750,13 @@ async fn dispatch(
                         "session/prompt",
                         json!({"sessionId":s.acp,"prompt":blocks}),
                         &c.command_id,
-                        "prompt_end",
+                        ResponseKind::PromptEnd,
                     )
                     .await?;
                 }
             }
             "cancel" => {
-                s.stale_requests()?;
+                s.handle.requests.retire_all()?;
                 if s.binding.harness == "antigravity" {
                     return Err(error(
                         "stop_runtime",
@@ -837,7 +770,7 @@ async fn dispatch(
                             "turn/interrupt",
                             json!({"threadId":s.native,"turnId":turn}),
                             &c.command_id,
-                            "cancel",
+                            ResponseKind::Cancel,
                         )
                         .await?;
                     } else if s.active.is_some() {
@@ -854,19 +787,7 @@ async fn dispatch(
                 }
             }
             "reply" => {
-                let key = p["source_request_id"]
-                    .as_str()
-                    .ok_or_else(|| error("invalid_params", "Request occurrence required"))?;
-                let (id, result) = {
-                    let mut live = s.handle.requests.lock().map_err(internal)?;
-                    let r = live.get_mut(key).ok_or_else(|| {
-                        error("stale_request", "Request owner no longer has private state")
-                    })?;
-                    let result = validate_reply(r, &p)?;
-                    let id = serde_json::to_value(&r.wire.native_request_id).map_err(internal)?;
-                    live.remove(key);
-                    (id, result)
-                };
+                let (id, result) = s.handle.requests.take_reply(&p)?;
                 wire::json_line(input, &json!({"jsonrpc":"2.0","id":id,"result":result})).await?;
                 s.done(&c.command_id, None, None)?;
                 s.state("working")?;
@@ -1024,13 +945,7 @@ async fn native(s: &mut State<'_>, input: &mut tokio::process::ChildStdin, v: Va
                 state: "pending".into(),
                 payload: public(payload)?,
             };
-            let request_bytes = serde_json::to_vec(&request).map_err(internal)?.len();
-            if request_bytes > 256 * 1024 {
-                return Err(error(
-                    "control_capacity",
-                    "Private request exceeds its size limit",
-                ));
-            }
+            let request = LiveRequest::new(request, method, deny_decision)?;
             let mut marker = json!({"redacted":true,"kind":kind,"source_request_id":source,"request_revision":1});
             if let Some(mode) = mode {
                 marker["mode"] = json!(mode);
@@ -1051,42 +966,7 @@ async fn native(s: &mut State<'_>, input: &mut tokio::process::ChildStdin, v: Va
                 "waiting_input"
             })?;
             let after_sequence = s.journal.latest_event_sequence(s.binding)?;
-            {
-                let mut requests = s.handle.requests.lock().map_err(internal)?;
-                if requests
-                    .values()
-                    .any(|r| !r.consumed && r.wire.native_request_id == request.native_request_id)
-                {
-                    return Err(error(
-                        "native_request_conflict",
-                        "Native request identity was reused before completion",
-                    ));
-                }
-                let bytes = requests
-                    .values()
-                    .try_fold(request_bytes, |total, r| {
-                        serde_json::to_vec(&r.wire).map(|v| total + v.len())
-                    })
-                    .map_err(internal)?;
-                if requests.len() >= 32 || bytes > 1024 * 1024 {
-                    return Err(error(
-                        "control_capacity",
-                        "Too many pending native requests",
-                    ));
-                }
-                requests.insert(
-                    source.clone(),
-                    LiveRequest {
-                        wire: request,
-                        after_sequence,
-                        method: method.into(),
-                        consumed: false,
-                        announced: None,
-                        deny_decision: deny_decision.into(),
-                        peer_retired: None,
-                    },
-                );
-            }
+            s.handle.requests.insert(request, after_sequence)?;
             return Ok(());
         }
         if codex {
@@ -1170,18 +1050,7 @@ async fn native(s: &mut State<'_>, input: &mut tokio::process::ChildStdin, v: Va
                     }
                 }
                 "serverRequest/resolved" => {
-                    let id = &p["requestId"];
-                    let mut requests = s.handle.requests.lock().map_err(internal)?;
-                    for r in requests.values_mut() {
-                        if serde_json::to_value(&r.wire.native_request_id).map_err(internal)? == *id
-                            && !r.consumed
-                        {
-                            r.consumed = true;
-                            r.wire.state = "stale".into();
-                            r.wire.payload = tower_protocol::Value::Object(Default::default());
-                            r.wire.request_revision += 1;
-                        }
-                    }
+                    s.handle.requests.retire_native(&p["requestId"], "stale")?;
                 }
                 _ => {}
             }
@@ -1237,17 +1106,7 @@ async fn native(s: &mut State<'_>, input: &mut tokio::process::ChildStdin, v: Va
                 s.append(kind, update.clone(), s.active.clone(), false)?;
             }
         } else if method == "_tower/request_cancelled" {
-            let mut requests = s.handle.requests.lock().map_err(internal)?;
-            for r in requests.values_mut() {
-                if serde_json::to_value(&r.wire.native_request_id).map_err(internal)? == p["id"]
-                    && !r.consumed
-                {
-                    r.consumed = true;
-                    r.wire.state = "cancelled".into();
-                    r.wire.payload = tower_protocol::Value::Object(Default::default());
-                    r.wire.request_revision += 1;
-                }
-            }
+            s.handle.requests.retire_native(&p["id"], "cancelled")?;
         }
         return Ok(());
     }
@@ -1264,10 +1123,10 @@ async fn native(s: &mut State<'_>, input: &mut tokio::process::ChildStdin, v: Va
             Some(failure(
                 "native_rejected",
                 "execution",
-                kind == "prompt_end",
+                kind == ResponseKind::PromptEnd,
             )),
         )?;
-        if matches!(kind.as_str(), "initialize" | "session") {
+        if matches!(kind, ResponseKind::Initialize | ResponseKind::Session) {
             return Err(error("native_initialize", "Native session setup failed"));
         }
         if s.active.as_deref() == Some(&command) {
@@ -1276,8 +1135,8 @@ async fn native(s: &mut State<'_>, input: &mut tokio::process::ChildStdin, v: Va
         return Ok(());
     }
     let result = &v["result"];
-    match kind.as_str() {
-        "initialize" => {
+    match kind {
+        ResponseKind::Initialize => {
             if codex {
                 wire::json_line(input, &json!({"jsonrpc":"2.0","method":"initialized"})).await?;
                 let mut params = json!({"cwd":s.binding.cwd});
@@ -1287,7 +1146,8 @@ async fn native(s: &mut State<'_>, input: &mut tokio::process::ChildStdin, v: Va
                 } else {
                     "thread/start"
                 };
-                s.rpc(input, method, params, &command, "session").await?;
+                s.rpc(input, method, params, &command, ResponseKind::Session)
+                    .await?;
             } else {
                 if result["protocolVersion"] != 1 {
                     return Err(error(
@@ -1297,40 +1157,18 @@ async fn native(s: &mut State<'_>, input: &mut tokio::process::ChildStdin, v: Va
                 }
                 let mut params = json!({"cwd":s.binding.cwd,"mcpServers":[]});
                 let method = if let Some(id) = &s.binding.resume_session_id {
-                    let previous = s
-                        .journal
-                        .bindings(Some(&s.binding.namespace()))?
-                        .into_iter()
-                        .rev()
-                        .find(|b| {
-                            b.runtime_id != s.binding.runtime_id
-                                && b.session_id == s.binding.session_id
-                                && s.journal
-                                    .metadata(b)
-                                    .is_ok_and(|m| m["acp_session_id"].as_str() == Some(id))
-                        })
-                        .ok_or_else(|| {
-                            error("resume_unavailable", "Previous runtime binding unavailable")
-                        })?;
-                    let metadata = s.journal.metadata(&previous)?;
-                    if metadata["acp_session_id"] != *id {
-                        return Err(error(
-                            "resume_unavailable",
-                            "ACP resume identity does not match prior execution",
-                        ));
-                    }
                     params["sessionId"] = json!(id);
-                    params["_meta"] =
-                        json!({"tower.nativeSessionId":metadata["native_session_id"]});
+                    params["_meta"] = json!({"tower.nativeSessionId":s.resume_native});
                     s.acp = id.clone();
                     "session/load"
                 } else {
                     "session/new"
                 };
-                s.rpc(input, method, params, &command, "session").await?;
+                s.rpc(input, method, params, &command, ResponseKind::Session)
+                    .await?;
             }
         }
-        "session" => {
+        ResponseKind::Session => {
             if codex {
                 if result["model"].is_string() {
                     s.metadata["model"] = result["model"].clone();
@@ -1372,7 +1210,7 @@ async fn native(s: &mut State<'_>, input: &mut tokio::process::ChildStdin, v: Va
             s.state("idle")?;
             s.done(&command, None, None)?;
         }
-        "prompt_start" => {
+        ResponseKind::PromptStart => {
             s.turn = result
                 .pointer("/turn/id")
                 .and_then(Value::as_str)
@@ -1382,13 +1220,12 @@ async fn native(s: &mut State<'_>, input: &mut tokio::process::ChildStdin, v: Va
                 return Err(error("native_protocol", "Missing native turn"));
             }
         }
-        "prompt_end" => s.end_turn(if result["stopReason"] == "cancelled" {
+        ResponseKind::PromptEnd => s.end_turn(if result["stopReason"] == "cancelled" {
             "cancelled"
         } else {
             "end_turn"
         })?,
-        "cancel" => s.done(&command, None, None)?,
-        _ => {}
+        ResponseKind::Cancel => s.done(&command, None, None)?,
     }
     Ok(())
 }
@@ -1416,6 +1253,7 @@ mod tests {
             binding,
             handle,
             native: "native".into(),
+            resume_native: None,
             acp: String::new(),
             metadata: json!({}),
             active: Some("prompt".into()),

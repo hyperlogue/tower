@@ -26,7 +26,6 @@ getrandom.workspace = true
 
 axum = "0.8"
 async-stream = "0.3"
-base64 = "0.22"
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 futures-util = "0.3"

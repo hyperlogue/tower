@@ -85,7 +85,6 @@ impl Service {
         })
     }
     pub(super) fn remote_scopes(&self) -> std::result::Result<Vec<String>, RpcError> {
-        let configured = &self.allgather_config.scopes;
         let consent = tower_pal::read_private(&self.paths.state.join("allgather-consent.json"))
             .ok()
             .and_then(|bytes| {
@@ -101,16 +100,15 @@ impl Service {
                 return Ok(consent
                     .scopes
                     .into_iter()
-                    .filter(|scope| {
-                        !self.allgather_config.scopes_configured
-                            || configured
-                                .iter()
-                                .any(|s| s == scope || (scope != "acp:control" && s == "admin"))
-                    })
+                    .filter(|scope| self.allgather_config.permits_scope(scope))
                     .collect());
             }
         }
-        Ok(configured.clone())
+        Ok(self
+            .allgather_config
+            .scopes
+            .clone()
+            .unwrap_or_else(|| vec!["read".into(), "send".into()]))
     }
     pub(crate) fn remote_dispatch(
         &self,

@@ -142,7 +142,7 @@ impl Actor {
 }
 pub(super) struct Service {
     paths: Paths,
-    store: Arc<dyn Store>,
+    store: Arc<Store>,
     backends: tower_sessions::Backends,
     startup: String,
     retention_ms: u64,
@@ -163,7 +163,7 @@ pub(super) struct Service {
 impl Service {
     pub fn new(
         paths: Paths,
-        store: Arc<dyn Store>,
+        store: Arc<Store>,
         startup: &str,
         backends: tower_sessions::Backends,
     ) -> Result<Self> {

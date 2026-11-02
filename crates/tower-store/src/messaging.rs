@@ -8,30 +8,8 @@ pub struct StoredApproval {
     pub consumed: bool,
 }
 
-pub trait MessageStore: Send + Sync {
-    fn set_sync_state(&self, id: &str, state: &str) -> Result<()>;
-    fn delivery(&self, id: &str) -> Result<DeliveryEndpoint>;
-    fn set_delivery(
-        &self,
-        id: &str,
-        endpoint: &DeliveryEndpoint,
-        caps: Capabilities,
-        now: u64,
-    ) -> Result<()>;
-    fn approvals(&self) -> Result<Vec<StoredApproval>>;
-    fn approval(&self, id: &str) -> Result<StoredApproval>;
-    fn matching_approvals(
-        &self,
-        from: &str,
-        to: &str,
-        digest: &[u8],
-    ) -> Result<Vec<StoredApproval>>;
-    fn approval_count(&self) -> Result<usize>;
-    fn put_approval(&self, approval: StoredApproval, rule: Option<Rule>) -> Result<()>;
-    fn expire_approvals(&self, now: u64) -> Result<Vec<Approval>>;
-}
-impl MessageStore for LocalStore {
-    fn set_sync_state(&self, id: &str, state: &str) -> Result<()> {
+impl Store {
+    pub fn set_sync_state(&self, id: &str, state: &str) -> Result<()> {
         if !matches!(state, "pending" | "synced" | "rejected") {
             return Err(Error::Conflict("Invalid sync state"));
         }
@@ -47,7 +25,7 @@ impl MessageStore for LocalStore {
         Ok(())
     }
 
-    fn delivery(&self, id: &str) -> Result<DeliveryEndpoint> {
+    pub fn delivery(&self, id: &str) -> Result<DeliveryEndpoint> {
         let json: Option<String> = self
             .lock()?
             .query_row("SELECT data FROM delivery WHERE id=?1", [id], |r| r.get(0))
@@ -57,7 +35,7 @@ impl MessageStore for LocalStore {
             .transpose()?
             .unwrap_or_default())
     }
-    fn set_delivery(
+    pub fn set_delivery(
         &self,
         id: &str,
         endpoint: &DeliveryEndpoint,
@@ -77,7 +55,7 @@ impl MessageStore for LocalStore {
         tx.commit()?;
         Ok(())
     }
-    fn approvals(&self) -> Result<Vec<StoredApproval>> {
+    pub fn approvals(&self) -> Result<Vec<StoredApproval>> {
         let conn = self.lock()?;
         let mut query =
             conn.prepare("SELECT data,body_hash,consumed FROM approvals ORDER BY created_at DESC")?;
@@ -100,7 +78,7 @@ impl MessageStore for LocalStore {
             })
             .collect()
     }
-    fn approval(&self, id: &str) -> Result<StoredApproval> {
+    pub fn approval(&self, id: &str) -> Result<StoredApproval> {
         let conn = self.lock()?;
         let row = conn
             .query_row(
@@ -116,13 +94,13 @@ impl MessageStore for LocalStore {
             consumed: row.2,
         })
     }
-    fn approval_count(&self) -> Result<usize> {
+    pub fn approval_count(&self) -> Result<usize> {
         let count: i64 = self
             .lock()?
             .query_row("SELECT COUNT(*) FROM approvals", [], |r| r.get(0))?;
         usize::try_from(count).map_err(|_| Error::Schema)
     }
-    fn matching_approvals(
+    pub fn matching_approvals(
         &self,
         from: &str,
         to: &str,
@@ -145,7 +123,7 @@ impl MessageStore for LocalStore {
             })
             .collect()
     }
-    fn put_approval(&self, approval: StoredApproval, rule: Option<Rule>) -> Result<()> {
+    pub fn put_approval(&self, approval: StoredApproval, rule: Option<Rule>) -> Result<()> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         if let Some(rule) = rule {
@@ -165,7 +143,7 @@ impl MessageStore for LocalStore {
         tx.commit()?;
         Ok(())
     }
-    fn expire_approvals(&self, now: u64) -> Result<Vec<Approval>> {
+    pub fn expire_approvals(&self, now: u64) -> Result<Vec<Approval>> {
         let mut expired = Vec::new();
         let due: Vec<StoredApproval> = {
             let conn = self.lock()?;

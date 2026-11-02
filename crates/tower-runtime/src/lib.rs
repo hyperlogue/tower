@@ -4,6 +4,7 @@ mod controls;
 mod engine;
 mod host;
 mod journal;
+mod requests;
 mod wire;
 pub use backend::Backend;
 pub mod bridge;

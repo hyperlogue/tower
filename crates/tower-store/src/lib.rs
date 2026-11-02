@@ -1,7 +1,7 @@
 //! Transactional local persistence. Runtime observations never contain message bodies.
 
 mod messaging;
-pub use messaging::{DeliveryState, MessageStore, StoredApproval};
+pub use messaging::{DeliveryState, StoredApproval};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
@@ -58,67 +58,22 @@ pub struct StoredToken {
 }
 /// Each mutation commits its identity, revision and metadata together.
 /// Callers never receive a raw database connection.
-pub trait Store: Send + Sync + MessageStore {
-    fn set_enrollment(&self, mode: &str, node: Option<&str>) -> Result<()>;
-    fn apply_policy(&self, revision: u64, rules: &[Rule]) -> Result<bool>;
-    fn apply_policy_delta(&self, delta: &tower_protocol::PolicyDelta) -> Result<bool>;
-    fn clear_policy(&self) -> Result<()>;
-
-    fn create_managed(
-        &self,
-        record: AgentRecord,
-        hash: &[u8],
-        session: &ManagedSession,
-    ) -> Result<()>;
-    fn managed_session(&self, id: &str) -> Result<ManagedSession>;
-    fn managed_sessions(&self) -> Result<Vec<ManagedSession>>;
-    fn observe_managed(&self, protocol: &str, observation: Observation, now: u64) -> Result<()>;
-    fn disable_managed_recovery(&self, id: &str) -> Result<()>;
-    fn replace_managed(&self, session: &ManagedSession, mode: Option<&str>, now: u64)
-    -> Result<()>;
-    fn initialize(&self, host_id: &str, node_name: &str) -> Result<Host>;
-    fn host(&self) -> Result<Host>;
-    fn registration_target(&self, candidate: &AgentRecord) -> Result<Option<StoredAgent>>;
-    /// Commit only to the identity validated by the caller, including for a new record.
-    fn register(
-        &self,
-        candidate: AgentRecord,
-        hash: &[u8],
-        expected_id: &str,
-    ) -> Result<Registration>;
-    fn agent(&self, id: &str) -> Result<StoredAgent>;
-    fn agent_by_token_hash(&self, hash: &[u8]) -> Result<StoredAgent>;
-    fn agent_by_native_id(&self, harness: &str, native_id: &str) -> Result<StoredAgent>;
-    fn agents(&self, filter: &AgentFilter) -> Result<Vec<AgentRecord>>;
-    fn update(&self, update: &UpdateParams, now: u64) -> Result<UpdateResult> {
-        self.update_with_delivery(update, now, None)
-    }
-    fn update_with_delivery(
-        &self,
-        update: &UpdateParams,
-        now: u64,
-        delivery: Option<DeliveryState>,
-    ) -> Result<UpdateResult>;
-    fn heartbeat(&self, id: &str, now: u64) -> Result<()>;
-    fn unregister(&self, id: &str, now: u64) -> Result<AgentRecord>;
-    fn mark_lost(&self, id: &str, now: u64) -> Result<()>;
-    fn mark_unconfirmed(&self, now: u64) -> Result<()>;
-    fn expire(&self, now: u64, owned_retention_ms: u64) -> Result<Vec<String>>;
-    fn expiring_managed(&self, now: u64, retention_ms: u64) -> Result<Vec<ManagedSession>>;
-    fn rules(&self) -> Result<RulesView>;
-    fn put_rule(&self, rule: Rule) -> Result<()>;
-    fn remove_rule(&self, id: &str) -> Result<()>;
-    fn replace_rules(&self, rules: &[Rule]) -> Result<()>;
-    fn issue_token(&self, info: TokenInfo, hash: &[u8]) -> Result<()>;
-    fn tokens(&self) -> Result<Vec<StoredToken>>;
-    fn token_by_hash(&self, hash: &[u8]) -> Result<StoredToken>;
-    fn revoke_token(&self, name: &str) -> Result<()>;
-}
-
-pub struct LocalStore {
+pub struct Store {
     conn: Mutex<Connection>,
 }
-impl LocalStore {
+const MIGRATIONS: &[&str] = &[
+    include_str!("schema.sql"),
+    "CREATE INDEX agent_token_hash ON agents(token_hash); CREATE INDEX named_token_hash ON tokens(hash);",
+    "CREATE TABLE owned_launches(id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,data TEXT NOT NULL);",
+    include_str!("managed.sql"),
+    "ALTER TABLE managed_sessions ADD COLUMN auto_resume INTEGER NOT NULL DEFAULT 1; UPDATE managed_sessions SET auto_resume=0 WHERE launch IS NULL;",
+    "CREATE TABLE delivery(id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,data TEXT NOT NULL); CREATE TABLE approvals(id TEXT PRIMARY KEY,data TEXT NOT NULL,body_hash BLOB NOT NULL,consumed INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL); CREATE INDEX approvals_created ON approvals(created_at); CREATE INDEX approvals_expiry ON approvals(json_extract(data,'$.expires_at')) WHERE json_extract(data,'$.state')='pending';",
+    "CREATE INDEX IF NOT EXISTS approvals_expiry ON approvals(json_extract(data,'$.expires_at')) WHERE json_extract(data,'$.state')='pending'; CREATE INDEX approvals_body_hash ON approvals(body_hash);",
+    "DROP INDEX process_identity; CREATE UNIQUE INDEX process_identity ON agents(pid,pid_start) WHERE pid IS NOT NULL AND pid_start IS NOT NULL AND ownership='registered' AND coalesce(json_extract(public_json,'$.shared_process'),0)=0; CREATE INDEX process_observation ON agents(pid,pid_start);",
+    "ALTER TABLE policy_snapshot ADD COLUMN delta_hash BLOB;",
+];
+
+impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         let mut conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(5))?;
@@ -126,61 +81,13 @@ impl LocalStore {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         let version: u32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 9 {
+        if version as usize > MIGRATIONS.len() {
             return Err(Error::Schema);
         }
-        if version == 0 {
+        for (index, sql) in MIGRATIONS.iter().enumerate().skip(version as usize) {
             let tx = conn.transaction()?;
-            tx.execute_batch(include_str!("schema.sql"))?;
-            tx.pragma_update(None, "user_version", 1)?;
-            tx.commit()?;
-        }
-        if version < 2 {
-            let tx = conn.transaction()?;
-            tx.execute_batch("CREATE INDEX agent_token_hash ON agents(token_hash); CREATE INDEX named_token_hash ON tokens(hash);")?;
-            tx.pragma_update(None, "user_version", 2)?;
-            tx.commit()?;
-        }
-        if version < 3 {
-            let tx = conn.transaction()?;
-            tx.execute_batch("CREATE TABLE owned_launches(id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,data TEXT NOT NULL);")?;
-            tx.pragma_update(None, "user_version", 3)?;
-            tx.commit()?;
-        }
-        if version < 4 {
-            let tx = conn.transaction()?;
-            tx.execute_batch(include_str!("managed.sql"))?;
-            tx.pragma_update(None, "user_version", 4)?;
-            tx.commit()?;
-        }
-        if version < 5 {
-            let tx = conn.transaction()?;
-            tx.execute_batch("ALTER TABLE managed_sessions ADD COLUMN auto_resume INTEGER NOT NULL DEFAULT 1; UPDATE managed_sessions SET auto_resume=0 WHERE launch IS NULL;")?;
-            tx.pragma_update(None, "user_version", 5)?;
-            tx.commit()?;
-        }
-        if version < 6 {
-            let tx = conn.transaction()?;
-            tx.execute_batch("CREATE TABLE delivery(id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,data TEXT NOT NULL); CREATE TABLE approvals(id TEXT PRIMARY KEY,data TEXT NOT NULL,body_hash BLOB NOT NULL,consumed INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL); CREATE INDEX approvals_created ON approvals(created_at); CREATE INDEX approvals_expiry ON approvals(json_extract(data,'$.expires_at')) WHERE json_extract(data,'$.state')='pending';")?;
-            tx.pragma_update(None, "user_version", 6)?;
-            tx.commit()?;
-        }
-        if version < 7 {
-            let tx = conn.transaction()?;
-            tx.execute_batch("CREATE INDEX IF NOT EXISTS approvals_expiry ON approvals(json_extract(data,'$.expires_at')) WHERE json_extract(data,'$.state')='pending'; CREATE INDEX approvals_body_hash ON approvals(body_hash);")?;
-            tx.pragma_update(None, "user_version", 7)?;
-            tx.commit()?;
-        }
-        if version < 8 {
-            let tx = conn.transaction()?;
-            tx.execute_batch("DROP INDEX process_identity; CREATE UNIQUE INDEX process_identity ON agents(pid,pid_start) WHERE pid IS NOT NULL AND pid_start IS NOT NULL AND ownership='registered' AND coalesce(json_extract(public_json,'$.shared_process'),0)=0; CREATE INDEX process_observation ON agents(pid,pid_start);")?;
-            tx.pragma_update(None, "user_version", 8)?;
-            tx.commit()?;
-        }
-        if version < 9 {
-            let tx = conn.transaction()?;
-            tx.execute_batch("ALTER TABLE policy_snapshot ADD COLUMN delta_hash BLOB;")?;
-            tx.pragma_update(None, "user_version", 9)?;
+            tx.execute_batch(sql)?;
+            tx.pragma_update(None, "user_version", (index + 1) as u32)?;
             tx.commit()?;
         }
         Ok(Self {
@@ -302,18 +209,6 @@ impl LocalStore {
         )?;
         tx.commit()?;
         Ok(true)
-    }
-    /// Used by the owned-session supervisor before spawn/recovery, not by discovery.
-    pub fn set_recovery_pending(&self, id: &str, pending: bool) -> Result<()> {
-        let conn = self.lock()?;
-        if conn.execute(
-            "UPDATE agents SET recovery_pending=?2 WHERE id=?1 AND ownership='owned'",
-            params![id, pending],
-        )? == 0
-        {
-            return Err(Error::NotFound);
-        }
-        Ok(())
     }
 }
 
@@ -473,17 +368,11 @@ fn host_info(conn: &Connection) -> Result<Host> {
             .transpose()?,
     })
 }
-impl Store for LocalStore {
-    fn set_enrollment(&self, mode: &str, node: Option<&str>) -> Result<()> {
-        LocalStore::set_enrollment(self, mode, node)
+impl Store {
+    pub fn update(&self, update: &UpdateParams, now: u64) -> Result<UpdateResult> {
+        self.update_with_delivery(update, now, None)
     }
-    fn apply_policy(&self, revision: u64, rules: &[Rule]) -> Result<bool> {
-        LocalStore::apply_policy(self, revision, rules)
-    }
-    fn apply_policy_delta(&self, delta: &tower_protocol::PolicyDelta) -> Result<bool> {
-        LocalStore::apply_policy_delta(self, delta)
-    }
-    fn clear_policy(&self) -> Result<()> {
+    pub fn clear_policy(&self) -> Result<()> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM allgather_rules", [])?;
@@ -492,7 +381,7 @@ impl Store for LocalStore {
         Ok(())
     }
 
-    fn create_managed(
+    pub fn create_managed(
         &self,
         mut record: AgentRecord,
         hash: &[u8],
@@ -526,7 +415,7 @@ impl Store for LocalStore {
         tx.commit()?;
         Ok(())
     }
-    fn managed_session(&self, id: &str) -> Result<ManagedSession> {
+    pub fn managed_session(&self, id: &str) -> Result<ManagedSession> {
         let conn = self.lock()?;
         let row = conn
             .query_row(
@@ -551,7 +440,7 @@ impl Store for LocalStore {
             auto_resume: row.3,
         })
     }
-    fn managed_sessions(&self) -> Result<Vec<ManagedSession>> {
+    pub fn managed_sessions(&self) -> Result<Vec<ManagedSession>> {
         let conn = self.lock()?;
         let mut query = conn.prepare("SELECT m.id,m.protocol,m.binding,m.launch,m.auto_resume FROM managed_sessions m JOIN agents a ON a.id=m.id WHERE a.ended_at IS NULL")?;
         let rows = query.query_map([], |r| {
@@ -575,7 +464,7 @@ impl Store for LocalStore {
         })
         .collect()
     }
-    fn observe_managed(&self, protocol: &str, o: Observation, now: u64) -> Result<()> {
+    pub fn observe_managed(&self, protocol: &str, o: Observation, now: u64) -> Result<()> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         let id = &o.id;
@@ -686,7 +575,7 @@ impl Store for LocalStore {
         tx.commit()?;
         Ok(())
     }
-    fn disable_managed_recovery(&self, id: &str) -> Result<()> {
+    pub fn disable_managed_recovery(&self, id: &str) -> Result<()> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         tx.execute(
@@ -697,7 +586,7 @@ impl Store for LocalStore {
         tx.commit()?;
         Ok(())
     }
-    fn replace_managed(
+    pub fn replace_managed(
         &self,
         session: &ManagedSession,
         mode: Option<&str>,
@@ -736,7 +625,7 @@ impl Store for LocalStore {
         tx.commit()?;
         Ok(())
     }
-    fn initialize(&self, host_id: &str, node_name: &str) -> Result<Host> {
+    pub fn initialize(&self, host_id: &str, node_name: &str) -> Result<Host> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         tx.execute("INSERT OR IGNORE INTO host(singleton,host_id,standalone_node,node_name,mode) VALUES(1,?1,?2,?2,'standalone')",params![host_id,node_name])?;
@@ -747,13 +636,13 @@ impl Store for LocalStore {
         tx.commit()?;
         Ok(host)
     }
-    fn host(&self) -> Result<Host> {
+    pub fn host(&self) -> Result<Host> {
         host_info(&*self.lock()?)
     }
-    fn registration_target(&self, candidate: &AgentRecord) -> Result<Option<StoredAgent>> {
+    pub fn registration_target(&self, candidate: &AgentRecord) -> Result<Option<StoredAgent>> {
         registration_target(&*self.lock()?, candidate)
     }
-    fn register(
+    pub fn register(
         &self,
         mut candidate: AgentRecord,
         hash: &[u8],
@@ -834,10 +723,10 @@ impl Store for LocalStore {
             created: true,
         })
     }
-    fn agent(&self, id: &str) -> Result<StoredAgent> {
+    pub fn agent(&self, id: &str) -> Result<StoredAgent> {
         stored_agent(&*self.lock()?, id)
     }
-    fn agent_by_token_hash(&self, hash: &[u8]) -> Result<StoredAgent> {
+    pub fn agent_by_token_hash(&self, hash: &[u8]) -> Result<StoredAgent> {
         let conn = self.lock()?;
         let id: String = conn
             .query_row("SELECT id FROM agents WHERE token_hash=?1", [hash], |r| {
@@ -847,7 +736,7 @@ impl Store for LocalStore {
             .ok_or(Error::NotFound)?;
         stored_agent(&conn, &id)
     }
-    fn agent_by_native_id(&self, harness: &str, native_id: &str) -> Result<StoredAgent> {
+    pub fn agent_by_native_id(&self, harness: &str, native_id: &str) -> Result<StoredAgent> {
         let conn = self.lock()?;
         let id: String = conn
             .query_row(
@@ -859,7 +748,7 @@ impl Store for LocalStore {
             .ok_or(Error::NotFound)?;
         stored_agent(&conn, &id)
     }
-    fn agents(&self, filter: &AgentFilter) -> Result<Vec<AgentRecord>> {
+    pub fn agents(&self, filter: &AgentFilter) -> Result<Vec<AgentRecord>> {
         Ok(all_records(&*self.lock()?)?
             .into_iter()
             .filter(|r| {
@@ -882,7 +771,7 @@ impl Store for LocalStore {
             })
             .collect())
     }
-    fn update_with_delivery(
+    pub fn update_with_delivery(
         &self,
         update: &UpdateParams,
         now: u64,
@@ -960,7 +849,7 @@ impl Store for LocalStore {
             revision: agent.record.revision,
         })
     }
-    fn heartbeat(&self, id: &str, now: u64) -> Result<()> {
+    pub fn heartbeat(&self, id: &str, now: u64) -> Result<()> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         let mut agent = stored_agent(&tx, id)?;
@@ -972,7 +861,7 @@ impl Store for LocalStore {
         tx.commit()?;
         Ok(())
     }
-    fn unregister(&self, id: &str, now: u64) -> Result<AgentRecord> {
+    pub fn unregister(&self, id: &str, now: u64) -> Result<AgentRecord> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         let mut agent = stored_agent(&tx, id)?;
@@ -991,7 +880,7 @@ impl Store for LocalStore {
         tx.commit()?;
         Ok(agent.record)
     }
-    fn mark_lost(&self, id: &str, now: u64) -> Result<()> {
+    pub fn mark_lost(&self, id: &str, now: u64) -> Result<()> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         let mut agent = stored_agent(&tx, id)?;
@@ -1009,7 +898,7 @@ impl Store for LocalStore {
         tx.commit()?;
         Ok(())
     }
-    fn mark_unconfirmed(&self, now: u64) -> Result<()> {
+    pub fn mark_unconfirmed(&self, now: u64) -> Result<()> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         for mut r in all_records(&tx)? {
@@ -1026,7 +915,7 @@ impl Store for LocalStore {
         tx.commit()?;
         Ok(())
     }
-    fn expire(&self, now: u64, owned_retention_ms: u64) -> Result<Vec<String>> {
+    pub fn expire(&self, now: u64, owned_retention_ms: u64) -> Result<Vec<String>> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         let mut removed = Vec::new();
@@ -1051,7 +940,7 @@ impl Store for LocalStore {
         tx.commit()?;
         Ok(removed)
     }
-    fn expiring_managed(&self, now: u64, retention_ms: u64) -> Result<Vec<ManagedSession>> {
+    pub fn expiring_managed(&self, now: u64, retention_ms: u64) -> Result<Vec<ManagedSession>> {
         if now < retention_ms {
             return Ok(Vec::new());
         }
@@ -1067,7 +956,7 @@ impl Store for LocalStore {
         };
         ids.iter().map(|id| self.managed_session(id)).collect()
     }
-    fn rules(&self) -> Result<RulesView> {
+    pub fn rules(&self) -> Result<RulesView> {
         let conn = self.lock()?;
         Ok(RulesView {
             local_rules: read_rules(&conn, "local_rules")?,
@@ -1075,7 +964,7 @@ impl Store for LocalStore {
             policy_revision: host_info(&conn)?.policy_revision,
         })
     }
-    fn put_rule(&self, rule: Rule) -> Result<()> {
+    pub fn put_rule(&self, rule: Rule) -> Result<()> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         let mut rules = read_rules(&tx, "local_rules")?;
@@ -1092,21 +981,21 @@ impl Store for LocalStore {
         tx.commit()?;
         Ok(())
     }
-    fn remove_rule(&self, id: &str) -> Result<()> {
+    pub fn remove_rule(&self, id: &str) -> Result<()> {
         let conn = self.lock()?;
         if conn.execute("DELETE FROM local_rules WHERE id=?1", [id])? == 0 {
             return Err(Error::NotFound);
         }
         Ok(())
     }
-    fn replace_rules(&self, rules: &[Rule]) -> Result<()> {
+    pub fn replace_rules(&self, rules: &[Rule]) -> Result<()> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         write_rules(&tx, "local_rules", rules)?;
         tx.commit()?;
         Ok(())
     }
-    fn issue_token(&self, info: TokenInfo, hash: &[u8]) -> Result<()> {
+    pub fn issue_token(&self, info: TokenInfo, hash: &[u8]) -> Result<()> {
         let conn = self.lock()?;
         if conn
             .query_row("SELECT 1 FROM tokens WHERE name=?1", [&info.name], |r| {
@@ -1125,7 +1014,7 @@ impl Store for LocalStore {
         )?;
         Ok(())
     }
-    fn tokens(&self) -> Result<Vec<StoredToken>> {
+    pub fn tokens(&self) -> Result<Vec<StoredToken>> {
         let conn = self.lock()?;
         let mut q = conn.prepare("SELECT data,hash FROM tokens ORDER BY name")?;
         let data = q
@@ -1142,14 +1031,14 @@ impl Store for LocalStore {
             })
             .collect()
     }
-    fn revoke_token(&self, name: &str) -> Result<()> {
+    pub fn revoke_token(&self, name: &str) -> Result<()> {
         let conn = self.lock()?;
         if conn.execute("DELETE FROM tokens WHERE name=?1", [name])? == 0 {
             return Err(Error::NotFound);
         }
         Ok(())
     }
-    fn token_by_hash(&self, hash: &[u8]) -> Result<StoredToken> {
+    pub fn token_by_hash(&self, hash: &[u8]) -> Result<StoredToken> {
         let conn = self.lock()?;
         let (data, hash): (String, Vec<u8>) = conn
             .query_row("SELECT data,hash FROM tokens WHERE hash=?1", [hash], |r| {

@@ -8,7 +8,7 @@ use std::{
 };
 use subtle::ConstantTimeEq;
 use tower_protocol::{ExecutionCommand, ExecutionStatus, RuntimeCursor};
-use tower_sessions::execution::{RuntimeUpdates, RuntimeView};
+use tower_sessions::execution::RuntimeUpdates;
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Call {
@@ -107,11 +107,7 @@ impl Host {
         };
         if c.kind == "reply" {
             let p = serde_json::to_value(&c.payload).map_err(internal)?;
-            let requests = handle.requests.lock().map_err(internal)?;
-            let r = requests
-                .get(p["source_request_id"].as_str().unwrap_or(""))
-                .ok_or_else(|| error("stale_request", "Private request is no longer live"))?;
-            engine::validate_reply(r, &p)?;
+            handle.requests.validate_reply(&p)?;
         }
         let result = if matches!(c.kind.as_str(), "cancel" | "reply") {
             let permit = handle
@@ -157,20 +153,9 @@ impl Host {
                 let mut views = Vec::new();
                 let mut cursor = None;
                 let mut bytes = 0usize;
-                let entries = self.journal.bindings_page(namespace, after)?;
+                let entries = self.journal.views_page(namespace, after)?;
                 let more = entries.len() == 64;
-                for (id, binding) in entries {
-                    let (state, fenced, termination) = self.journal.state(&binding)?;
-                    let metadata = parse(self.journal.metadata(&binding)?)?;
-                    let pending_events = Some(self.journal.pending_events(&binding)?);
-                    let view = RuntimeView {
-                        binding,
-                        state,
-                        fenced,
-                        termination,
-                        metadata,
-                        pending_events,
-                    };
+                for (id, view) in entries {
                     let size = serde_json::to_vec(&view).map_err(internal)?.len();
                     if bytes + size > tower_protocol::MAX_FRAME_BYTES - 4096 {
                         if views.is_empty() {
@@ -198,30 +183,16 @@ impl Host {
                 let receipts = self.journal.receipt_updates(namespace)?;
                 let losses = self.journal.losses(namespace)?;
                 let mut requests = Vec::new();
-                let mut bytes = serde_json::to_vec(&receipts).map_err(internal)?.len()
-                    + serde_json::to_vec(&losses).map_err(internal)?.len()
-                    + 4096;
+                let mut budget = tower_protocol::MAX_FRAME_BYTES.saturating_sub(
+                    serde_json::to_vec(&receipts).map_err(internal)?.len()
+                        + serde_json::to_vec(&losses).map_err(internal)?.len()
+                        + 4096,
+                );
                 let owners = self.owners.lock().map_err(internal)?;
                 for binding in self.journal.bindings(Some(namespace))? {
                     if let Some(h) = owners.get(&key(&binding)) {
                         let committed = self.journal.cursor(&binding)?.cursor;
-                        for request in h.requests.lock().map_err(internal)?.values() {
-                            if request.wire.state == "pending" && request.after_sequence > committed
-                            {
-                                continue;
-                            }
-                            if request.announced.as_ref().is_some_and(|(c, r)| {
-                                c == connection && *r >= request.wire.request_revision
-                            }) {
-                                continue;
-                            }
-                            let size = serde_json::to_vec(&request.wire).map_err(internal)?.len();
-                            if bytes + size > tower_protocol::MAX_FRAME_BYTES {
-                                continue;
-                            }
-                            bytes += size;
-                            requests.push(request.wire.clone());
-                        }
+                        requests.extend(h.requests.updates(connection, committed, &mut budget)?);
                     }
                 }
                 value(RuntimeUpdates {
@@ -280,24 +251,12 @@ impl Host {
                         let owners = self.owners.lock().map_err(internal)?;
                         for binding in self.journal.bindings(Some(ns))? {
                             if let Some(h) = owners.get(&key(&binding)) {
-                                let mut requests = h.requests.lock().map_err(internal)?;
-                                if requests.get(id).is_some_and(|r| {
-                                    r.wire.state != "pending" && r.wire.request_revision <= rev
-                                }) {
-                                    requests.remove(id);
-                                } else if let Some(r) = requests.get_mut(id)
-                                    && rev <= r.wire.request_revision
-                                {
-                                    if matches!(
-                                        v["peer_state"].as_str(),
-                                        Some("answered" | "cancelled" | "stale")
-                                    ) {
-                                        r.peer_retired
-                                            .get_or_insert_with(tokio::time::Instant::now);
-                                    }
-                                    r.announced =
-                                        Some((v["connection"].as_str().unwrap_or("").into(), rev));
-                                }
+                                h.requests.acknowledge(
+                                    id,
+                                    rev,
+                                    v["connection"].as_str().unwrap_or(""),
+                                    v["peer_state"].as_str().unwrap_or(""),
+                                )?;
                             }
                         }
                     }

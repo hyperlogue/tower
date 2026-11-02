@@ -17,9 +17,7 @@ pub(crate) struct Config {
     pub managed: bool,
     pub url: String,
     pub policy_id: String,
-    pub scopes: Vec<String>,
-    #[serde(skip)]
-    pub scopes_configured: bool,
+    pub scopes: Option<Vec<String>>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -27,8 +25,7 @@ impl Default for Config {
             managed: true,
             url: String::new(),
             policy_id: "tower".into(),
-            scopes: vec!["read".into(), "send".into()],
-            scopes_configured: false,
+            scopes: None,
         }
     }
 }
@@ -60,24 +57,33 @@ impl Config {
             allgather: Config,
         }
         let text = tower_pal::read_config(&paths.config_home.join("tower/config.toml"))?;
-        let scopes_configured = text
-            .as_ref()
-            .and_then(|s| toml::from_str::<toml::Table>(s).ok())
-            .and_then(|t| t.get("allgather").and_then(|a| a.get("scopes")).cloned())
-            .is_some();
-        let mut root: Root = text
+        let root: Root = text
             .map(|s| toml::from_str(&s))
             .transpose()
             .map_err(|_| Error::Other("Invalid Allgather configuration".into()))?
             .unwrap_or_default();
-        root.allgather.scopes_configured = scopes_configured;
         Ok(root.allgather)
+    }
+    pub(crate) fn permits_scope(&self, scope: &str) -> bool {
+        self.scopes.as_ref().is_none_or(|configured| {
+            configured
+                .iter()
+                .any(|s| s == scope || (scope != "acp:control" && s == "admin"))
+        })
+    }
+
+    pub(crate) fn enrollment_scopes(&self, read_only: bool) -> Vec<String> {
+        ["read", "send", "acp:control"]
+            .into_iter()
+            .filter(|scope| (!read_only || *scope == "read") && self.permits_scope(scope))
+            .map(str::to_owned)
+            .collect()
     }
     pub(crate) fn validate(&self) -> Result<()> {
         safe_url(&self.url, true)?;
         if self.policy_id.is_empty()
             || self.policy_id.len() > 128
-            || self.scopes.iter().any(|s| {
+            || self.scopes.iter().flatten().any(|s| {
                 !matches!(
                     s.as_str(),
                     "read" | "send" | "subscribe" | "approve" | "admin" | "acp:control"
@@ -432,6 +438,22 @@ async fn connection(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn enrollment_respects_explicit_scope_restrictions() {
+        let default: super::Config = toml::from_str("").unwrap();
+        assert_eq!(
+            default.enrollment_scopes(false),
+            ["read", "send", "acp:control"]
+        );
+        assert_eq!(default.enrollment_scopes(true), ["read"]);
+        let empty: super::Config = toml::from_str("scopes=[]").unwrap();
+        assert!(empty.enrollment_scopes(false).is_empty());
+        let admin: super::Config = toml::from_str("scopes=['admin']").unwrap();
+        assert_eq!(admin.enrollment_scopes(false), ["read", "send"]);
+        let read: super::Config = toml::from_str("scopes=['read']").unwrap();
+        assert_eq!(read.enrollment_scopes(false), ["read"]);
+    }
+
     use super::*;
 
     #[tokio::test]

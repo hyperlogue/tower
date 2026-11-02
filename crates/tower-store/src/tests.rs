@@ -31,9 +31,9 @@ fn record(id: &str, native: Option<&str>, pid: Option<u32>) -> AgentRecord {
         sync_state: "synced".into(),
     }
 }
-fn setup() -> (tempfile::TempDir, LocalStore) {
+fn setup() -> (tempfile::TempDir, Store) {
     let dir = tempfile::tempdir().unwrap();
-    let store = LocalStore::open(&dir.path().join("db")).unwrap();
+    let store = Store::open(&dir.path().join("db")).unwrap();
     store.initialize("host", "node").unwrap();
     (dir, store)
 }
@@ -150,7 +150,7 @@ fn policy_snapshot_is_atomic_separate_and_durable() {
     assert_eq!(before.allgather_rules[0].action, "deny");
     s.replace_rules(&[]).unwrap();
     drop(s);
-    let s = LocalStore::open(&dir.path().join("db")).unwrap();
+    let s = Store::open(&dir.path().join("db")).unwrap();
     let host = s.initialize("host", "new-random-name").unwrap();
     assert_eq!(host.mode, "allgather");
     assert_eq!(host.node_name, "remote-node");
@@ -170,7 +170,13 @@ fn expiration_uses_confirmed_end_and_protects_active_and_pending_recovery() {
     }
     s.unregister("ended", 200).unwrap();
     s.unregister("pending", 200).unwrap();
-    s.set_recovery_pending("pending", true).unwrap();
+    s.lock()
+        .unwrap()
+        .execute(
+            "UPDATE agents SET recovery_pending=1 WHERE id='pending'",
+            [],
+        )
+        .unwrap();
     s.unregister("ended", 500).unwrap();
     assert_eq!(s.agent("ended").unwrap().ended_at, Some(200));
     assert!(s.expire(1199, 1000).unwrap().is_empty());
@@ -233,7 +239,7 @@ fn version_one_database_migrates_with_credentials_and_identity_intact() {
     let agent = record("existing", Some("native"), None);
     conn.execute("INSERT INTO agents(id,harness,native_id,ownership,public_json,token_hash) VALUES(?1,?2,?3,?4,?5,?6)", params![agent.id,agent.harness,agent.native_session_id,agent.ownership,serde_json::to_string(&agent).unwrap(), b"credential".as_slice()]).unwrap();
     drop(conn);
-    let store = LocalStore::open(&path).unwrap();
+    let store = Store::open(&path).unwrap();
     assert_eq!(
         store.agent_by_token_hash(b"credential").unwrap().record,
         agent
@@ -251,10 +257,10 @@ fn version_one_database_migrates_with_credentials_and_identity_intact() {
         Err(Error::NotFound)
     ));
     drop(store);
-    assert!(LocalStore::open(&path).is_ok());
+    assert!(Store::open(&path).is_ok());
 }
 
-impl LocalStore {
+impl Store {
     fn register_test(&self, candidate: AgentRecord, hash: &[u8]) -> Result<Registration> {
         let target = self.registration_target(&candidate)?;
         let expected = target.map_or_else(|| candidate.id.clone(), |a| a.record.id);
@@ -287,7 +293,7 @@ fn version_three_migration_uses_terminal_binding_evidence_and_keeps_launch_inten
     )
     .unwrap();
     drop(conn);
-    let store = LocalStore::open(&path).unwrap();
+    let store = Store::open(&path).unwrap();
     let saved = store.managed_session(&terminal.id).unwrap();
     assert_eq!(saved.protocol, "terminal");
     assert_eq!(
@@ -315,7 +321,7 @@ fn version_three_migration_uses_terminal_binding_evidence_and_keeps_launch_inten
     ));
     store.disable_managed_recovery(&terminal.id).unwrap();
     drop(store);
-    let store = LocalStore::open(&path).unwrap();
+    let store = Store::open(&path).unwrap();
     assert!(!store.managed_session(&terminal.id).unwrap().auto_resume);
     assert!(
         store
@@ -385,7 +391,7 @@ fn policy_deltas_are_atomic_ordered_and_replay_safe_after_restart() {
     assert_eq!(before.allgather_rules, vec![rule("a", "allow")]);
     assert!(before.local_rules.iter().any(|r| r.id == "local"));
     drop(store);
-    let store = LocalStore::open(&dir.path().join("db")).unwrap();
+    let store = Store::open(&dir.path().join("db")).unwrap();
     assert!(!store.apply_policy_delta(&delta).unwrap());
     let mut conflict = delta.clone();
     conflict.upserts = vec![rule("a", "deny")];

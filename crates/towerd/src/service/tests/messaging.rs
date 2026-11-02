@@ -1,7 +1,6 @@
 use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tower_sessions::messaging::RegisteredDelivery;
-use tower_store::MessageStore;
 
 struct Delivery {
     calls: Arc<AtomicUsize>,
@@ -41,7 +40,7 @@ fn messaging(
     outcome: usize,
 ) -> (
     tempfile::TempDir,
-    Arc<LocalStore>,
+    Arc<Store>,
     Service,
     Arc<AtomicUsize>,
     String,
@@ -461,10 +460,15 @@ fn remote_messages_require_scopes_and_both_policy_tables() {
         .unwrap();
     assert_eq!(send(&service).unwrap_err().data.code, "denied");
     store.apply_policy(3, &[]).unwrap();
-    service.allgather_config.scopes = vec!["read".into()];
+    service.allgather_config.scopes = Some(vec!["read".into()]);
     assert_eq!(send(&service).unwrap_err().data.code, "denied");
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    service.allgather_config.scopes.push("send".into());
+    service
+        .allgather_config
+        .scopes
+        .as_mut()
+        .unwrap()
+        .push("send".into());
     send(&service).unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
 }
@@ -472,7 +476,7 @@ fn remote_messages_require_scopes_and_both_policy_tables() {
 #[test]
 fn allgather_cannot_administer_local_state_even_with_admin_scope() {
     let (_dir, store, mut service) = setup();
-    service.allgather_config.scopes = vec!["admin".into()];
+    service.allgather_config.scopes = Some(vec!["admin".into()]);
     store.set_enrollment("allgather", None).unwrap();
     tower_pal::write_private(&service.paths.state.join("allgather.key"), b"test-key").unwrap();
     let epoch = service

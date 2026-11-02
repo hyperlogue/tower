@@ -434,21 +434,40 @@ impl Journal {
         rows.map(|r| serde_json::from_str(&r.map_err(internal)?).map_err(internal))
             .collect()
     }
-    pub fn bindings_page(
+    pub fn views_page(
         &self,
         namespace: Option<&str>,
         after: u64,
-    ) -> Result<Vec<(u64, Binding)>> {
+    ) -> Result<Vec<(u64, tower_sessions::execution::RuntimeView)>> {
         let conn = self.lock()?;
         let after = i64::try_from(after).map_err(internal)?;
-        let mut q=conn.prepare("SELECT rowid,binding FROM runtimes WHERE (?1 IS NULL OR namespace=?1) AND rowid>?2 ORDER BY rowid LIMIT 64").map_err(internal)?;
+        let mut q=conn.prepare("SELECT rowid,binding,state,fenced,termination,metadata,next_sequence>ack_sequence+1 FROM runtimes WHERE (?1 IS NULL OR namespace=?1) AND rowid>?2 ORDER BY rowid LIMIT 64").map_err(internal)?;
         q.query_map(params![namespace, after], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, bool>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, bool>(6)?,
+            ))
         })
         .map_err(internal)?
         .map(|r| {
-            let (id, json) = r.map_err(internal)?;
-            Ok((id as u64, serde_json::from_str(&json).map_err(internal)?))
+            let (id, binding, state, fenced, termination, metadata, pending_events) =
+                r.map_err(internal)?;
+            Ok((
+                id as u64,
+                tower_sessions::execution::RuntimeView {
+                    binding: serde_json::from_str(&binding).map_err(internal)?,
+                    metadata: serde_json::from_str(&metadata).map_err(internal)?,
+                    state,
+                    fenced,
+                    termination,
+                    pending_events: Some(pending_events),
+                },
+            ))
         })
         .collect()
     }
@@ -458,9 +477,6 @@ impl Journal {
     }
     pub fn state(&self, binding: &Binding) -> Result<(String, bool, String)> {
         self.lock()?.query_row("SELECT state,fenced,termination FROM runtimes WHERE namespace=?1 AND runtime_id=?2 AND generation=?3", params![binding.namespace(),binding.runtime_id,binding.generation], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(internal)
-    }
-    pub fn pending_events(&self, binding: &Binding) -> Result<bool> {
-        self.lock()?.query_row("SELECT next_sequence>ack_sequence+1 FROM runtimes WHERE namespace=?1 AND runtime_id=?2 AND generation=?3",params![binding.namespace(),binding.runtime_id,binding.generation],|r|r.get(0)).map_err(internal)
     }
     pub fn losses(&self, namespace: &str) -> Result<Vec<RuntimeLoss>> {
         let conn = self.lock()?;

@@ -61,7 +61,7 @@ fn observation(v: &RuntimeView) -> Result<Observation> {
         pid_start_time: m["pid_start_time"].as_u64(),
         caps: capabilities(
             !v.fenced,
-            native.is_some() && v.termination == "confirmed" || !v.fenced && native.is_some(),
+            native.is_some() && (!v.fenced || v.termination == "confirmed"),
         ),
         terminal: None,
         recovery_pending: false,

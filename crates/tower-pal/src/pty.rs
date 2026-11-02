@@ -277,9 +277,6 @@ pub fn is_terminal() -> bool {
     use std::io::IsTerminal;
     io::stdin().is_terminal() && io::stdout().is_terminal()
 }
-pub fn terminal_dimensions() -> io::Result<(u16, u16)> {
-    terminal_size(&File::open("/dev/tty")?)
-}
 pub fn terminal_resize_signal() -> io::Result<tokio::signal::unix::Signal> {
     tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
 }

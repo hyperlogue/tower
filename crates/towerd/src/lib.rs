@@ -36,7 +36,7 @@ pub async fn run(paths: Paths, startup: &str, backends: tower_sessions::Backends
     let _lock = SingletonLock::acquire(&paths.run.join("towerd.lock"))?;
     tower_pal::ignore_hangup()?;
     tower_pal::private_file(&paths.database, true)?;
-    let store = Arc::new(tower_store::LocalStore::open(&paths.database)?);
+    let store = Arc::new(tower_store::Store::open(&paths.database)?);
     let service = Service::new(paths.clone(), store, startup, backends)?;
     service.recover_registry()?;
     let service = ServiceWorker::new(service);

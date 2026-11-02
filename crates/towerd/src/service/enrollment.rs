@@ -48,36 +48,7 @@ impl Service {
         }) {
             return Err(invalid("Invalid node label"));
         }
-        let mut scopes = Vec::new();
-        if !self.allgather_config.scopes_configured
-            || self
-                .allgather_config
-                .scopes
-                .iter()
-                .any(|s| s == "read" || s == "admin")
-        {
-            scopes.push("read".to_owned());
-        }
-        if !p.read_only
-            && (!self.allgather_config.scopes_configured
-                || self
-                    .allgather_config
-                    .scopes
-                    .iter()
-                    .any(|s| s == "send" || s == "admin"))
-        {
-            scopes.push("send".into());
-        }
-        if !p.read_only
-            && (!self.allgather_config.scopes_configured
-                || self
-                    .allgather_config
-                    .scopes
-                    .iter()
-                    .any(|s| s == "acp:control"))
-        {
-            scopes.push("acp:control".into());
-        }
+        let scopes = self.allgather_config.enrollment_scopes(p.read_only);
         if scopes.is_empty() {
             return Err(invalid(
                 "No enrollment scopes are enabled by the local configuration",

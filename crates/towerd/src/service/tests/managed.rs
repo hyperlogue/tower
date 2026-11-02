@@ -4,14 +4,14 @@ use tower_sessions::{Backends, ManagedBackend, ManagedSession, Observation, Prep
 
 struct StructuredBackend {
     protocol: String,
-    store: Arc<LocalStore>,
+    store: Arc<Store>,
     states: Mutex<BTreeMap<String, String>>,
     unavailable: AtomicBool,
     allow_stop: AtomicBool,
     injected_id: Mutex<Option<String>>,
 }
 impl StructuredBackend {
-    fn new(protocol: &str, store: Arc<LocalStore>) -> Self {
+    fn new(protocol: &str, store: Arc<Store>) -> Self {
         Self {
             protocol: protocol.into(),
             store,
