@@ -11,6 +11,7 @@ description = "Local registry, session orchestration, delivery, and API daemon."
 workspace = true
 
 [dependencies]
+tower-clipboard.workspace = true
 tower-protocol.workspace = true
 tower-pal.workspace = true
 tower-store.workspace = true

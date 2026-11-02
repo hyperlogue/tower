@@ -21,6 +21,11 @@ pub struct Snapshot {
     pub buffer: Vec<u8>,
 }
 pub enum Command {
+    Clipboard {
+        id: u64,
+        lease: tower_protocol::ClipboardLease,
+        connection: tower_pal::IpcStream,
+    },
     Inject {
         proof: tower_pool_proto::InputProof,
         text: String,
@@ -69,6 +74,7 @@ enum InputOrigin {
     Client,
     Reply,
     Message(Box<Submission>),
+    Clipboard(u64),
 }
 struct InputUnit {
     bytes: Vec<u8>,
@@ -80,6 +86,7 @@ impl InputUnit {
     }
 }
 struct Actor {
+    clipboard: crate::clipboard::Clipboard,
     launch: Launch,
     pty: Option<PtyProcess>,
     terminal: Terminal,
@@ -113,6 +120,7 @@ pub fn reserve(launch: Launch) -> Handle {
     let (state, receiver) = watch::channel(info.clone());
     let (tx, rx) = mpsc::channel(64);
     let actor = Actor {
+        clipboard: crate::clipboard::Clipboard::new(launch.name.clone(), launch.clipboard.clone()),
         launch: launch.clone(),
         pty: None,
         terminal: Terminal::new(size),
@@ -140,6 +148,48 @@ pub fn reserve(launch: Launch) -> Handle {
     }
 }
 impl Actor {
+    fn remove_client(&mut self, id: u64) {
+        self.clients.remove(&id);
+        self.clipboard.detached(id);
+    }
+    fn clipboard_action(&mut self, action: crate::clipboard::Action) {
+        match action {
+            crate::clipboard::Action::Input { id, bytes } => {
+                if self.clients.contains_key(&id)
+                    && self.killing.is_none()
+                    && self.pending_exit.is_none()
+                    && bytes.len() <= MAX_INPUT - self.input_bytes
+                {
+                    self.input_bytes += bytes.len();
+                    self.input.push_back(InputUnit {
+                        bytes,
+                        origin: InputOrigin::Clipboard(id),
+                    });
+                } else {
+                    self.remove_client(id);
+                    self.resize();
+                }
+            }
+            crate::clipboard::Action::Finished { id, code, input } => {
+                if let Some(c) = self.clients.get(&id) {
+                    let _ = c.out.try_send(Out::Control(Reply::Clipboard {
+                        state: if code.is_some() {
+                            "failed"
+                        } else {
+                            "submitted"
+                        }
+                        .into(),
+                        code,
+                    }));
+                }
+                if !self.enqueue(input) {
+                    self.remove_client(id);
+                    self.resize();
+                }
+            }
+            crate::clipboard::Action::Ignore => {}
+        }
+    }
     async fn start(&mut self, size: Size) -> io::Result<()> {
         if self.pty.is_some() {
             return Ok(());
@@ -208,8 +258,15 @@ impl Actor {
         }
         let bytes: Arc<[u8]> = bytes.into();
         let before = self.clients.len();
-        self.clients
-            .retain(|_, c| c.out.try_send(Out::Data(Arc::clone(&bytes))).is_ok());
+        let gone = self
+            .clients
+            .iter()
+            .filter(|(_, c)| c.out.try_send(Out::Data(Arc::clone(&bytes))).is_err())
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        for id in gone {
+            self.remove_client(id);
+        }
         if self.clients.len() != before {
             self.resize();
         }
@@ -257,6 +314,7 @@ impl Actor {
             }));
         }
         self.clients.clear();
+        self.clipboard.clear();
         self.clear_input();
         self.pty.take();
         for reply in self.kill_replies.drain(..) {
@@ -275,6 +333,7 @@ impl Actor {
                 .into()));
             }
         }
+        self.clipboard.clear();
         self.input_bytes = 0;
         self.reply_bytes = 0;
         self.offset = 0;
@@ -297,6 +356,9 @@ impl Actor {
                     }
                 }
                 continue;
+            }
+            if self.offset==0 && self.input.front().is_some_and(|u|matches!(u.origin,InputOrigin::Clipboard(id) if !self.clients.contains_key(&id))) {
+                if let Some(unit)=self.input.pop_front(){self.input_bytes-=unit.bytes.len();}continue;
             }
             let pty = self.pty.as_ref();
             let pending = self.input.front().map(|v| &v.bytes[self.offset..]);
@@ -335,7 +397,7 @@ impl Actor {
                             if self.input.front().unwrap().is_reply() { self.reply_bytes -= n; }
                             else { self.input_bytes -= n; }
                             if self.offset == self.input.front().unwrap().bytes.len() {
-                                if let Some(unit)=self.input.pop_front() && let InputOrigin::Message(message)=unit.origin {let _=message.reply.send(Ok(()));}
+                                if let Some(unit)=self.input.pop_front() {match unit.origin {InputOrigin::Message(message)=>{let _=message.reply.send(Ok(()));},InputOrigin::Clipboard(id)=>self.clipboard.submitted(id),_=>{}}}
                                 self.offset = 0;
                             }
                         }
@@ -344,6 +406,8 @@ impl Actor {
                 }
                 _ = tokio::time::sleep_until(wake.into()), if pty.is_some() => {
                     let now = Instant::now();
+                    let closed=self.clients.iter().filter(|(_,c)|c.out.is_closed()).map(|(id,_)|*id).collect::<Vec<_>>();
+                    if !closed.is_empty(){for id in closed{self.remove_client(id);}self.resize();}
                     let mut expired = Vec::new();
                     let mut overflow = Vec::new();
                     for (&id, client) in &mut self.clients {
@@ -351,10 +415,13 @@ impl Actor {
                             && self.killing.is_none() && self.pending_exit.is_none() { expired.push((id, unit)); }
                     }
                     for (id, unit) in expired {
-                        if !self.enqueue(vec![unit]) { overflow.push(id); }
+                        match self.clipboard.push(id, vec![unit], MAX_INPUT - self.input_bytes) {
+                            Ok(units) => { if !self.enqueue(units) { overflow.push(id); } },
+                            _ => overflow.push(id),
+                        }
                     }
                     if !overflow.is_empty() {
-                        for id in overflow { self.clients.remove(&id); }
+                        for id in overflow { self.remove_client(id); }
                         self.resize();
                     }
                     if now >= next_poll {
@@ -373,6 +440,9 @@ impl Actor {
                             }
                         }
                     }
+                }
+                event = self.clipboard.receive.recv() => {
+                    if let Some(event)=event {let action=self.clipboard.event(event,MAX_INPUT-self.input_bytes);self.clipboard_action(action);}
                 }
                 command = self.rx.recv() => {
                     let Some(command) = command else { break };
@@ -441,6 +511,15 @@ impl Actor {
                     });
                 }
             }
+            Command::Clipboard {
+                id,
+                lease,
+                connection,
+            } => {
+                if self.clients.contains_key(&id) {
+                    self.clipboard.bind(id, lease, connection);
+                }
+            }
             Command::Start { size, reply } => {
                 let result = self.start(size).await.map_err(|e| e.to_string());
                 let _ = reply.send(result);
@@ -477,11 +556,11 @@ impl Actor {
                     .is_err()
                     || out.try_send(Out::Data(restored.into())).is_err()
                 {
-                    self.clients.remove(&id);
+                    self.remove_client(id);
                     self.resize();
                     let _ = reply.send(Err("client disconnected".into()));
                 } else if reply.send(Ok(id)).is_err() {
-                    self.clients.remove(&id);
+                    self.remove_client(id);
                     self.resize();
                 }
             }
@@ -494,9 +573,33 @@ impl Actor {
                         self.last_input = Some(tower_pal::monotonic_ms());
                     }
                     let units = client.input.push(&bytes, Instant::now());
-                    if units.is_err() || !self.enqueue(units.unwrap_or_default()) {
-                        self.clients.remove(&id);
-                        self.resize();
+                    match units {
+                        Err(()) => {
+                            self.remove_client(id);
+                            self.resize();
+                        }
+                        Ok(units) => {
+                            match self.clipboard.push(id, units, MAX_INPUT - self.input_bytes) {
+                                Ok(units) => {
+                                    if !self.enqueue(units) {
+                                        self.remove_client(id);
+                                        self.resize();
+                                    }
+                                }
+                                Err(code) => {
+                                    if let Some(c) = self.clients.get(&id) {
+                                        let _ = c.out.try_send(Out::Control(Reply::Clipboard {
+                                            state: "failed".into(),
+                                            code: Some(code.clone()),
+                                        }));
+                                    }
+                                    if code == "input_overflow" {
+                                        self.remove_client(id);
+                                        self.resize();
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -507,7 +610,7 @@ impl Actor {
                 }
             }
             Command::Detach { id } => {
-                self.clients.remove(&id);
+                self.remove_client(id);
                 self.resize();
             }
             Command::Snapshot(reply) => {

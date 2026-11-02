@@ -513,6 +513,7 @@ trust_level="trusted"
             env: f.env.clone(),
             cwd: f.root.path().to_string_lossy().into_owned(),
             size: Some(Size::default()),
+            clipboard: None,
         },
     });
     let Reply::Created { session } = created else {

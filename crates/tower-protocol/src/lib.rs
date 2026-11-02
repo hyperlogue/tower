@@ -1,5 +1,8 @@
 //! Extensible public wire types. This crate deliberately depends only on serde.
 
+pub mod clipboard;
+pub use clipboard::*;
+
 mod execution;
 mod messaging;
 mod sync;

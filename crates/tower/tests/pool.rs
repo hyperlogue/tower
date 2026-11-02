@@ -60,6 +60,7 @@ impl Pool {
                     env: BTreeMap::new(),
                     cwd: self.dir.path().to_string_lossy().into_owned(),
                     size: headless.then(Size::default),
+                    clipboard: None,
                 }
             }),
             Reply::Created { .. }
@@ -78,6 +79,7 @@ impl Pool {
             &Request::Attach {
                 name: name.into(),
                 size,
+                clipboard: None,
             },
         )
         .unwrap();

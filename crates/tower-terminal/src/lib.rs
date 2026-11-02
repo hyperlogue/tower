@@ -3,7 +3,7 @@ mod client;
 mod injection;
 pub mod launcher;
 mod pool;
-pub use client::attach;
+pub use client::{attach, attach_with_terminal};
 use serde::{Serialize, de::DeserializeOwned};
 use tower_pal::Paths;
 use tower_pool_proto::{Launch, Reply, Request, Session};
@@ -279,7 +279,28 @@ impl TerminalBackend {
         Ok(result)
     }
 }
+fn clipboard_mode(harness: tower_agents::Harness) -> Option<tower_pool_proto::ClipboardMode> {
+    match harness {
+        tower_agents::Harness::Codex => Some(tower_pool_proto::ClipboardMode::FileUrl),
+        tower_agents::Harness::ClaudeCode if tower_pal::operating_system() == "linux" => {
+            Some(tower_pool_proto::ClipboardMode::NativeKey)
+        }
+        _ => None,
+    }
+}
 impl ManagedBackend for TerminalBackend {
+    fn clipboard(
+        &self,
+        session: &ManagedSession,
+    ) -> Result<Option<tower_sessions::ClipboardTarget>> {
+        let binding = binding(session)?;
+        Ok(clipboard_mode(binding.plan.spec.harness)
+            .is_some()
+            .then_some(tower_sessions::ClipboardTarget {
+                generation: binding.plan.generation,
+            }))
+    }
+
     fn send_message(
         &self,
         session: &ManagedSession,
@@ -534,6 +555,13 @@ impl ManagedBackend for TerminalBackend {
                 "run".into(),
                 path.to_string_lossy().into_owned(),
             ],
+            clipboard: clipboard_mode(plan.spec.harness).map(|mode| {
+                tower_pool_proto::ClipboardConfig {
+                    socket: self.paths.socket.to_string_lossy().into_owned(),
+                    generation: binding.plan.generation.clone(),
+                    mode,
+                }
+            }),
             cwd: plan.spec.cwd,
             env: [
                 ("TOWER_AGENT_ID".into(), session.id.clone()),
@@ -737,6 +765,7 @@ impl TerminalAccess for TerminalBackend {
         Ok(AttachInfo {
             pool_socket: self.paths.pool_socket().to_string_lossy().into_owned(),
             pool_session: name(session)?,
+            clipboard: None,
         })
     }
     fn snapshot(&self, session: &ManagedSession) -> Result<SnapshotResult> {

@@ -100,8 +100,53 @@ history and a `limited` flag for unsupported terminal behavior. The current boun
 are 10,000 history lines and 16 MiB of retained cells per session. The pool accepts
 up to 64 sessions, 16 clients per session, and terminal sizes up to 512 columns by
 256 rows. Stopped terminal buffers can be evicted when the pool fills; SQLite
-retains ended-session metadata for 30 days by default. Raw OSC 52 clipboard access
-is blocked pending the clipboard policy interface.
+retains ended-session metadata for 30 days by default. Raw OSC 52 clipboard reads
+and writes are blocked, including during reattach.
+
+Image clipboard access uses an opt-in provider connection. The provider runs on
+the computer that owns the clipboard. For example, with a local Wayland desktop:
+
+```sh
+mkdir -p "$XDG_RUNTIME_DIR/tower-clipboard"
+tower clipboard provide --name desktop \
+  --credentials "$XDG_RUNTIME_DIR/tower-clipboard/client.json" \
+  -- wl-paste --type image/png
+# In another terminal, while the provider is running:
+tower attach SESSION_ID --clipboard "$XDG_RUNTIME_DIR/tower-clipboard/client.json"
+tower clipboard status SESSION_ID
+```
+
+The reader command writes PNG bytes to stdout. `--format image/bmp` selects BMP;
+a reader that offers both formats receives `TOWER_CLIPBOARD_FORMAT`. Stopping the
+provider revokes its access. Credentials are private, connection-bound files.
+A frontend can implement the same `clipboard.images.v1` protocol over a dedicated
+UDS connection, including an SSH-forwarded socket. Tower does not manage SSH or
+read the desktop clipboard itself.
+
+Ctrl-V uses the provider bound to the client that sent the key. A separate
+agent helper read uses the latest attached provider; detach selects the latest
+remaining eligible attachment. An in-progress paste never switches providers.
+Text paste remains ordinary terminal input. Image paste adds an attachment to
+the composer and does not submit a prompt. Codex terminal sessions use a staged
+file URL; Claude terminal sessions on Linux use image-only clipboard helpers.
+Other backends reject clipboard attachment until they implement it.
+
+For an SSH frontend, `session.attach_info` accepts `client_id` and `client_token`
+and returns a one-use, 60-second ticket in `clipboard`. Pass that object to
+`tower attach SESSION_ID --clipboard-stdin`. On a PTY, wait for
+`tower: ready for clipboard credential`, then write one JSON line. Tower disables
+echo before this marker. Credentials and tickets must not appear in command
+arguments. A provider credential object also works with this flag.
+
+Images are limited to 16 MiB each. Private staging is bounded at 256 files and
+256 MiB per host; files remain until the session ends or restarts so a composer
+can read them later. Transfers expire after 30 seconds. A failed paste discards
+that client's input queued behind it. If Claude helper consumption is uncertain,
+restart the session before another image paste. A daemon restart revokes provider
+bindings while terminal attachments keep running; reconnect the provider and
+reattach to restore sharing. Clipboard bytes do not enter registry events,
+SQLite, or Allgather sync. Allgather clipboard relay and desktop UI integration
+are separate from this local/SSH interface.
 
 Each launcher reports native session identity and status through a private socket.
 Reports continue while the daemon is stopped. Status stays `unknown` until the

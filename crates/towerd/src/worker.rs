@@ -13,6 +13,9 @@ pub(super) struct ServiceWorker {
     enrollment_gate: Arc<Semaphore>,
 }
 impl ServiceWorker {
+    pub(crate) fn clipboard(&self) -> Arc<tower_clipboard::Broker> {
+        self.service.clipboard.clone()
+    }
     pub fn events(
         &self,
     ) -> tokio::sync::broadcast::Receiver<Arc<tower_protocol::EventNotification>> {
@@ -49,6 +52,10 @@ impl ServiceWorker {
         peer: tower_pal::Peer,
     ) -> std::result::Result<tower_protocol::Value, tower_protocol::RpcError> {
         let result = match request.method.as_str() {
+            "clipboard.read" | "clipboard.fetch" | "clipboard.claim" | "clipboard.activate"
+            | "clipboard.consumed" | "clipboard.wait" | "clipboard.finish" | "clipboard.status" => {
+                self.clipboard_request(request, peer).await
+            }
             "message.send" => self.send_message(request, peer).await,
             "approval.watch" => self.approval_watch(request, peer).await,
             "conversation.list" => self.conversations(request, peer).await,
@@ -65,6 +72,91 @@ impl ServiceWorker {
                 "Request processing failed",
             )),
         }
+    }
+    async fn clipboard_request(
+        &self,
+        request: tower_protocol::Request,
+        peer: tower_pal::Peer,
+    ) -> Result<std::result::Result<tower_protocol::Value, tower_protocol::RpcError>> {
+        let method = request.method.clone();
+        let recheck = request.clone();
+        let (p, session) = self
+            .execute(move |s| s.clipboard_prepare(&request, peer))
+            .await??;
+        let broker = self.clipboard();
+        let result: std::result::Result<tower_protocol::Value, tower_protocol::RpcError> = async {
+            let v = match method.as_str() {
+                "clipboard.read" => serde_json::to_value(
+                    broker
+                        .helper(
+                            session.clone(),
+                            p.format.unwrap_or(tower_protocol::ImageFormat::Png),
+                        )
+                        .await?,
+                )
+                .map_err(|_| {
+                    tower_protocol::RpcError::application("internal_error", "Cannot encode image")
+                })?,
+                "clipboard.fetch" => {
+                    let lease = p.lease.as_ref().ok_or_else(|| {
+                        tower_protocol::RpcError::application(
+                            "unauthorized",
+                            "An attached client credential is required",
+                        )
+                    })?;
+                    serde_json::to_value(
+                        broker.fetch(session.clone(), Some(lease), p.format).await?,
+                    )
+                    .map_err(|_| {
+                        tower_protocol::RpcError::application(
+                            "internal_error",
+                            "Cannot encode image",
+                        )
+                    })?
+                }
+                "clipboard.claim" => serde_json::to_value(broker.claim(&session, &p.paste_id)?)
+                    .map_err(|_| {
+                        tower_protocol::RpcError::application(
+                            "internal_error",
+                            "Cannot encode image",
+                        )
+                    })?,
+                "clipboard.activate" => {
+                    broker.activate(&session, &p.paste_id)?;
+                    serde_json::Value::Null
+                }
+                "clipboard.consumed" => {
+                    broker.consumed(&session, &p.paste_id)?;
+                    serde_json::Value::Null
+                }
+                "clipboard.wait" => {
+                    broker.wait(&session, &p.paste_id).await?;
+                    serde_json::Value::Null
+                }
+                "clipboard.finish" => {
+                    broker.finish(&session, &p.paste_id, p.success)?;
+                    serde_json::Value::Null
+                }
+                "clipboard.status" => broker.status(&session)?,
+                _ => unreachable!(),
+            };
+            self.execute(move |s| s.clipboard_prepare(&recheck, peer).map(|_| ()))
+                .await
+                .map_err(|_| {
+                    tower_protocol::RpcError::application(
+                        "internal_error",
+                        "Clipboard authority is unavailable",
+                    )
+                })??;
+            serde_json::from_value(v).map_err(|_| {
+                tower_protocol::RpcError::application(
+                    "internal_error",
+                    "Cannot encode clipboard response",
+                )
+            })
+        }
+        .await;
+        Ok(result)
     }
     async fn enroll(
         &self,

@@ -12,8 +12,10 @@ autobins = false
 workspace = true
 
 [dependencies]
+tower-clipboard.workspace = true
 tower-pal = { workspace = true, features = ["terminal"] }
 tower-pool-proto.workspace = true
+tower-protocol.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 unicode-width = "0.2"

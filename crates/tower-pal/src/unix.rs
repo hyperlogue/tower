@@ -89,6 +89,12 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 pub fn write_owned_config(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_owned(path, bytes, true)
+}
+pub fn write_new_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_owned(path, bytes, false)
+}
+fn write_owned(path: &Path, bytes: &[u8], replace: bool) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| denied("invalid configuration path"))?;
@@ -111,7 +117,11 @@ pub fn write_owned_config(path: &Path, bytes: &[u8]) -> io::Result<()> {
         .set_permissions(fs::Permissions::from_mode(0o600))?;
     temp.write_all(bytes)?;
     temp.as_file().sync_all()?;
-    temp.persist(path).map_err(|e| e.error)?;
+    if replace {
+        temp.persist(path).map_err(|e| e.error)?;
+    } else {
+        temp.persist_noclobber(path).map_err(|e| e.error)?;
+    }
     File::open(parent)?.sync_all()
 }
 pub fn remove_private(path: &Path) -> io::Result<()> {

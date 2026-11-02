@@ -1,3 +1,4 @@
+mod clipboard;
 mod enrollment;
 mod events;
 mod execution;
@@ -142,6 +143,7 @@ impl Actor {
 }
 pub(super) struct Service {
     paths: Paths,
+    pub(crate) clipboard: Arc<tower_clipboard::Broker>,
     store: Arc<Store>,
     backends: tower_sessions::Backends,
     startup: String,
@@ -205,6 +207,7 @@ impl Service {
         store.initialize(&host_id, &node)?;
         Ok(Self {
             paths: paths.clone(),
+            clipboard: Arc::new(tower_clipboard::Broker::new(paths.state.join("clipboard"))),
             store,
             backends,
             startup: startup.into(),
@@ -235,6 +238,7 @@ impl Service {
             .map_err(|_| Error::Other("mutation lock poisoned".into()))?;
         self.sync_managed()?;
         self.scan_processes()?;
+        self.maintain_clipboard().map_err(Error::Rpc)?;
         let now = now_ms();
         for r in self.store.agents(&AgentFilter::default())? {
             if r.ownership != "registered" {
@@ -892,8 +896,7 @@ impl Service {
             }
             "session.attach_info" => {
                 require(&actor, "admin")?;
-                let p: IdParams = params(&request.params)?;
-                self.terminal_attach_info(&p.id)
+                self.clipboard_attach_info(&request.params)
             }
             "session.kill" => {
                 require(&actor, "admin")?;
@@ -954,6 +957,7 @@ impl Service {
                     "daemon.control.v1".into(),
                     "events.registry.v1".into(),
                     "sessions.managed.v1".into(),
+                    "clipboard.images.v1".into(),
                 ];
                 capabilities.extend(
                     self.backends

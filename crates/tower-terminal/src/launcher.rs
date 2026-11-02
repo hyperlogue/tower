@@ -251,6 +251,14 @@ async fn serve(
         &exe,
         env,
     )?;
+    if super::clipboard_mode(plan.spec.harness).is_some() {
+        tower_clipboard::shim::install(
+            Path::new(&plan.state_dir),
+            &exe,
+            &mut invocation.env,
+            &plan.generation,
+        )?;
+    }
     if plan.spec.harness == Harness::Codex {
         let supported =
             tower_agents::delivery::queue_supported(&invocation.env, Path::new(&plan.spec.cwd))

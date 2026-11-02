@@ -49,7 +49,16 @@ pub struct SessionMetadata {
     pub detail: Option<Value>,
 }
 
+#[derive(Clone, Debug)]
+pub struct ClipboardTarget {
+    pub generation: String,
+}
+
 pub trait ManagedBackend: Send + Sync {
+    fn clipboard(&self, _session: &ManagedSession) -> Result<Option<ClipboardTarget>> {
+        Ok(None)
+    }
+
     fn send_message(
         &self,
         _session: &ManagedSession,

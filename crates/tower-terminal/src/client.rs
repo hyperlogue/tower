@@ -9,18 +9,25 @@ use tower_pool_proto::{self as wire, Frame, Reply, Request, Size};
 use tower_protocol::AttachInfo;
 
 pub async fn attach(info: AttachInfo) -> Result<()> {
-    if !tower_pal::is_terminal() {
-        return Err("attach requires an interactive terminal".into());
-    }
+    attach_with_terminal(info, LocalTerminal::open()?).await
+}
+pub async fn attach_with_terminal(info: AttachInfo, terminal: LocalTerminal) -> Result<()> {
     let mut socket = tower_pal::connect(Path::new(&info.pool_socket)).await?;
-    tokio::time::timeout(Duration::from_secs(5), wire::hello(&mut socket)).await??;
-    let terminal = LocalTerminal::open()?;
+    let capabilities = tokio::time::timeout(
+        Duration::from_secs(5),
+        wire::hello_capabilities(&mut socket),
+    )
+    .await??;
+    if info.clipboard.is_some() && !capabilities.iter().any(|c| c == "clipboard.images.v1") {
+        return Err("This pool does not support clipboard attachments".into());
+    }
     let size = dimensions(&terminal)?;
     wire::write(
         &mut socket,
         &Request::Attach {
             name: info.pool_session,
             size,
+            clipboard: info.clipboard,
         },
     )
     .await?;
@@ -31,11 +38,22 @@ pub async fn attach(info: AttachInfo) -> Result<()> {
             match wire::read(&mut read).await? {
                 Frame::Data(bytes) => terminal.write(&bytes).await?,
                 Frame::Json(bytes) => {
-                    if let Reply::Exited { .. } = serde_json::from_slice::<Reply>(&bytes)
+                    match serde_json::from_slice::<Reply>(&bytes)
                         .map_err(io::Error::other)?
                         .checked()?
                     {
-                        return Ok::<_, io::Error>(());
+                        Reply::Exited { .. } => return Ok::<_, io::Error>(()),
+                        Reply::Clipboard {
+                            code: Some(code), ..
+                        } => {
+                            let code: String = code
+                                .chars()
+                                .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+                                .take(80)
+                                .collect();
+                            terminal.write(format!("\r\n[tower: image paste failed: {code}; pending input discarded]\r\n").as_bytes()).await?;
+                        }
+                        _ => {}
                     }
                 }
                 Frame::Unknown => {}

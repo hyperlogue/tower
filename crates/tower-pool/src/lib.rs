@@ -1,3 +1,4 @@
+mod clipboard;
 mod input;
 mod session;
 mod terminal;
@@ -105,6 +106,7 @@ async fn connection(
                 "snapshot.v1".into(),
                 "inject_if_idle.v1".into(),
                 "terminal.kitty.v1".into(),
+                "clipboard.images.v1".into(),
             ],
         },
     )
@@ -232,7 +234,11 @@ async fn connection(
                 .await
             }
         }
-        Request::Attach { name, size } => {
+        Request::Attach {
+            name,
+            size,
+            clipboard,
+        } => {
             let size = size.bounded()?;
             let Some(handle) = find(&sessions, &name) else {
                 return reply(&mut stream, &Reply::error("not_found", "session not found")).await;
@@ -254,6 +260,41 @@ async fn connection(
                     return reply(&mut stream, &Reply::error("attach_failed", error)).await;
                 }
             };
+            if let Some(ticket) = clipboard {
+                let Some(config) = &handle.launch.clipboard else {
+                    let _ = handle.tx.send(Command::Detach { id }).await;
+                    return reply(
+                        &mut stream,
+                        &Reply::error("unsupported", "Session does not support clipboard input"),
+                    )
+                    .await;
+                };
+                let params = tower_protocol::ClipboardAttach {
+                    id: name.clone(),
+                    generation: config.generation.clone(),
+                    client_id: ticket.client_id,
+                    ticket: ticket.ticket,
+                };
+                match tower_clipboard::client::attach(std::path::Path::new(&config.socket), &params)
+                    .await
+                {
+                    Ok((lease, connection)) => {
+                        handle
+                            .tx
+                            .send(Command::Clipboard {
+                                id,
+                                lease,
+                                connection,
+                            })
+                            .await
+                            .map_err(io::Error::other)?;
+                    }
+                    Err(e) => {
+                        let _ = handle.tx.send(Command::Detach { id }).await;
+                        return reply(&mut stream, &Reply::error(&e.data.code, e.message)).await;
+                    }
+                }
+            }
             let (read, mut write) = stream.split();
             let mut read = read;
             let reader = async {

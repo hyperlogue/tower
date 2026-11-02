@@ -44,6 +44,7 @@
             filter = path: type:
               craneLib.filterCargoSources path type
               || pkgs.lib.hasSuffix ".sql" path
+              || pkgs.lib.hasSuffix ".mjs" path
               || pkgs.lib.hasPrefix "LICENSE" (baseNameOf path);
           };
           strictDeps = true;

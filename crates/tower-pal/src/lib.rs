@@ -191,3 +191,7 @@ pub fn read_config(path: &Path) -> io::Result<Option<String>> {
     }
     Ok(Some(text))
 }
+
+pub fn operating_system() -> &'static str {
+    std::env::consts::OS
+}

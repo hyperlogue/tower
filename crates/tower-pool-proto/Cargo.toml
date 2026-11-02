@@ -11,6 +11,7 @@ description = "Internal control and attach protocol between towerd and tower-poo
 workspace = true
 
 [dependencies]
+tower-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

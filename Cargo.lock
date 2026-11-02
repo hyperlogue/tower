@@ -2156,10 +2156,12 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "tokio-tungstenite",
  "tower-agents",
+ "tower-clipboard",
  "tower-pal",
  "tower-pool",
  "tower-pool-proto",
@@ -2202,6 +2204,22 @@ dependencies = [
  "tower-pal",
  "tower-protocol",
  "tower-sessions",
+]
+
+[[package]]
+name = "tower-clipboard"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "getrandom 0.4.3",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "tempfile",
+ "tokio",
+ "tower-pal",
+ "tower-protocol",
 ]
 
 [[package]]
@@ -2249,8 +2267,10 @@ version = "0.1.0"
 dependencies = [
  "serde_json",
  "tokio",
+ "tower-clipboard",
  "tower-pal",
  "tower-pool-proto",
+ "tower-protocol",
  "unicode-segmentation",
  "unicode-width",
 ]
@@ -2262,6 +2282,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tower-protocol",
 ]
 
 [[package]]
@@ -2335,6 +2356,7 @@ dependencies = [
  "tokio-tungstenite",
  "toml",
  "tower-agents",
+ "tower-clipboard",
  "tower-pal",
  "tower-pool-proto",
  "tower-protocol",
@@ -2359,6 +2381,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "toml",
+ "tower-clipboard",
  "tower-pal",
  "tower-protocol",
  "tower-sessions",

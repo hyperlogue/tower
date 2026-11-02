@@ -2,6 +2,7 @@
 
 pub mod allgather;
 pub mod client;
+mod clipboard;
 mod http;
 mod http_io;
 pub mod policy;
@@ -137,6 +138,7 @@ async fn serve_connection(
         }
     }
     let _reader = ReaderGuard(reader);
+    let mut clipboard = clipboard::Connection::new(service.clipboard());
     let mut events = service.events();
     let mut subscription: Option<(
         tower_protocol::CallerContext,
@@ -148,6 +150,11 @@ async fn serve_connection(
     loop {
         let line = tokio::select! {
             line=incoming.recv()=>match line {Some(Ok(Some(line)))=>line,Some(Err(e))=>return Err(e.into()),_=>return Ok(())},
+            event=clipboard.next()=>{
+                clipboard.check(&service,peer).await?;
+                if let Some(event)=event {let mut v=serde_json::to_value(event)?;v["jsonrpc"]="2.0".into();wire::write_frame(&mut write,&v).await?;}
+                continue;
+            }
             event=events.recv(),if subscription.is_some()=>{
                 let event=event.map_err(|_|Error::Other("event stream lost data; reconnect and load current state".into()))?;
                 let (context,state,topics,approval_id)=subscription.as_ref().expect("guarded");
@@ -161,9 +168,9 @@ async fn serve_connection(
                 wire::write_frame(&mut write,&*event).await?;
                 continue;
             }
-            _=check.tick(),if subscription.is_some()=>{
-                let context=subscription.as_ref().expect("guarded").0.clone();
-                service.execute(move |s|s.check_subscription(&context,peer)).await??;
+            _=check.tick(),if subscription.is_some()||clipboard.context().is_some()=>{
+                if let Some(subscription)=&subscription {let context=subscription.0.clone();service.execute(move |s|s.check_subscription(&context,peer)).await??;}
+                clipboard.check(&service,peer).await?;
                 continue;
             }
         };
@@ -225,7 +232,9 @@ async fn serve_connection(
             true
         };
         let id = request.id.clone();
-        let result = if unsubscribe_valid {
+        let result = if let Some(result) = clipboard.request(&request, peer, &service).await {
+            result
+        } else if unsubscribe_valid {
             service.request(request, peer).await
         } else {
             Err(RpcError::application(

@@ -5,6 +5,7 @@ use tower_pal::Paths;
 use tower_protocol::*;
 use towerd::client::Client;
 mod attach;
+mod clipboard;
 mod hooks;
 mod mcp;
 mod wrapper;
@@ -72,6 +73,22 @@ enum Command {
     },
     Attach {
         id: String,
+        #[arg(
+            long,
+            conflicts_with = "clipboard_stdin",
+            help = "Private JSON file with clipboard client credentials"
+        )]
+        clipboard: Option<std::path::PathBuf>,
+        #[arg(
+            long,
+            help = "Read one JSON clipboard credential or attach ticket from stdin"
+        )]
+        clipboard_stdin: bool,
+    },
+    /// Offer this computer's image clipboard, or inspect a session's source.
+    Clipboard {
+        #[command(subcommand)]
+        command: clipboard::Command,
     },
     Kill {
         id: String,
@@ -396,6 +413,28 @@ fn context_with(
 }
 
 fn main() -> ExitCode {
+    let program = std::env::args_os().next();
+    if let Some(program) = program.as_ref().and_then(|p| p.to_str())
+        && tower_clipboard::shim::invoked_as(program)
+    {
+        let Ok(args) = std::env::args_os()
+            .skip(1)
+            .map(|arg| arg.into_string())
+            .collect::<std::result::Result<Vec<_>, _>>()
+        else {
+            return ExitCode::FAILURE;
+        };
+        return match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => match runtime.block_on(tower_clipboard::shim::run(program, args)) {
+                Ok(0) => ExitCode::SUCCESS,
+                _ => ExitCode::FAILURE,
+            },
+            Err(_) => ExitCode::FAILURE,
+        };
+    }
     let cli = Cli::parse();
     let json = cli.json;
     match execute(cli) {
@@ -793,7 +832,12 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
                 println!("{}", opened.id);
             }
         }
-        Command::Attach { id } => attach::run(&mut client, &id).await?,
+        Command::Attach {
+            id,
+            clipboard,
+            clipboard_stdin,
+        } => attach::with_clipboard(&mut client, &id, clipboard, clipboard_stdin).await?,
+        Command::Clipboard { command } => clipboard::run(command, &paths, &mut client).await?,
         Command::Kill { id, yes } => print_json(
             &client
                 .call("session.kill", &serde_json::json!({"id":id,"confirm":yes}))

@@ -389,6 +389,7 @@ fn standalone_executable_preserves_owned_session_and_both_attach_streams_on_rest
             &Request::Attach {
                 name: id.into(),
                 size: Size::default(),
+                clipboard: None,
             },
         )
         .unwrap();

@@ -11,6 +11,7 @@ description = "Command-line, MCP, and hook entry points for tower."
 workspace = true
 
 [dependencies]
+tower-clipboard.workspace = true
 tower-runtime.workspace = true
 tower-sessions.workspace = true
 tower-agents.workspace = true
@@ -26,6 +27,7 @@ serde.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+sha2.workspace = true
 tokio-tungstenite = "0.28"
 futures-util = "0.3"
 tempfile.workspace = true

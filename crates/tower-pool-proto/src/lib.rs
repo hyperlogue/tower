@@ -43,6 +43,20 @@ pub struct Launch {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub size: Option<Size>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clipboard: Option<ClipboardConfig>,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClipboardConfig {
+    pub socket: String,
+    pub generation: String,
+    pub mode: ClipboardMode,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipboardMode {
+    FileUrl,
+    NativeKey,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -62,6 +76,8 @@ pub enum Request {
     Attach {
         name: String,
         size: Size,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        clipboard: Option<tower_protocol::ClipboardTicket>,
     },
     Resize {
         size: Size,
@@ -114,6 +130,10 @@ pub enum Reply {
     Attached {
         client_id: u64,
         size: Size,
+    },
+    Clipboard {
+        state: String,
+        code: Option<String>,
     },
     Snapshot {
         size: Size,
@@ -236,9 +256,17 @@ pub async fn data(writer: &mut (impl AsyncWrite + Unpin), bytes: &[u8]) -> io::R
     Ok(())
 }
 pub async fn hello(stream: &mut (impl AsyncRead + AsyncWrite + Unpin)) -> io::Result<()> {
+    hello_capabilities(stream).await.map(|_| ())
+}
+pub async fn hello_capabilities(
+    stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
+) -> io::Result<Vec<String>> {
     write(stream, &Request::Hello { version: VERSION }).await?;
     match read(stream).await?.json::<Reply>()?.checked()? {
-        Reply::Hello { version, .. } if version == VERSION => Ok(()),
+        Reply::Hello {
+            version,
+            capabilities,
+        } if version == VERSION => Ok(capabilities),
         _ => Err(io::Error::other("incompatible pool protocol")),
     }
 }
