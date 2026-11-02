@@ -10,6 +10,10 @@ description = "Platform interfaces for terminal, IPC, process, and daemon operat
 [lints]
 workspace = true
 
+[features]
+default = []
+terminal = ["nix/term"]
+
 [dependencies]
 tokio.workspace = true
 thiserror.workspace = true
@@ -17,11 +21,12 @@ tempfile.workspace = true
 fs2 = "0.4"
 signal-hook = "0.3"
 daemonize = "0.5"
-rustix = { version = "1", features = ["process"] }
+rustix = { version = "1", features = ["process", "time"] }
+nix = { version = "0.31", features = ["process", "signal", "fs", "socket", "user", "poll"] }
+libc = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libproc = "0.14"
-libc = "0.2"

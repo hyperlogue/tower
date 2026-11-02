@@ -3,13 +3,17 @@ use std::{io, time::Duration};
 use tokio::io::BufReader;
 use tower_pal::{Paths, SingletonLock};
 use tower_protocol::{
-    CallerContext, HelloParams, PROTOCOL_VERSION, Request, RequestId, Response, ResponseBody, Value,
+    CallerContext, HelloParams, HelloResult, PROTOCOL_VERSION, Request, RequestId, Response,
+    ResponseBody, Value,
 };
 
 pub struct Client {
     reader: BufReader<tower_pal::IpcStream>,
     context: CallerContext,
     next: u64,
+    features: Vec<String>,
+    events: std::collections::VecDeque<tower_protocol::EventNotification>,
+    failed: bool,
 }
 impl Client {
     pub async fn connect(paths: &Paths, context: CallerContext, autostart: bool) -> Result<Self> {
@@ -85,8 +89,11 @@ impl Client {
             reader: BufReader::new(stream),
             context,
             next: 0,
+            features: Vec::new(),
+            events: Default::default(),
+            failed: false,
         };
-        client
+        let hello = client
             .call(
                 "hello",
                 &HelloParams {
@@ -94,9 +101,26 @@ impl Client {
                 },
             )
             .await?;
+        let hello: HelloResult = serde_json::from_value(serde_json::to_value(hello)?)?;
+        client.features = hello.capabilities;
         Ok(client)
     }
     pub async fn call<T: serde::Serialize>(&mut self, method: &str, params: &T) -> Result<Value> {
+        if self.failed {
+            return Err(Error::Other(
+                "RPC connection is unusable; reconnect before retrying".into(),
+            ));
+        }
+        // A cancelled read can consume only part of a frame. Keep this set
+        // until a complete response confirms that the stream is usable.
+        self.failed = true;
+        let result = self.call_inner(method, params).await;
+        if result.is_ok() || matches!(result, Err(Error::Rpc(_))) {
+            self.failed = false;
+        }
+        result
+    }
+    async fn call_inner<T: serde::Serialize>(&mut self, method: &str, params: &T) -> Result<Value> {
         self.next += 1;
         let id = RequestId::String(self.next.to_string());
         let request = Request {
@@ -106,13 +130,59 @@ impl Client {
             params: serde_json::from_value(serde_json::to_value(params)?)?,
             context: self.context.clone(),
         };
+        if method == "session.open"
+            && matches!(&request.params, Value::Object(p) if p.get("protocol").is_some_and(|v| !matches!(v, Value::Null)))
+            && !self.features.iter().any(|f| f == "sessions.managed.v1")
+        {
+            return Err(tower_protocol::RpcError::application("unsupported", "The running daemon does not support session protocol selection; restart it after upgrading").into());
+        }
+        if method == "session.open"
+            && matches!(&request.params,Value::Object(p) if p.get("resume").is_some_and(|v|!matches!(v,Value::Null)))
+            && !self
+                .features
+                .iter()
+                .any(|f| f == "sessions.conversations.v1")
+        {
+            return Err(tower_protocol::RpcError::application("unsupported","The running daemon does not support explicit conversation selection; restart it after upgrading").into());
+        }
+        if matches!(method, "session.restart" | "session.resume")
+            && matches!(&request.params,Value::Object(p) if p.get("args").is_some_and(|v|!matches!(v,Value::Null)))
+            && !self
+                .features
+                .iter()
+                .any(|f| f == "sessions.restart-options.v1")
+        {
+            return Err(tower_protocol::RpcError::application("unsupported","The running daemon does not support replacement arguments; restart it after upgrading").into());
+        }
         wire::write_frame(self.reader.get_mut(), &request).await?;
-        let frame =
-            tokio::time::timeout(Duration::from_secs(10), wire::read_frame(&mut self.reader))
-                .await
-                .map_err(|_| Error::Other("daemon request timed out".into()))??
-                .ok_or_else(|| Error::Other("daemon disconnected".into()))?;
-        let response: Response = serde_json::from_slice(&frame)?;
+        let timeout = if method == "approval.watch" {
+            610
+        } else if method == "message.send" || method.starts_with("allgather.enrollment.") {
+            30
+        } else {
+            10
+        };
+        let response = tokio::time::timeout(Duration::from_secs(timeout), async {
+            loop {
+                let frame = wire::read_response(&mut self.reader)
+                    .await?
+                    .ok_or_else(|| Error::Other("daemon disconnected".into()))?;
+                let parsed: serde_json::Value = serde_json::from_slice(&frame)?;
+                if parsed.get("method").is_some() {
+                    if self.events.len() >= 256 {
+                        return Err(Error::Other(
+                            "event buffer full; reconnect and reload current state".into(),
+                        ));
+                    }
+                    self.events.push_back(serde_json::from_value(parsed)?);
+                    continue;
+                }
+                return Ok::<Response, Error>(serde_json::from_value(parsed)?);
+            }
+        })
+        .await
+        .map_err(|_| Error::Other("daemon request timed out".into()))??;
+
         if response.jsonrpc != "2.0" || response.id != id {
             return Err(Error::Other("invalid RPC response identity".into()));
         }
@@ -120,6 +190,25 @@ impl Client {
             ResponseBody::Success { result } => Ok(result),
             ResponseBody::Failure { error } => Err(error.into()),
         }
+    }
+    pub async fn next_event(&mut self) -> Result<tower_protocol::EventNotification> {
+        if self.failed {
+            return Err(Error::Other(
+                "Event connection is unusable; reconnect and reload current state".into(),
+            ));
+        }
+        if let Some(event) = self.events.pop_front() {
+            return Ok(event);
+        }
+        self.failed = true;
+        let frame = wire::read_response(&mut self.reader)
+            .await?
+            .ok_or_else(|| {
+                Error::Other("event stream disconnected; reconnect and reload current state".into())
+            })?;
+        let event = serde_json::from_slice(&frame)?;
+        self.failed = false;
+        Ok(event)
     }
 }
 async fn connect(path: &std::path::Path) -> io::Result<tower_pal::IpcStream> {

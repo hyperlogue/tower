@@ -55,10 +55,14 @@ jobs:
         run: |
           nix develop --command actionlint
           nix develop --command shellcheck scripts/*.sh
+          nix develop --command node --check tests/e2e/replay.mjs
           bash -n .envrc
 
       - name: Clippy
         run: nix develop --command cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: Check daemon without terminal support
+        run: nix develop --command cargo check -p towerd --locked
 
       - name: Check Nix flake
         run: nix flake check --print-build-logs

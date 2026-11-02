@@ -15,8 +15,34 @@ pub type IpcStream = UnixStream;
 pub fn uid() -> u32 {
     rustix::process::geteuid().as_raw()
 }
+pub fn secure_socket(path: &Path) -> io::Result<()> {
+    let m = fs::symlink_metadata(path)?;
+    if !m.file_type().is_socket() || m.uid() != uid() {
+        return Err(denied("unexpected socket owner or type"));
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+}
 fn denied(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, message)
+}
+pub fn open_regular(path: &Path) -> io::Result<File> {
+    if !fs::metadata(path)?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok(file)
 }
 
 pub fn require_private_dir(path: &Path) -> io::Result<()> {
@@ -66,6 +92,22 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
         .parent()
         .ok_or_else(|| denied("invalid private file path"))?;
     require_private_dir(parent)?;
+    write_owned_config(path, bytes)
+}
+
+pub fn write_owned_config(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| denied("invalid configuration path"))?;
+    let directory = fs::metadata(parent)?;
+    if !directory.is_dir()
+        || directory.uid() != uid()
+        || directory.permissions().mode() & 0o022 != 0
+    {
+        return Err(denied(
+            "configuration directory must be owned and not writable by others",
+        ));
+    }
     if let Ok(m) = fs::symlink_metadata(path)
         && (!m.is_file() || m.uid() != uid())
     {
@@ -87,6 +129,14 @@ pub fn remove_private(path: &Path) -> io::Result<()> {
         Err(e) => Err(e),
     }
 }
+pub fn remove_private_tree(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() && m.uid() == uid() => fs::remove_dir_all(path),
+        Ok(_) => Err(denied("refusing to remove an unexpected state directory")),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
 
 /// The lock file is never unlinked: replacing its inode would permit two owners.
 pub struct SingletonLock {
@@ -97,6 +147,13 @@ impl SingletonLock {
         let file = private_file(path, true)?;
         file.try_lock_exclusive()?;
         Ok(Self { _file: file })
+    }
+}
+impl Drop for SingletonLock {
+    fn drop(&mut self) {
+        // Children can inherit this descriptor between fork and exec. Release
+        // the owner's lease now instead of waiting for every copy to close.
+        let _ = FileExt::unlock(&self._file);
     }
 }
 
@@ -189,9 +246,35 @@ pub fn ignore_hangup() -> io::Result<()> {
 }
 /// Called before starting any runtime threads.
 pub fn detach(paths: &Paths) -> io::Result<()> {
+    detach_log(paths, "towerd.log")
+}
+pub fn detach_runtime(paths: &Paths) -> io::Result<()> {
+    detach_log(paths, "runtime.log")
+}
+pub fn start_runtime() -> io::Result<()> {
+    let status = Command::new(super::executable()?)
+        .args(["__runtime", "run", "--detach"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env_remove("TOWER_AGENT_TOKEN")
+        .env_remove("TOWER_AGENT_ID")
+        .env_remove("TOWER_BEARER_TOKEN")
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other("runtime startup failed"))
+    }
+}
+#[cfg(feature = "terminal")]
+pub fn detach_pool(paths: &Paths) -> io::Result<()> {
+    detach_log(paths, "pool.log")
+}
+fn detach_log(paths: &Paths, name: &str) -> io::Result<()> {
     paths.prepare()?;
     ignore_hangup()?;
-    let mut log = private_file(&paths.logs.join("towerd.log"), true)?;
+    let mut log = private_file(&paths.logs.join(name), true)?;
     use std::io::{Seek, SeekFrom};
     log.seek(SeekFrom::End(0))?;
     daemonize::Daemonize::new()
@@ -201,6 +284,63 @@ pub fn detach(paths: &Paths) -> io::Result<()> {
         .stderr(log)
         .start()
         .map_err(io::Error::other)
+}
+
+pub type BlockingIpcStream = std::os::unix::net::UnixStream;
+pub fn connect_blocking(path: &Path) -> io::Result<BlockingIpcStream> {
+    let stream = std::os::unix::net::UnixStream::connect(path)?;
+    #[cfg(target_os = "linux")]
+    let peer_uid =
+        nix::sys::socket::getsockopt(&stream, nix::sys::socket::sockopt::PeerCredentials)?.uid();
+    #[cfg(target_os = "macos")]
+    let peer_uid = nix::unistd::getpeereid(&stream)?.0.as_raw();
+    if peer_uid != uid() {
+        return Err(denied("pool belongs to another system user"));
+    }
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(5)))?;
+    Ok(stream)
+}
+
+#[cfg(feature = "terminal")]
+pub fn start_pool() -> io::Result<()> {
+    let paths = Paths::discover()?;
+    let mut command = if cfg!(target_os = "linux")
+        && paths
+            .config_home
+            .join("systemd/user/tower-pool.service")
+            .is_file()
+    {
+        let mut c = Command::new("systemctl");
+        c.args(["--user", "--no-block", "start", "tower-pool.service"]);
+        c
+    } else if cfg!(target_os = "macos")
+        && paths
+            .home
+            .join("Library/LaunchAgents/io.tower.tower-pool.plist")
+            .is_file()
+    {
+        let mut c = Command::new("launchctl");
+        c.args(["kickstart", &format!("gui/{}/io.tower.tower-pool", uid())]);
+        c
+    } else {
+        let mut c = Command::new(super::executable()?);
+        c.args(["__pool", "run", "--detach"]);
+        c
+    };
+    let status = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .env_remove("TOWER_AGENT_TOKEN")
+        .env_remove("TOWER_AGENT_ID")
+        .env_remove("TOWER_BEARER_TOKEN")
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other("pool startup failed"))
+    }
 }
 pub async fn shutdown_signal() -> io::Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
@@ -246,8 +386,14 @@ pub fn start_daemon(paths: &Paths) -> io::Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
 pub fn process_identity(pid: u32) -> io::Result<ProcessIdentity> {
+    process_identity_detail(pid, false)
+}
+pub(crate) fn process_incarnation(pid: u32) -> io::Result<ProcessIdentity> {
+    process_identity_detail(pid, true)
+}
+#[cfg(target_os = "linux")]
+fn process_identity_detail(pid: u32, include_exited: bool) -> io::Result<ProcessIdentity> {
     let data = fs::read_to_string(format!("/proc/{pid}/stat"))?;
     let close = data
         .rfind(')')
@@ -261,7 +407,7 @@ pub fn process_identity(pid: u32) -> io::Result<ProcessIdentity> {
             .map_err(io::Error::other)
     };
     // A zombie has exited, even though kill(pid, 0) could still succeed.
-    if fields.first().is_some_and(|s| *s == "Z" || *s == "X") {
+    if !include_exited && fields.first().is_some_and(|s| *s == "Z" || *s == "X") {
         return Err(io::Error::new(io::ErrorKind::NotFound, "process exited"));
     }
     Ok(ProcessIdentity {
@@ -271,7 +417,7 @@ pub fn process_identity(pid: u32) -> io::Result<ProcessIdentity> {
     })
 }
 #[cfg(target_os = "macos")]
-pub fn process_identity(pid: u32) -> io::Result<ProcessIdentity> {
+fn process_identity_detail(pid: u32, include_exited: bool) -> io::Result<ProcessIdentity> {
     use libproc::bsd_info::BSDInfo;
     let raw = i32::try_from(pid).map_err(io::Error::other)?;
     let process = rustix::process::Pid::from_raw(raw)
@@ -287,7 +433,7 @@ pub fn process_identity(pid: u32) -> io::Result<ProcessIdentity> {
             io::Error::other(error)
         }
     })?;
-    if info.pbi_status == libc::SZOMB {
+    if !include_exited && info.pbi_status == libc::SZOMB {
         return Err(io::Error::new(io::ErrorKind::NotFound, "process exited"));
     }
     Ok(ProcessIdentity {
@@ -300,9 +446,68 @@ pub fn process_identity(pid: u32) -> io::Result<ProcessIdentity> {
     })
 }
 
+pub fn make_executable(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+}
+
+pub fn owned_socket(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.file_type().is_socket() || metadata.uid() != uid() {
+        return Err(denied("socket is not owned by the current user"));
+    }
+    Ok(())
+}
+
+pub async fn loopback_listeners(port: u16) -> io::Result<Vec<tokio::net::TcpListener>> {
+    let v4 = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
+    let port = v4.local_addr()?.port();
+    let mut listeners = vec![v4];
+    match tokio::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)).await {
+        Ok(v6) => listeners.push(v6),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::AddrNotAvailable | io::ErrorKind::Unsupported
+            ) => {}
+        Err(e) => return Err(e),
+    }
+    Ok(listeners)
+}
+
+pub fn process_name(pid: u32) -> io::Result<String> {
+    #[cfg(target_os = "linux")]
+    {
+        Ok(std::fs::read_to_string(format!("/proc/{pid}/comm"))?
+            .trim()
+            .into())
+    }
+    #[cfg(target_os = "macos")]
+    {
+        libproc::proc_pid::name(i32::try_from(pid).map_err(io::Error::other)?)
+            .map_err(io::Error::other)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn dropping_owner_releases_lock_despite_an_inherited_descriptor() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("service.lock");
+        let owner = SingletonLock::acquire(&path).unwrap();
+        // dup and fork share an open file description. CLOEXEC only closes the
+        // child's copy after exec, which may overlap another thread's shutdown.
+        let inherited = owner._file.try_clone().unwrap();
+        drop(owner);
+        let next = SingletonLock::acquire(&path).unwrap();
+        drop(inherited);
+        assert!(SingletonLock::acquire(&path).is_err());
+        drop(next);
+        assert!(SingletonLock::acquire(&path).is_ok());
+    }
     #[test]
     fn unreaped_exited_process_is_not_live() {
         let mut child = Command::new("sh").args(["-c", "exit 0"]).spawn().unwrap();

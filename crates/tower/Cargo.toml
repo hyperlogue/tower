@@ -11,13 +11,22 @@ description = "Command-line, MCP, and hook entry points for tower."
 workspace = true
 
 [dependencies]
+tower-runtime.workspace = true
+tower-sessions.workspace = true
+tower-agents.workspace = true
+tower-terminal.workspace = true
 tower-protocol.workspace = true
 tower-pal.workspace = true
 towerd.workspace = true
+tower-pool-proto.workspace = true
+tower-pool.workspace = true
 clap.workspace = true
 serde_json.workspace = true
+serde.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+tokio-tungstenite = "0.28"
+futures-util = "0.3"
 tempfile.workspace = true
 rusqlite.workspace = true

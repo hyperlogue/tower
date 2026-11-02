@@ -1,17 +1,17 @@
-//! Human and program entry points. The daemon runtime is hosted by this binary.
+//! Human and program entry points, including separate daemon and pool processes.
 use clap::{Args, Parser, Subcommand};
 use std::process::ExitCode;
 use tower_pal::Paths;
 use tower_protocol::*;
 use towerd::client::Client;
+mod attach;
+mod hooks;
+mod mcp;
+mod wrapper;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 #[derive(Parser)]
-#[command(
-    version,
-    about = "Local agent registry and daemon",
-    long_about = "Local agent registry and daemon. This build provides the UDS core, registration, local rules, and tokens. Owned terminals and message delivery are not available yet."
-)]
+#[command(version, about = "Local agent sessions and registry")]
 struct Cli {
     #[arg(long, global = true)]
     json: bool,
@@ -22,6 +22,89 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    #[command(name = "__runtime", hide = true)]
+    Runtime {
+        #[command(subcommand)]
+        command: PoolCommand,
+    },
+    #[command(name = "__acp", hide = true)]
+    Acp {
+        harness: String,
+    },
+    #[command(name = "__agent", hide = true)]
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
+    /// Receive a native agent lifecycle report. Always exits successfully.
+    Hook {
+        harness: String,
+        event: String,
+    },
+    #[command(name = "__pool", hide = true)]
+    Pool {
+        #[command(subcommand)]
+        command: PoolCommand,
+    },
+    Run {
+        harness: String,
+        #[arg(long,value_parser=["native"])]
+        mode: Option<String>,
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+    Open {
+        harness: String,
+        #[arg(long)]
+        protocol: Option<String>,
+        #[arg(long)]
+        cwd: Option<String>,
+        #[arg(long)]
+        mode: Option<String>,
+        #[arg(long)]
+        headless: bool,
+        #[arg(long)]
+        resume: Option<String>,
+        #[arg(long, requires = "resume")]
+        fork: bool,
+        #[arg(last = true)]
+        args: Vec<String>,
+    },
+    Attach {
+        id: String,
+    },
+    Kill {
+        id: String,
+        #[arg(long, help = "Confirm stopping an externally managed process")]
+        yes: bool,
+    },
+    Restart {
+        id: String,
+        #[arg(long)]
+        mode: Option<String>,
+        #[arg(last = true)]
+        args: Option<Vec<String>>,
+        #[arg(
+            long,
+            conflicts_with = "args",
+            help = "Discard saved launch options when resuming"
+        )]
+        clear_args: bool,
+    },
+    Resume {
+        id: String,
+        #[arg(last = true)]
+        args: Option<Vec<String>>,
+        #[arg(
+            long,
+            conflicts_with = "args",
+            help = "Discard saved launch options when resuming"
+        )]
+        clear_args: bool,
+    },
+    Snapshot {
+        id: String,
+    },
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
@@ -32,11 +115,18 @@ enum Command {
     },
     Register {
         #[arg(long)]
+        protocol: Option<String>,
+        #[arg(long)]
         harness: String,
         #[arg(long)]
         session_id: Option<String>,
         #[arg(long)]
         pid: Option<u32>,
+        #[arg(
+            long,
+            help = "This process hosts several sessions; never signal it to stop one session"
+        )]
+        shared_process: bool,
         #[arg(long)]
         name: Option<String>,
         #[arg(long)]
@@ -57,6 +147,62 @@ enum Command {
     Heartbeat(CredentialArgs),
     Unregister(CredentialArgs),
     Whoami,
+    Login {
+        url: Option<String>,
+        #[arg(long, help = "Read a pre-issued machine access key from stdin")]
+        key_stdin: bool,
+        #[arg(
+            long,
+            conflicts_with = "key_stdin",
+            help = "Use browser machine enrollment (the default)"
+        )]
+        browser: bool,
+        #[arg(long, help = "Suggested node display name; editable in the browser")]
+        name: Option<String>,
+        #[arg(
+            long,
+            conflicts_with = "key_stdin",
+            help = "Do not request remote ACP control"
+        )]
+        read_only: bool,
+    },
+    Logout,
+
+    Send {
+        to: String,
+        #[arg(required_unless_present = "stdin", conflicts_with = "stdin")]
+        body: Option<String>,
+        #[arg(long, help = "Read message text from stdin")]
+        stdin: bool,
+    },
+    Approve {
+        id: String,
+        #[arg(long)]
+        deny: bool,
+        #[arg(long, help = "Permit only one resend of this exact message")]
+        once: bool,
+    },
+    Approval {
+        #[command(subcommand)]
+        command: ApprovalCommand,
+    },
+    Mcp {
+        #[command(subcommand)]
+        command: Option<IntegrationCommand>,
+    },
+    Hooks {
+        #[command(subcommand)]
+        command: IntegrationCommand,
+    },
+
+    Events {
+        #[arg(
+            long,
+            value_delimiter = ',',
+            default_value = "agents,sessions,messages,approvals,sync"
+        )]
+        topics: Vec<String>,
+    },
     Rules {
         #[command(subcommand)]
         command: RulesCommand,
@@ -77,7 +223,31 @@ enum Command {
     },
 }
 #[derive(Subcommand)]
+enum PoolCommand {
+    Run {
+        #[arg(long)]
+        detach: bool,
+    },
+    Stop,
+}
+#[derive(Subcommand)]
+enum AgentCommand {
+    Run { plan: std::path::PathBuf },
+    Env,
+}
+#[derive(Subcommand)]
 enum DaemonCommand {
+    Install {
+        #[arg(long, help = "Write service files without enabling them")]
+        write_only: bool,
+    },
+    Uninstall {
+        #[arg(
+            long,
+            help = "Remove service files without contacting the service manager"
+        )]
+        write_only: bool,
+    },
     /// Run the daemon in the foreground (for a service manager), or detach.
     Run {
         #[arg(long)]
@@ -88,6 +258,8 @@ enum DaemonCommand {
 }
 #[derive(Args, Default)]
 struct ListArgs {
+    #[arg(long)]
+    protocol: Option<String>,
     #[arg(long)]
     all: bool,
     #[arg(long)]
@@ -108,8 +280,54 @@ struct CredentialArgs {
 }
 #[derive(Subcommand)]
 enum AgentsCommand {
+    Send {
+        to: String,
+        body: String,
+    },
+    Conversations {
+        #[arg(long)]
+        harness: Option<String>,
+        #[arg(long)]
+        cwd_prefix: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long)]
+        refresh: bool,
+    },
+    Supported,
+    Resumable {
+        #[arg(long)]
+        harness: Option<String>,
+    },
     Ls(ListArgs),
-    Status { id: String },
+    Status {
+        id: String,
+    },
+}
+#[derive(Subcommand)]
+enum IntegrationCommand {
+    Install {
+        harness: String,
+        #[arg(long,default_value="user",value_parser=["user","project"])]
+        scope: String,
+    },
+    Uninstall {
+        harness: String,
+        #[arg(long,default_value="user",value_parser=["user","project"])]
+        scope: String,
+    },
+}
+#[derive(Subcommand)]
+enum ApprovalCommand {
+    Ls,
+    Status {
+        id: String,
+    },
+    Watch {
+        id: String,
+        #[arg(long, default_value_t = 600)]
+        timeout_s: u64,
+    },
 }
 #[derive(Subcommand)]
 enum RulesCommand {
@@ -204,7 +422,96 @@ fn main() -> ExitCode {
     }
 }
 fn execute(cli: Cli) -> Result<()> {
+    if let Command::Hook { harness, event } = &cli.command {
+        if std::env::var_os("TOWER_LAUNCHER_SOCKET").is_some() {
+            tower_terminal::launcher::hook(harness, event);
+        } else {
+            let _ = hooks::report(harness, event);
+        }
+        return Ok(());
+    }
+    if let Command::Agent { command } = &cli.command {
+        match command {
+            AgentCommand::Env => println!("{}", serde_json::to_string(&tower_pal::environment())?),
+            AgentCommand::Run { plan } => {
+                let code = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(tower_terminal::launcher::run(plan))?;
+                if code != 0 {
+                    return Err(format!("agent exited with status {code}").into());
+                }
+            }
+        }
+        return Ok(());
+    }
+    if let Command::Hooks { command }
+    | Command::Mcp {
+        command: Some(command),
+    } = &cli.command
+    {
+        let (harness, scope, install) = match command {
+            IntegrationCommand::Install { harness, scope } => (harness, scope, true),
+            IntegrationCommand::Uninstall { harness, scope } => (harness, scope, false),
+        };
+        let path = if matches!(cli.command, Command::Hooks { .. }) {
+            tower_agents::integration::hooks(harness, scope == "project", install)?
+        } else {
+            tower_agents::integration::mcp(harness, scope == "project", install)?
+        };
+        println!("{}", path.display());
+        if install && harness == "codex" && matches!(cli.command, Command::Hooks { .. }) {
+            eprintln!(
+                "Review and trust the Tower hooks in Codex before use. Project configuration also requires native project trust."
+            );
+        }
+        return Ok(());
+    }
     let paths = Paths::discover()?;
+    if let Command::Acp { harness } = &cli.command {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(tower_runtime::bridge::run(harness))?;
+        return Ok(());
+    }
+    if let Command::Runtime { command } = &cli.command {
+        match command {
+            PoolCommand::Run { detach } => {
+                if *detach {
+                    tower_pal::detach_runtime(&paths)?;
+                }
+                tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(tower_runtime::run(paths))?;
+            }
+            PoolCommand::Stop => tower_runtime::Client::new(paths).shutdown()?,
+        }
+        return Ok(());
+    }
+    if let Command::Pool { command } = &cli.command {
+        match command {
+            PoolCommand::Run { detach } => {
+                if *detach {
+                    tower_pal::detach_pool(&paths)?;
+                }
+                tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()?
+                    .block_on(tower_pool::run(paths))?;
+            }
+            PoolCommand::Stop => {
+                let mut stream = tower_pal::connect_blocking(&paths.pool_socket())?;
+                tower_pool_proto::hello_sync(&mut stream)?;
+                tower_pool_proto::write_sync(&mut stream, &tower_pool_proto::Request::Shutdown)?;
+                tower_pool_proto::read_sync(&mut stream)?
+                    .json::<tower_pool_proto::Reply>()?
+                    .checked()?;
+            }
+        }
+        return Ok(());
+    }
     if let Command::Daemon {
         command: DaemonCommand::Run { detach },
     } = &cli.command
@@ -215,6 +522,21 @@ fn execute(cli: Cli) -> Result<()> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
+        let execution = std::sync::Arc::new(tower_runtime::Client::new(paths.clone()));
+        let backends = tower_sessions::Backends::new(
+            "terminal",
+            vec![
+                std::sync::Arc::new(tower_terminal::TerminalBackend::new(paths.clone())),
+                std::sync::Arc::new(tower_runtime::Backend::new(
+                    execution.clone(),
+                    "codex-app-server",
+                )),
+                std::sync::Arc::new(tower_runtime::Backend::new(execution.clone(), "acp")),
+            ],
+        )?
+        .with_execution(execution);
+        let backends =
+            backends.with_delivery(std::sync::Arc::new(tower_agents::delivery::NativeDelivery));
         runtime.block_on(towerd::run(
             paths,
             if *detach {
@@ -222,15 +544,22 @@ fn execute(cli: Cli) -> Result<()> {
             } else {
                 "foreground"
             },
+            backends,
         ))?;
         return Ok(());
     }
-    tokio::runtime::Builder::new_current_thread()
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
-        .build()?
-        .block_on(run(cli, paths))
+        .build()?;
+    let result = runtime.block_on(run(cli, paths));
+    runtime.shutdown_timeout(std::time::Duration::from_millis(100));
+    result
 }
 async fn run(cli: Cli, paths: Paths) -> Result<()> {
+    if matches!(cli.command, Command::Mcp { command: None }) {
+        return mcp::serve(paths, context()?, !cli.no_start).await;
+    }
+
     let stopping = matches!(
         cli.command,
         Command::Daemon {
@@ -252,6 +581,273 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
         Err(e) => return Err(e.into()),
     };
     match cli.command {
+        Command::Login {
+            url,
+            key_stdin,
+            browser: _,
+            name,
+            read_only,
+        } => {
+            if key_stdin {
+                client
+                    .call("daemon.service_access", &serde_json::json!({}))
+                    .await?;
+                let bytes = tokio::task::spawn_blocking(|| {
+                    tower_pal::read_stdin_bounded(4096, std::time::Duration::from_secs(30))
+                })
+                .await??;
+                let key = Secret(String::from_utf8(bytes)?.trim_end().into());
+                let url = match url {
+                    Some(url) => towerd::allgather::enrollment_url(&url)?,
+                    None => towerd::allgather::configured_url(&paths)?,
+                };
+                print_json(
+                    &client
+                        .call("allgather.login", &serde_json::json!({"key":key,"url":url}))
+                        .await?,
+                )?;
+            } else {
+                let started = serde_json::to_value(
+                    client
+                        .call(
+                            "allgather.enrollment.begin",
+                            &serde_json::json!({"url":url,"node_label":name,"read_only":read_only}),
+                        )
+                        .await?,
+                )?;
+                let id = started["id"]
+                    .as_str()
+                    .ok_or("Enrollment did not return an identity")?
+                    .to_owned();
+                eprintln!(
+                    "Open {}\nAuthorize this machine and choose its name in the browser.",
+                    started["authorization_url"]
+                        .as_str()
+                        .ok_or("Enrollment did not return a browser URL")?
+                );
+                if cli.json {
+                    print_json(&started)?;
+                }
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
+                let mut interval = started["interval"].as_u64().unwrap_or(5).clamp(1, 30);
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err("Browser authorization expired; run tower login again".into());
+                    }
+                    let polled = match client
+                        .call("allgather.enrollment.poll", &serde_json::json!({"id":id}))
+                        .await
+                    {
+                        Ok(value) => serde_json::to_value(value)?,
+                        Err(towerd::Error::Rpc(e))
+                            if matches!(
+                                e.data.code.as_str(),
+                                "enrollment_unavailable" | "rate_limited"
+                            ) =>
+                        {
+                            continue;
+                        }
+                        Err(error) => return Err(error.into()),
+                    };
+                    interval = polled["interval"].as_u64().unwrap_or(interval).clamp(1, 30);
+                    match polled["state"].as_str() {
+                        Some("complete") => {
+                            print_json(&polled)?;
+                            break;
+                        }
+                        Some("pending" | "authorized") => {}
+                        Some("denied") => return Err("Browser authorization was denied".into()),
+                        Some("expired") => {
+                            return Err(
+                                "Browser authorization expired; run tower login again".into()
+                            );
+                        }
+                        _ => return Err("Unexpected browser enrollment state".into()),
+                    }
+                }
+            }
+        }
+        Command::Logout => print_json(
+            &client
+                .call("allgather.logout", &serde_json::json!({}))
+                .await?,
+        )?,
+        Command::Mcp { .. } | Command::Hooks { .. } => unreachable!("handled before connecting"),
+        Command::Agents {
+            command: AgentsCommand::Send { to, body },
+        } => print_json(
+            &client
+                .call(
+                    "message.send",
+                    &MessageSendParams {
+                        to,
+                        body,
+                        ..Default::default()
+                    },
+                )
+                .await?,
+        )?,
+        Command::Send { to, body, stdin } => {
+            let body = if stdin {
+                let bytes = tokio::task::spawn_blocking(|| {
+                    tower_pal::read_stdin_bounded(32 * 1024, std::time::Duration::from_secs(30))
+                })
+                .await??;
+                String::from_utf8(bytes)?
+            } else {
+                body.unwrap_or_default()
+            };
+            print_json(
+                &client
+                    .call(
+                        "message.send",
+                        &MessageSendParams {
+                            to,
+                            body,
+                            ..Default::default()
+                        },
+                    )
+                    .await?,
+            )?;
+        }
+        Command::Approve { id, deny, once } => print_json(
+            &client
+                .call(
+                    "approval.resolve",
+                    &ApprovalResolveParams {
+                        id,
+                        allow: !deny,
+                        remember: !once,
+                    },
+                )
+                .await?,
+        )?,
+        Command::Approval { command } => match command {
+            ApprovalCommand::Ls => {
+                print_json(&client.call("approval.list", &serde_json::json!({})).await?)?
+            }
+            ApprovalCommand::Status { id } => {
+                print_json(&client.call("approval.status", &IdParams { id }).await?)?
+            }
+            ApprovalCommand::Watch { id, timeout_s } => print_json(
+                &client
+                    .call("approval.watch", &ApprovalWatchParams { id, timeout_s })
+                    .await?,
+            )?,
+        },
+        Command::Run {
+            harness,
+            mode,
+            args,
+        } => wrapper::run(paths, &mut client, harness, mode, args).await?,
+        Command::Open {
+            harness,
+            protocol,
+            cwd,
+            mode,
+            headless,
+            resume,
+            fork,
+            args,
+        } => {
+            let params = SessionOpenParams {
+                harness,
+                protocol,
+                mode,
+                headless,
+                args,
+                resume: resume.map(|native_session_id| ConversationSeed {
+                    native_session_id,
+                    fork,
+                }),
+                cwd: cwd.unwrap_or(tower_pal::cwd()?.to_string_lossy().into_owned()),
+            };
+            let r = client.call("session.open", &params).await?;
+            let opened: SessionOpenResult = serde_json::from_value(serde_json::to_value(&r)?)?;
+            if cli.json {
+                print_json(&r)?;
+            } else if !headless && tower_pal::is_terminal() {
+                let caps = match opened.caps {
+                    Some(caps) => caps,
+                    None => {
+                        let value = client
+                            .call(
+                                "agent.get",
+                                &IdParams {
+                                    id: opened.id.clone(),
+                                },
+                            )
+                            .await?;
+                        let record: AgentRecord =
+                            serde_json::from_value(serde_json::to_value(value)?)?;
+                        record.caps
+                    }
+                };
+                if caps.attach {
+                    attach::run(&mut client, &opened.id).await?;
+                } else {
+                    println!("{}", opened.id);
+                }
+            } else {
+                println!("{}", opened.id);
+            }
+        }
+        Command::Attach { id } => attach::run(&mut client, &id).await?,
+        Command::Kill { id, yes } => print_json(
+            &client
+                .call("session.kill", &serde_json::json!({"id":id,"confirm":yes}))
+                .await?,
+        )?,
+        Command::Restart {
+            id,
+            mode,
+            args,
+            clear_args,
+        } => print_json(
+            &client
+                .call(
+                    "session.restart",
+                    &SessionRestartParams {
+                        id,
+                        mode,
+                        args: if clear_args { Some(vec![]) } else { args },
+                    },
+                )
+                .await?,
+        )?,
+        Command::Resume {
+            id,
+            args,
+            clear_args,
+        } => print_json(
+            &client
+                .call(
+                    "session.resume",
+                    &SessionRestartParams {
+                        id,
+                        mode: None,
+                        args: if clear_args { Some(vec![]) } else { args },
+                    },
+                )
+                .await?,
+        )?,
+        Command::Snapshot { id } => {
+            let r = client.call("session.snapshot", &IdParams { id }).await?;
+            if cli.json {
+                print_json(&r)?;
+            } else {
+                let s: SnapshotResult = serde_json::from_value(serde_json::to_value(r)?)?;
+                use std::io::Write;
+                std::io::stdout().write_all(s.buffer.as_bytes())?;
+                if s.truncated {
+                    eprintln!("tower: oldest terminal history was discarded");
+                }
+                if s.limited {
+                    eprintln!("tower: snapshot contains unsupported terminal sequences");
+                }
+            }
+        }
         Command::Daemon {
             command: DaemonCommand::Status,
         } => {
@@ -274,15 +870,61 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
             }
         }
         Command::Daemon {
-            command: DaemonCommand::Stop,
+            command: DaemonCommand::Install { write_only },
         } => {
+            client
+                .call("daemon.service_access", &serde_json::json!({}))
+                .await?;
+            let installed = tower_pal::install_services(&paths, write_only)?;
+            print_json(&serde_json::json!({"files":installed.files,"enabled":installed.enabled}))?;
+            if !cli.json {
+                if cfg!(target_os = "linux") {
+                    eprintln!("For startup before login, run: loginctl enable-linger \"$USER\"");
+                }
+                if !write_only && !installed.enabled {
+                    eprintln!(
+                        "Service files were written. Enable them through your user service manager."
+                    );
+                }
+            }
+        }
+        Command::Daemon {
+            command: DaemonCommand::Uninstall { write_only },
+        } => {
+            client
+                .call("daemon.service_access", &serde_json::json!({}))
+                .await?;
             print_json(
-                &client
-                    .call("daemon.shutdown", &serde_json::json!({}))
-                    .await?,
+                &serde_json::json!({"removed":tower_pal::uninstall_services(&paths,write_only)?}),
             )?;
         }
         Command::Daemon {
+            command: DaemonCommand::Stop,
+        } => {
+            let result = client
+                .call("daemon.shutdown", &serde_json::json!({}))
+                .await?;
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    match tower_pal::SingletonLock::acquire(&paths.run.join("towerd.lock")) {
+                        Ok(_lock) => return Ok::<_, std::io::Error>(()),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+            })
+            .await
+            .map_err(|_| "daemon shutdown could not be confirmed")??;
+            print_json(&result)?;
+        }
+        Command::Agent { .. }
+        | Command::Acp { .. }
+        | Command::Runtime { .. }
+        | Command::Hook { .. }
+        | Command::Pool { .. }
+        | Command::Daemon {
             command: DaemonCommand::Run { .. },
         } => unreachable!(),
         Command::Ls(args)
@@ -298,6 +940,7 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
                             status: args.status,
                             cwd_prefix: args.cwd_prefix,
                             ownership: args.ownership,
+                            protocol: args.protocol,
                             include_exited: args.all,
                         },
                     },
@@ -307,7 +950,7 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
                 print_json(&r)?;
             } else {
                 let records: Vec<AgentRecord> = serde_json::from_value(serde_json::to_value(r)?)?;
-                println!("ID\tNAME\tHARNESS\tMODE\tSTATUS\tMESSAGE\tTRUST\tCWD\tATTACH");
+                println!("ID\tNAME\tHARNESS\tPROTOCOL\tMODE\tSTATUS\tMESSAGE\tTRUST\tCWD\tATTACH");
                 for r in records {
                     let message = if r.caps.message == "none" {
                         format!("none: {}", r.caps.message_reason.unwrap_or_default())
@@ -315,16 +958,19 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
                         r.caps.message
                     };
                     println!(
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                         visible(&r.id),
                         visible(r.display_name.as_deref().unwrap_or("-")),
                         visible(&r.harness),
+                        visible(r.protocol.as_deref().unwrap_or("-")),
                         visible(r.mode.as_deref().unwrap_or("-")),
                         visible(&r.status),
                         visible(&message),
                         if r.trust == "weak" { "WEAK" } else { "strong" },
                         visible(&r.cwd),
-                        r.attach_count
+                        r.pool_session
+                            .as_ref()
+                            .map_or_else(|| "-".into(), |_| r.attach_count.to_string())
                     );
                 }
             }
@@ -335,8 +981,10 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
         } => print_json(&client.call("agent.get", &IdParams { id }).await?)?,
         Command::Register {
             harness,
+            protocol,
             session_id,
             pid,
+            shared_process,
             name,
             cwd,
         } => {
@@ -345,7 +993,10 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
                 .call(
                     "agent.register",
                     &RegisterParams {
+                        shared_process,
+                        delivery: None,
                         harness,
+                        protocol,
                         cwd,
                         native_session_id: session_id,
                         pid,
@@ -372,6 +1023,7 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
                 None => Patch::Missing,
             };
             let p = UpdateParams {
+                delivery: Patch::Missing,
                 id: credential.id,
                 token: Secret(credential.token),
                 seq,
@@ -469,6 +1121,61 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
                 print_json(&client.call("token.list", &serde_json::json!({})).await?)?
             }
         },
+        Command::Agents {
+            command: AgentsCommand::Supported,
+        } => print_json(&client.call("harness.list", &serde_json::json!({})).await?)?,
+        Command::Agents {
+            command: AgentsCommand::Resumable { harness },
+        } => print_json(
+            &client
+                .call(
+                    "session.list_resumable",
+                    &serde_json::json!({"harness":harness}),
+                )
+                .await?,
+        )?,
+        Command::Events { topics } => {
+            let snapshot = client
+                .call(
+                    "subscribe",
+                    &SubscribeParams {
+                        topics,
+                        approval_id: None,
+                    },
+                )
+                .await?;
+            println!(
+                "{}",
+                serde_json::json!({"method":"snapshot","params":snapshot})
+            );
+            loop {
+                println!("{}", serde_json::to_string(&client.next_event().await?)?);
+            }
+        }
+        Command::Agents {
+            command:
+                AgentsCommand::Conversations {
+                    harness,
+                    cwd_prefix,
+                    limit,
+                    refresh,
+                },
+        } => {
+            print_json(
+                &client
+                    .call(
+                        "conversation.list",
+                        &ConversationListParams {
+                            harness,
+                            cwd_prefix,
+                            limit: Some(limit),
+                            refresh,
+                            protocol: None,
+                        },
+                    )
+                    .await?,
+            )?;
+        }
         Command::Rpc { method, params } => {
             let params: serde_json::Value = serde_json::from_str(&params)?;
             print_json(&client.call(&method, &params).await?)?;
@@ -476,7 +1183,7 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
     }
     Ok(())
 }
-fn print_json(value: &Value) -> Result<()> {
+fn print_json(value: &impl serde::Serialize) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
 }

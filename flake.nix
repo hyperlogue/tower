@@ -42,9 +42,12 @@
           src = pkgs.lib.cleanSourceWith {
             src = ./.;
             filter = path: type:
-              craneLib.filterCargoSources path type || pkgs.lib.hasSuffix ".sql" path;
+              craneLib.filterCargoSources path type
+              || pkgs.lib.hasSuffix ".sql" path
+              || pkgs.lib.hasPrefix "LICENSE" (baseNameOf path);
           };
           strictDeps = true;
+          nativeCheckInputs = [pkgs.nodejs];
           cargoExtraArgs = "--workspace --locked";
           nativeBuildInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [pkgs.rustPlatform.bindgenHook];
         };
@@ -53,6 +56,13 @@
           // {
             inherit cargoArtifacts;
             meta.mainProgram = "tower";
+            postInstall = ''
+              test -x "$out/bin/tower"
+              test "$(ls -A "$out/bin")" = tower
+              install -Dm644 LICENSE-MIT "$out/share/licenses/tower/LICENSE-MIT"
+              install -Dm644 LICENSE-APACHE "$out/share/licenses/tower/LICENSE-APACHE"
+              install -Dm644 LICENSE-CAPTAIN-MIAO "$out/share/licenses/tower/LICENSE-CAPTAIN-MIAO"
+            '';
           });
       in {
         packages = {
@@ -62,6 +72,12 @@
 
         checks = {
           build = tower;
+          core = craneLib.cargoClippy (commonArgs
+            // {
+              inherit cargoArtifacts;
+              cargoExtraArgs = "-p towerd --locked";
+              cargoClippyExtraArgs = "--all-targets -- -D warnings";
+            });
           clippy = craneLib.cargoClippy (commonArgs
             // {
               inherit cargoArtifacts;

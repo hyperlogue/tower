@@ -17,19 +17,23 @@ in
       [rustToolchain]
       ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [pkgs.rustPlatform.bindgenHook];
 
-    packages = with pkgs; [
-      rust-analyzer
-      cargo-edit
-      cargo-watch
-      pkg-config
-      sqlite
-      jq
-      alejandra
-      actionlint
-      shellcheck
-      direnv
-      nix-direnv
-    ];
+    packages =
+      (with pkgs; [
+        rust-analyzer
+        cargo-edit
+        cargo-watch
+        pkg-config
+        sqlite
+        jq
+        nodejs
+        bun
+        alejandra
+        actionlint
+        shellcheck
+        direnv
+        nix-direnv
+      ])
+      ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [pkgs.util-linux pkgs.iproute2];
 
     shellHook = ''
       tower_repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)

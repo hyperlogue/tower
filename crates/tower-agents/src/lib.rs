@@ -1,3 +1,13 @@
-//! Agent launchers, harness adapters, hooks, and resume support.
-//!
-//! Bootstrap crate. Interfaces will be defined after the design review.
+pub mod activity;
+pub mod config;
+pub mod delivery;
+pub mod environment;
+pub mod events;
+mod extensions;
+pub mod harness;
+pub mod integration;
+pub mod inventory;
+pub mod runtime;
+#[cfg(test)]
+mod tests;
+pub use harness::Harness;

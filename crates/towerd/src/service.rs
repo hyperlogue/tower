@@ -1,3 +1,11 @@
+mod enrollment;
+mod events;
+mod execution;
+mod managed;
+mod messaging;
+mod scan;
+mod sync;
+mod terminal;
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
@@ -83,7 +91,8 @@ fn params<T: DeserializeOwned>(v: &Value) -> std::result::Result<T, RpcError> {
 #[serde(default)]
 struct Config {
     history: History,
-    http: Http,
+    messaging: messaging::Limits,
+    scan: scan::Config,
 }
 #[derive(Deserialize)]
 #[serde(default)]
@@ -97,14 +106,12 @@ impl Default for History {
         }
     }
 }
-#[derive(Default, Deserialize)]
-#[serde(default)]
-struct Http {
-    enabled: bool,
-}
 
 enum Actor {
     Human,
+    Allgather {
+        scope: Vec<String>,
+    },
     Agent {
         record: Box<AgentRecord>,
         strong: bool,
@@ -116,6 +123,7 @@ impl Actor {
     fn id(&self) -> String {
         match self {
             Self::Human => "human".into(),
+            Self::Allgather { .. } => "allgather".into(),
             Self::Agent { record, .. } => record.id.clone(),
             Self::Token(info) => format!("token:{}", info.name),
             Self::Unregistered => "unregistered".into(),
@@ -124,32 +132,47 @@ impl Actor {
     fn authorized(&self, scope: &str) -> bool {
         match self {
             Self::Human => true,
+            Self::Allgather { scope: scopes } => scopes
+                .iter()
+                .any(|s| s == scope || (scope != "acp:control" && s == "admin")),
             Self::Token(t) => t.scope.iter().any(|s| s == scope || s == "admin"),
-            _ => scope == "read",
+            _ => matches!(scope, "read" | "subscribe"),
         }
     }
 }
 pub(super) struct Service {
     paths: Paths,
     store: Arc<dyn Store>,
+    backends: tower_sessions::Backends,
     startup: String,
     retention_ms: u64,
+    allgather_config: crate::allgather::Config,
+    pending_enrollments: Mutex<BTreeMap<String, crate::allgather::enrollment::Pending>>,
+    connected: std::sync::atomic::AtomicBool,
+    remote_epoch: std::sync::atomic::AtomicU64,
+    policy_epoch: std::sync::atomic::AtomicU64,
+    message_limits: messaging::Limits,
+    traffic: Mutex<messaging::Traffic>,
+    scan: scan::Config,
+    last_scan: Mutex<std::time::Instant>,
     /// Serialize identity resolution and writes, including filesystem credential publication.
     mutation: Mutex<()>,
+    events: tokio::sync::broadcast::Sender<Arc<EventNotification>>,
+    published: Mutex<events::Published>,
 }
 impl Service {
-    pub fn new(paths: Paths, store: Arc<dyn Store>, startup: &str) -> Result<Self> {
+    pub fn new(
+        paths: Paths,
+        store: Arc<dyn Store>,
+        startup: &str,
+        backends: tower_sessions::Backends,
+    ) -> Result<Self> {
         let config: Config =
             match tower_pal::read_config(&paths.config_home.join("tower/config.toml"))? {
                 Some(text) => toml::from_str(&text)
                     .map_err(|_| Error::Other("invalid tower configuration".into()))?,
                 None => Config::default(),
             };
-        if config.http.enabled {
-            return Err(Error::Other(
-                "this build implements UDS only; HTTP is not available yet".into(),
-            ));
-        }
         let retention_ms = config
             .history
             .owned_retention_days
@@ -181,15 +204,28 @@ impl Service {
         );
         store.initialize(&host_id, &node)?;
         Ok(Self {
-            paths,
+            paths: paths.clone(),
             store,
+            backends,
             startup: startup.into(),
             retention_ms,
+            allgather_config: crate::allgather::Config::load(&paths)?,
+            pending_enrollments: Mutex::new(BTreeMap::new()),
+            connected: std::sync::atomic::AtomicBool::new(false),
+            remote_epoch: std::sync::atomic::AtomicU64::new(0),
+            policy_epoch: std::sync::atomic::AtomicU64::new(0),
+            message_limits: config.messaging,
+            traffic: Mutex::new(messaging::Traffic::default()),
+            scan: config.scan,
+            last_scan: Mutex::new(std::time::Instant::now()),
             mutation: Mutex::new(()),
+            events: tokio::sync::broadcast::channel(256).0,
+            published: Mutex::new(events::Published::default()),
         })
     }
     pub fn recover_registry(&self) -> Result<()> {
         self.store.mark_unconfirmed(now_ms())?;
+        self.sync_managed()?;
         Ok(())
     }
     pub fn maintain(&self) -> Result<()> {
@@ -197,6 +233,8 @@ impl Service {
             .mutation
             .lock()
             .map_err(|_| Error::Other("mutation lock poisoned".into()))?;
+        self.sync_managed()?;
+        self.scan_processes()?;
         let now = now_ms();
         for r in self.store.agents(&AgentFilter::default())? {
             if r.ownership != "registered" {
@@ -216,9 +254,18 @@ impl Service {
                 self.store.mark_lost(&r.id, now)?;
             }
         }
+        for session in self.store.expiring_managed(now, self.retention_ms)? {
+            if let Some(backend) = self.backends.get(&session.protocol) {
+                backend.cleanup(&session).map_err(Error::Rpc)?;
+            }
+        }
         for id in self.store.expire(now, self.retention_ms)? {
             tower_pal::remove_private(&self.paths.token_path(&id)?)?;
         }
+        for a in self.store.expire_approvals(now)? {
+            self.emit("approval.resolved",&a.id,serde_json::json!({"approval_id":a.id,"state":a.state,"reason":a.reason,"from":a.from,"to":a.to})).map_err(Error::Rpc)?;
+        }
+        self.publish().map_err(Error::Rpc)?;
         Ok(())
     }
     fn all(&self) -> std::result::Result<Vec<AgentRecord>, RpcError> {
@@ -329,12 +376,16 @@ impl Service {
             let Ok(p) = tower_pal::process_identity(current) else {
                 break;
             };
-            if let Some(record) = all
+            let matches = all
                 .iter()
-                .find(|r| r.pid == Some(p.pid) && r.pid_start_time == Some(p.start_time))
-            {
+                .filter(|r| r.pid == Some(p.pid) && r.pid_start_time == Some(p.start_time))
+                .collect::<Vec<_>>();
+            if matches.len() > 1 || matches.iter().any(|r| r.shared_process) {
+                return Ok(Actor::Unregistered);
+            }
+            if let Some(record) = matches.first() {
                 return Ok(Actor::Agent {
-                    record: Box::new(record.clone()),
+                    record: Box::new((*record).clone()),
                     strong: false,
                 });
             }
@@ -358,10 +409,46 @@ impl Service {
         actor: &Actor,
         now: u64,
     ) -> std::result::Result<Value, RpcError> {
-        let p: RegisterParams = params(&request.params)?;
-        if matches!(&actor, Actor::Token(_)) {
+        self.register_source(request, actor, now, "cli")
+    }
+    fn register_source(
+        &self,
+        request: &Request,
+        actor: &Actor,
+        now: u64,
+        source: &str,
+    ) -> std::result::Result<Value, RpcError> {
+        if matches!(actor, Actor::Token(_)) {
             require(actor, "admin")?;
         }
+        let mut p: RegisterParams = params(&request.params)?;
+        let supplied_delivery = p.delivery.is_some();
+        let mut endpoint = p.delivery.take();
+        if p.harness == "codex" && source != "scan" {
+            if let Some(e) = &endpoint {
+                if p.native_session_id.is_none() {
+                    p.native_session_id = e.thread_id.clone();
+                }
+                if e.thread_id.is_some() && e.thread_id != p.native_session_id {
+                    return Err(invalid(
+                        "Delivery thread must match the native session identity",
+                    ));
+                }
+            }
+            if let Some(id) = &p.native_session_id {
+                let e = endpoint.get_or_insert_with(DeliveryEndpoint::default);
+                e.thread_id = Some(id.clone());
+            }
+        }
+        let message_reason = if source == "scan" {
+            "scan_only"
+        } else {
+            match p.harness.as_str() {
+                "claude-code" => "no_messaging_token",
+                "codex" => "no_thread_id",
+                _ => "harness_unsupported",
+            }
+        };
         identifier(&p.harness, 64)?;
         if p.native_session_id
             .as_ref()
@@ -397,6 +484,15 @@ impl Service {
         {
             return Err(app("denied", "An agent can only register its own session"));
         }
+        if let (Some(adapter), Some(endpoint)) = (self.backends.delivery(), &endpoint) {
+            adapter.validate(endpoint)?;
+        }
+        if p.protocol
+            .as_deref()
+            .is_some_and(|p| !tower_sessions::valid_protocol(p))
+        {
+            return Err(invalid("Invalid session protocol"));
+        }
         let cwd = self
             .paths
             .display_cwd(&p.cwd)
@@ -408,6 +504,13 @@ impl Service {
                     .map_err(|_| invalid("PID is not a live accessible process"))
             })
             .transpose()?;
+        let shared_codex = p.harness == "codex"
+            && (endpoint.as_ref().is_some_and(|e| e.app_server.is_some())
+                || (p.native_session_id.is_some()
+                    && identity.is_some_and(|i| {
+                        tower_pal::inspect_process(i.pid)
+                            .is_ok_and(|p| p.argv.iter().take(3).any(|s| s == "app-server"))
+                    })));
         let host = self.store.host().map_err(storage)?;
         let id = format!(
             "{}-{}",
@@ -420,19 +523,24 @@ impl Service {
             display_name: p.display_name,
             node: host.node_name,
             harness: p.harness,
-            mode: None,
+            mode: shared_codex.then(|| "app-server".into()),
             ownership: "registered".into(),
+            protocol: p.protocol,
             trust: "weak".into(),
             native_session_id: p.native_session_id,
             pid: identity.map(|p| p.pid),
             pid_start_time: identity.map(|p| p.start_time),
+            shared_process: p.shared_process || shared_codex,
             cwd,
             status: "unknown".into(),
             status_detail: None,
-            caps: Capabilities::unavailable("not_implemented"),
+            caps: Capabilities {
+                kill: identity.is_some() && !shared_codex && !p.shared_process,
+                ..Capabilities::unavailable(message_reason)
+            },
             pool_session: None,
             attach_count: 0,
-            sources: vec!["cli".into()],
+            sources: vec![source.into()],
             registered_at: now,
             updated_at: now,
             last_seen: now,
@@ -486,6 +594,18 @@ impl Service {
                     "Credential file and registry disagree",
                 ));
             }
+            if existing.record.ownership == "registered" && !supplied_delivery && source != "scan" {
+                let mut previous = self.store.delivery(&existing.record.id).map_err(storage)?;
+                if existing.record.harness == "codex" && previous.thread_id.is_none() {
+                    previous.thread_id = candidate
+                        .native_session_id
+                        .clone()
+                        .or_else(|| existing.record.native_session_id.clone());
+                }
+                endpoint = Some(previous);
+            }
+            candidate.shared_process |= existing.record.shared_process;
+            candidate.caps.kill &= !candidate.shared_process;
             // A report without a PID may retain a binding only if it is still live.
             if candidate.pid.is_none()
                 && let (Some(pid), Some(start)) =
@@ -494,6 +614,9 @@ impl Service {
             {
                 candidate.pid = Some(pid);
                 candidate.pid_start_time = Some(start);
+                candidate.shared_process = existing.record.shared_process;
+                candidate.caps.kill = existing.record.caps.kill;
+                candidate.mode = existing.record.mode.clone().or(candidate.mode);
             }
             (token, existing.record.id, None)
         } else {
@@ -514,21 +637,306 @@ impl Service {
                 return Err(storage(e));
             }
         };
+        if registered.agent.record.ownership == "registered"
+            && let Some(endpoint) = endpoint
+            && self.backends.delivery().is_some()
+        {
+            self.set_delivery(DeliveryParams {
+                id: registered.agent.record.id.clone(),
+                token: token.clone(),
+                delivery: endpoint,
+            })?;
+        }
         value(RegisterResult {
             id: registered.agent.record.id,
             token,
             trust: registered.agent.record.trust,
         })
     }
+    pub(crate) fn conversations(
+        &self,
+        request: &Request,
+        peer: Peer,
+    ) -> std::result::Result<Value, RpcError> {
+        require(&self.actor(&request.context, peer)?, "read")?;
+        let mut p: ConversationListParams = params(&request.params)?;
+        if p.limit.is_some_and(|n| n == 0 || n > 1000) {
+            return Err(invalid("limit must be between 1 and 1000"));
+        }
+        if let Some(prefix) = &p.cwd_prefix {
+            p.cwd_prefix = Some(
+                self.paths
+                    .absolute_cwd(prefix)
+                    .map_err(|_| invalid("Invalid directory prefix"))?
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        if let Some(protocol) = &p.protocol {
+            self.backends.select(Some(protocol))?;
+        }
+        let known = self.all()?;
+        let mut result = ConversationList::default();
+        for backend in self
+            .backends
+            .iter()
+            .filter(|b| p.protocol.as_deref().is_none_or(|s| s == b.protocol()))
+        {
+            let mut part = backend.conversations(&p)?;
+            for c in &mut part.conversations {
+                c.tower_id = known
+                    .iter()
+                    .find(|r| {
+                        r.harness == c.harness
+                            && r.native_session_id.as_ref() == Some(&c.native_session_id)
+                    })
+                    .map(|r| r.id.clone());
+            }
+            result.conversations.extend(part.conversations);
+            result.errors.extend(part.errors);
+            result.truncated |= part.truncated;
+        }
+        result.conversations.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| a.harness.cmp(&b.harness))
+                .then_with(|| a.native_session_id.cmp(&b.native_session_id))
+        });
+        result.truncated |= result.conversations.len() > p.limit.unwrap_or(100);
+        result.conversations.truncate(p.limit.unwrap_or(100));
+        require(&self.actor(&request.context, peer)?, "read")?;
+        value(result)
+    }
     pub fn dispatch(&self, request: &Request, peer: Peer) -> std::result::Result<Value, RpcError> {
+        let result = self.dispatch_inner(request, peer);
+        if result.is_ok() {
+            self.publish()?;
+        }
+        result
+    }
+    fn dispatch_inner(
+        &self,
+        request: &Request,
+        peer: Peer,
+    ) -> std::result::Result<Value, RpcError> {
         // Authentication and authorization are re-evaluated on every request, not cached per socket.
         let _guard = self
             .mutation
             .lock()
             .map_err(|_| app("internal_error", "Mutation lock unavailable"))?;
+        if request.method == "runtime.authorize" {
+            return self.authorize_runtime(request, peer);
+        }
         let actor = self.actor(&request.context, peer)?;
+        self.dispatch_actor(request, actor, peer)
+    }
+    fn dispatch_actor(
+        &self,
+        request: &Request,
+        actor: Actor,
+        peer: Peer,
+    ) -> std::result::Result<Value, RpcError> {
         let now = now_ms();
+        if matches!(
+            request.method.as_str(),
+            "agent.update" | "agent.delivery" | "agent.heartbeat" | "agent.unregister"
+        ) {
+            if matches!(actor, Actor::Token(_)) {
+                require(&actor, "admin")?;
+            }
+            if let Actor::Agent { record, .. } = &actor {
+                let p: IdParams = params(&request.params)?;
+                if self.resolve(&p.id)?.record.id != record.id {
+                    return Err(app(
+                        "denied",
+                        "Agent credentials cannot update another session",
+                    ));
+                }
+            }
+        }
         match request.method.as_str() {
+            "allgather.login" | "allgather.logout" | "allgather.status" => {
+                self.enrollment(request, &actor)
+            }
+            "agent.hook" => self.hook_report(request, &actor),
+            "agent.delivery" => self.set_delivery(params(&request.params)?),
+            "approval.list" | "approval.status" | "approval.resolve" => {
+                self.approval_dispatch(request, &actor)
+            }
+            "daemon.service_access" => {
+                require(&actor, "admin")?;
+                value(serde_json::json!({"authorized":true}))
+            }
+            "subscribe" => {
+                require(&actor, "subscribe")?;
+                let p: SubscribeParams = params(&request.params)?;
+                if p.topics.is_empty()
+                    || p.topics.iter().any(|t| {
+                        !matches!(
+                            t.as_str(),
+                            "agents" | "sessions" | "messages" | "approvals" | "sync"
+                        )
+                    })
+                {
+                    return Err(app(
+                        "unsupported",
+                        "Supported subscription topics: agents, sessions, messages, approvals, sync",
+                    ));
+                }
+                if let Some(id) = &p.approval_id {
+                    if p.topics != ["approvals"] {
+                        return Err(invalid(
+                            "An approval filter requires only the approvals topic",
+                        ));
+                    }
+                    let mut check = request.clone();
+                    check.method = "approval.status".into();
+                    check.params = value(IdParams { id: id.clone() })?;
+                    self.approval_dispatch(&check, &actor)?;
+                }
+                self.sync_managed().map_err(storage)?;
+                self.publish()?;
+                let state = self
+                    .published
+                    .lock()
+                    .map_err(|_| app("internal_error", "Event state unavailable"))?;
+                value(SubscribeResult {
+                    subscription_id: format!(
+                        "sub_{}",
+                        base32(
+                            &random(10)
+                                .map_err(|_| app("internal_error", "Random source unavailable"))?
+                        )
+                    ),
+                    cursor: state.seq,
+                    agents: state.records.values().cloned().collect(),
+                })
+            }
+            "unsubscribe" => {
+                require(&actor, "subscribe")?;
+                value(serde_json::json!({"unsubscribed":true}))
+            }
+            "harness.list" => {
+                require(&actor, "read")?;
+                value(
+                    self.backends
+                        .iter()
+                        .flat_map(|b| b.harnesses())
+                        .collect::<Vec<_>>(),
+                )
+            }
+            "conversation.list" => self.conversations(request, peer),
+            "session.list_resumable" => {
+                require(&actor, "read")?;
+                let filter: AgentFilter = params(&request.params)?;
+                let records = self
+                    .store
+                    .agents(&AgentFilter {
+                        include_exited: true,
+                        ..filter
+                    })
+                    .map_err(storage)?;
+                value(
+                    records
+                        .into_iter()
+                        .filter(|r| {
+                            r.ownership == "owned"
+                                && r.caps.resume
+                                && matches!(r.status.as_str(), "exited" | "lost")
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            }
+            "session.open" => {
+                require(&actor, "admin")?;
+                let p: SessionOpenParams = params(&request.params)?;
+                let cwd = self
+                    .paths
+                    .display_cwd(&p.cwd)
+                    .map_err(|_| invalid("Invalid working directory"))?;
+                self.session_policy(
+                    &actor,
+                    crate::policy::Subject {
+                        id: "*",
+                        harness: Some(&p.harness),
+                        cwd: Some(&cwd),
+                    },
+                )?;
+                self.managed_open(p)
+            }
+            "session.restart" | "session.resume" => {
+                require(&actor, "admin")?;
+                let p: SessionRestartParams = params(&request.params)?;
+                let record = self.resolve(&p.id)?.record;
+                self.session_policy(
+                    &actor,
+                    crate::policy::Subject {
+                        id: &record.id,
+                        harness: Some(&record.harness),
+                        cwd: Some(&record.cwd),
+                    },
+                )?;
+                if self.store.host().map_err(storage)?.mode == "allgather"
+                    && !self.policy_ready()
+                    && (p.args.is_some()
+                        || p.mode
+                            .as_ref()
+                            .is_some_and(|m| Some(m) != record.mode.as_ref()))
+                {
+                    return Err(app(
+                        "denied",
+                        "Reconnect to Allgather before changing launch settings",
+                    ));
+                }
+                self.managed_restart(p, request.method == "session.restart")
+            }
+            "session.attach_info" => {
+                require(&actor, "admin")?;
+                let p: IdParams = params(&request.params)?;
+                self.terminal_attach_info(&p.id)
+            }
+            "session.kill" => {
+                require(&actor, "admin")?;
+                #[derive(Deserialize)]
+                struct Kill {
+                    id: String,
+                    #[serde(default)]
+                    confirm: bool,
+                }
+                let p: Kill = params(&request.params)?;
+                let record = self.resolve(&p.id)?.record;
+                if record.ownership == "registered" {
+                    if !record.caps.kill {
+                        return Err(app(
+                            "not_owned",
+                            "External session has no managed stop capability",
+                        ));
+                    }
+                    if !p.confirm {
+                        return Err(app(
+                            "confirmation_required",
+                            "Use --yes to stop an externally managed process",
+                        ));
+                    }
+                    let (Some(pid), Some(start)) = (record.pid, record.pid_start_time) else {
+                        return Err(app(
+                            "unsupported",
+                            "Target has no verified process identity",
+                        ));
+                    };
+                    tower_pal::terminate_process(pid, start).map_err(|_| {
+                        app("stop_unconfirmed", "Cannot signal this process incarnation")
+                    })?;
+                    value(serde_json::json!({"id":record.id,"state":"signal_sent"}))
+                } else {
+                    self.managed_kill(&p.id)
+                }
+            }
+            "session.snapshot" => {
+                require(&actor, "read")?;
+                let p: IdParams = params(&request.params)?;
+                self.terminal_snapshot(&p.id)
+            }
             "hello" => {
                 let p: HelloParams = params(&request.params)?;
                 if p.protocol_version.major != PROTOCOL_VERSION.major {
@@ -537,14 +945,25 @@ impl Service {
                         "Protocol major versions differ",
                     ));
                 }
+                let mut capabilities = vec![
+                    "registry.v1".into(),
+                    "messages.v1".into(),
+                    "approvals.v1".into(),
+                    "rules.local.v1".into(),
+                    "tokens.v1".into(),
+                    "daemon.control.v1".into(),
+                    "events.registry.v1".into(),
+                    "sessions.managed.v1".into(),
+                ];
+                capabilities.extend(
+                    self.backends
+                        .iter()
+                        .flat_map(|b| b.features())
+                        .map(|f| (*f).into()),
+                );
                 value(HelloResult {
                     protocol_version: PROTOCOL_VERSION,
-                    capabilities: vec![
-                        "registry.v1".into(),
-                        "rules.local.v1".into(),
-                        "tokens.v1".into(),
-                        "daemon.control.v1".into(),
-                    ],
+                    capabilities,
                 })
             }
             "daemon.info" => {
@@ -557,12 +976,10 @@ impl Service {
                     host_id: host.host_id,
                     node_name: host.node_name,
                     mode: host.mode,
-                    pool: PoolInfo {
-                        running: false,
-                        proto_version: None,
-                    },
+                    pool: self.terminal_pool_info(),
                     allgather: AllgatherInfo {
-                        connected: false,
+                        connected: self.connected.load(std::sync::atomic::Ordering::Relaxed),
+                        policy_current: self.policy_ready(),
                         policy_revision: host.policy_revision,
                     },
                     startup: self.startup.clone(),
@@ -578,8 +995,11 @@ impl Service {
                 match actor {
                     Actor::Human => value(serde_json::json!({"id":actor_id,"trust":"local"})),
                     Actor::Agent { record, strong } => value(
-                        serde_json::json!({"id":actor_id,"harness":record.harness,"ownership":record.ownership,"trust":if strong {"strong"} else {"weak"}}),
+                        serde_json::json!({"id":actor_id,"display_name":record.display_name,"harness":record.harness,"ownership":record.ownership,"trust":if strong {"strong"} else {"weak"}}),
                     ),
+                    Actor::Allgather { scope } => {
+                        value(serde_json::json!({"id":"allgather","scope":scope}))
+                    }
                     Actor::Token(info) => {
                         value(serde_json::json!({"id":actor_id,"scope":info.scope}))
                     }
@@ -590,6 +1010,7 @@ impl Service {
             }
             "agent.list" => {
                 require(&actor, "read")?;
+                self.sync_managed().map_err(storage)?;
                 let mut p: ListParams = params(&request.params)?;
                 let prefix = p
                     .filter
@@ -613,10 +1034,15 @@ impl Service {
             }
             "agent.get" => {
                 require(&actor, "read")?;
+                self.sync_managed().map_err(storage)?;
                 let p: IdParams = params(&request.params)?;
                 value(self.resolve(&p.id)?.record)
             }
             "agent.register" => self.register_agent(request, &actor, now),
+            "agent.wrap" => {
+                require(&actor, "admin")?;
+                self.register_source(request, &actor, now, "wrapper")
+            }
             "agent.update" => {
                 let mut p: UpdateParams = params(&request.params)?;
                 let agent = self.credential(&AgentCredential {
@@ -646,6 +1072,9 @@ impl Service {
                 if matches!(&p.display_name,Patch::Set(v) if v.chars().count()>200) {
                     return Err(invalid("Display name is too long"));
                 }
+                if matches!(&p.detail,Patch::Set(v) if !matches!(v,Value::Object(_))) {
+                    return Err(invalid("detail must be an object"));
+                }
                 if let Patch::Set(Value::Object(detail)) = &mut p.detail {
                     // This foundation accepts bounded operational metadata, never prompts/transcripts.
                     detail.retain(|key, _| {
@@ -667,8 +1096,13 @@ impl Service {
                         }
                     }
                 }
+                let delivery = self.prepare_delivery_update(&agent, &p)?;
                 p.id = agent.record.id;
-                value(self.store.update(&p, now).map_err(storage)?)
+                value(
+                    self.store
+                        .update_with_delivery(&p, now, delivery)
+                        .map_err(storage)?,
+                )
             }
             "agent.heartbeat" | "agent.unregister" => {
                 let p: AgentCredential = params(&request.params)?;
@@ -710,12 +1144,24 @@ impl Service {
                 p.rule.created_by = actor.id();
                 p.rule.created_at = now;
                 self.store.put_rule(p.rule.clone()).map_err(storage)?;
+                self.emit(
+                    "rules.changed",
+                    &p.rule.id,
+                    serde_json::json!({"operation":"put"}),
+                )?;
+                self.refresh_approvals()?;
                 value(p.rule)
             }
             "rules.remove" => {
                 require(&actor, "admin")?;
                 let p: IdParams = params(&request.params)?;
                 self.store.remove_rule(&p.id).map_err(storage)?;
+                self.refresh_approvals()?;
+                self.emit(
+                    "rules.changed",
+                    &p.id,
+                    serde_json::json!({"operation":"remove"}),
+                )?;
                 value(serde_json::json!({"ok":true}))
             }
             "rules.replace" => {
@@ -734,6 +1180,12 @@ impl Service {
                     rule.created_at = now;
                 }
                 self.store.replace_rules(&p.rules).map_err(storage)?;
+                self.refresh_approvals()?;
+                self.emit(
+                    "rules.changed",
+                    "local",
+                    serde_json::json!({"operation":"replace"}),
+                )?;
                 value(serde_json::json!({"ok":true}))
             }
             "token.issue" => {
@@ -852,9 +1304,6 @@ fn validate_rule(rule: &Rule) -> std::result::Result<(), RpcError> {
             || selector.chars().any(char::is_control)
         {
             return Err(invalid("Invalid rule selector"));
-        }
-        if selector != "*" && (selector.contains('*') || selector.contains('?')) {
-            return Err(invalid("Use whole-selector * or harness/cwd selectors"));
         }
         if selector == "harness:" || selector == "cwd:" || selector == "token:" {
             return Err(invalid("Empty rule selector"));

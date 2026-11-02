@@ -1,0 +1,758 @@
+mod app_server;
+mod client;
+mod injection;
+pub mod launcher;
+mod pool;
+pub use client::attach;
+use serde::{Serialize, de::DeserializeOwned};
+use tower_pal::Paths;
+use tower_pool_proto::{Launch, Reply, Request, Session};
+use tower_protocol::{
+    Capabilities, PoolInfo, ProtocolVersion, RpcError, Secret, SessionOpenParams, Value,
+    terminal::{AttachInfo, SnapshotResult},
+};
+use tower_sessions::{
+    ManagedBackend, ManagedSession, Observation, PreparedSession, Result,
+    terminal::{TerminalAccess, TerminalState},
+};
+
+pub struct TerminalBackend {
+    paths: Paths,
+    inventory: std::sync::Mutex<tower_agents::inventory::Inventory>,
+}
+impl TerminalBackend {
+    pub fn new(paths: Paths) -> Self {
+        Self {
+            paths,
+            inventory: Default::default(),
+        }
+    }
+    fn codex_mode(&self, request: &SessionOpenParams) -> Result<String> {
+        if let Some(mode) = &request.mode {
+            return Ok(mode.clone());
+        }
+        let config = tower_pal::read_config(&self.paths.config_home.join("tower/config.toml"))
+            .map_err(|_| error("invalid_config", "Cannot read Tower configuration"))?;
+        let config: toml::Table = config
+            .map(|s| s.parse())
+            .transpose()
+            .map_err(|_| error("invalid_config", "Invalid Tower configuration"))?
+            .unwrap_or_default();
+        let codex = config.get("codex");
+        let default = codex
+            .and_then(|c| c.get("default_mode"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("app-server");
+        let overrides = codex
+            .and_then(|c| c.get("override"))
+            .and_then(|v| v.as_array());
+        let selected = overrides
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| {
+                let prefix = self
+                    .paths
+                    .absolute_cwd(entry.get("cwd_prefix")?.as_str()?)
+                    .ok()?;
+                let prefix = prefix.to_string_lossy();
+                tower_pal::path_prefix(&request.cwd, &prefix)
+                    .then(|| (prefix.len(), entry.get("mode").and_then(|v| v.as_str())))
+            })
+            .max_by_key(|(len, _)| *len)
+            .and_then(|(_, mode)| mode)
+            .unwrap_or(default);
+        Ok(selected.into())
+    }
+}
+fn error(code: &str, message: &str) -> RpcError {
+    RpcError::application(code, message)
+}
+fn encode(value: impl Serialize) -> Result<Value> {
+    serde_json::to_value(value)
+        .and_then(serde_json::from_value)
+        .map_err(|_| error("internal_error", "Cannot encode terminal session data"))
+}
+fn decode<T: DeserializeOwned>(value: &Value) -> Result<T> {
+    serde_json::to_value(value)
+        .and_then(serde_json::from_value)
+        .map_err(|_| error("invalid_params", "Invalid terminal session data"))
+}
+fn name(session: &ManagedSession) -> Result<String> {
+    let value: serde_json::Value = decode(&session.binding)?;
+    value
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        .ok_or_else(|| error("invalid_params", "Terminal binding has no session name"))
+}
+fn observation(id: &str, name: &str, session: Option<&Session>) -> Observation {
+    let state = session.map_or("lost", |s| s.state.as_str());
+    let active = matches!(state, "reserved" | "running");
+    Observation {
+        id: id.into(),
+        binding: None,
+        status: match state {
+            "reserved" => "starting",
+            "running" => "unknown",
+            "exited" => "exited",
+            _ => "lost",
+        }
+        .into(),
+        pid: session.and_then(|s| s.pid),
+        pid_start_time: session.and_then(|s| s.pid_start_time),
+        caps: Capabilities {
+            attach: active,
+            kill: active,
+            snapshot: session.is_some(),
+            ..Capabilities::unavailable("not_implemented")
+        },
+        terminal: Some(TerminalState {
+            pool_session: name.into(),
+            attach_count: session.map_or(0, |s| s.attach_count),
+        }),
+        recovery_pending: state == "reserved",
+        metadata: Default::default(),
+    }
+}
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct Binding {
+    name: String,
+    plan: tower_agents::runtime::LauncherPlan,
+}
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct Plan {
+    spec: tower_agents::runtime::AgentSpec,
+    headless: bool,
+}
+fn binding(session: &ManagedSession) -> Result<Binding> {
+    decode(&session.binding)
+}
+fn launcher_alive(state: &tower_agents::runtime::RuntimeState) -> Result<bool> {
+    if state.boot_id
+        != tower_pal::boot_id()
+            .map_err(|_| error("backend_unavailable", "Cannot verify boot identity"))?
+    {
+        return Ok(false);
+    }
+    for (pid, start) in [
+        (Some(state.launcher_pid), Some(state.launcher_start_time)),
+        (state.agent_pid, state.agent_start_time),
+        (
+            state
+                .private
+                .get("service_pid")
+                .and_then(|p| p.as_u64())
+                .and_then(|p| p.try_into().ok()),
+            state
+                .private
+                .get("service_start_time")
+                .and_then(|p| p.as_u64()),
+        ),
+    ] {
+        if let (Some(pid), Some(start)) = (pid, start) {
+            match tower_pal::process_identity(pid) {
+                Ok(p) if p.start_time == start => return Ok(true),
+                Err(e)
+                    if !matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
+                    ) =>
+                {
+                    return Err(error(
+                        "backend_unavailable",
+                        "Cannot verify previous process exit",
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(false)
+}
+impl TerminalBackend {
+    fn state(&self, session: &ManagedSession, record: Option<&Session>) -> Result<Observation> {
+        let name = name(session)?;
+        let mut result = observation(&session.id, &name, record);
+        if let Ok(binding) = binding(session) {
+            result.caps.resume = binding.plan.spec.resume.is_some() && !binding.plan.spec.fork;
+        }
+
+        if let Ok(binding) = binding(session)
+            && let Ok(mut state) = launcher::read_state(
+                &std::path::Path::new(&binding.plan.state_dir).join("state.json"),
+            )
+            && state.id == session.id
+            && state.generation == binding.plan.generation
+        {
+            let live = record.is_some_and(|r| r.state == "running")
+                && state.boot_id == tower_pal::boot_id().unwrap_or_default()
+                && tower_pal::process_identity(state.launcher_pid)
+                    .is_ok_and(|p| p.start_time == state.launcher_start_time);
+            if live || record.is_some_and(|r| r.state == "exited") || record.is_none() {
+                if live {
+                    result.status = state.status.clone();
+                }
+                if record.is_none() {
+                    if launcher_alive(&state)? {
+                        result.status = "unknown".into();
+                        result.recovery_pending = true;
+                    } else if tower_agents::config::resume_options(
+                        binding.plan.spec.harness,
+                        &binding.plan.spec.args,
+                    )
+                    .is_err()
+                    {
+                        result.status = "exited".into();
+                        state.detail.error = Some("session_resume_failed".into());
+                    } else if state.exit_code.is_some()
+                        || state.stop_requested
+                        || !session.auto_resume
+                        || state.native.is_none()
+                        || state.private.get("native_resumable")
+                            == Some(&serde_json::Value::Bool(false))
+                    {
+                        result.status = "exited".into();
+                        if state.exit_code.is_none()
+                            && !state.stop_requested
+                            && session.auto_resume
+                            && (state.native.is_none()
+                                || state.private.get("native_resumable")
+                                    == Some(&serde_json::Value::Bool(false)))
+                        {
+                            state.detail.error = Some("session_resume_failed".into());
+                        }
+                    }
+                }
+                result.pid = state.agent_pid;
+                result.pid_start_time = state.agent_start_time;
+                result.caps.resume = state.native.is_some()
+                    && state.private.get("native_resumable")
+                        != Some(&serde_json::Value::Bool(false));
+                if live
+                    && !state.stop_requested
+                    && !matches!(state.status.as_str(), "exited" | "lost")
+                {
+                    let mut endpoint: tower_protocol::DeliveryEndpoint = state
+                        .private
+                        .get("delivery")
+                        .cloned()
+                        .and_then(|v| serde_json::from_value(v).ok())
+                        .unwrap_or_default();
+                    endpoint.thread_id = state.native.as_ref().map(|n| n.id.clone());
+                    let mut caps = tower_agents::delivery::capabilities(
+                        state.harness.id(),
+                        &endpoint,
+                        state.private.get("queue_supported")
+                            == Some(&serde_json::Value::Bool(true)),
+                    );
+                    if binding.plan.spec.mode.as_deref() == Some("app-server")
+                        && state.native.is_some()
+                    {
+                        caps.message = "native".into();
+                        caps.message_reason = None;
+                        caps.wake_when_idle = true;
+                        caps.reply_path = true;
+                    }
+                    if caps.message == "none"
+                        && state.private.get("pty_supported")
+                            == Some(&serde_json::Value::Bool(true))
+                        && injection::allowed(&self.paths, state.harness)
+                    {
+                        caps.message = "pty".into();
+                        caps.message_reason = None;
+                        caps.wake_when_idle = true;
+                        caps.reply_path = true;
+                    }
+                    result.caps.message = caps.message;
+                    result.caps.message_reason = caps.message_reason;
+                    result.caps.wake_when_idle = caps.wake_when_idle;
+                    result.caps.reply_path = caps.reply_path;
+                }
+                result.metadata = tower_sessions::SessionMetadata {
+                    native_session_id: state.native.map(|n| n.id),
+                    display_name: state.display_name,
+                    cwd: self.paths.display_cwd(&state.cwd).ok(),
+                    detail: Some(encode(&state.detail)?),
+                };
+            }
+        }
+        Ok(result)
+    }
+}
+impl ManagedBackend for TerminalBackend {
+    fn send_message(
+        &self,
+        session: &ManagedSession,
+        text: &str,
+    ) -> Result<tower_protocol::DeliveryReceipt> {
+        let binding = binding(session)?;
+        let state =
+            launcher::read_state(&std::path::Path::new(&binding.plan.state_dir).join("state.json"))
+                .map_err(|_| error("delivery_failed", "Session state is unavailable"))?;
+        if state.generation != binding.plan.generation
+            || state.id != session.id
+            || state.stop_requested
+            || matches!(state.status.as_str(), "exited" | "lost")
+        {
+            return Err(error(
+                "delivery_failed",
+                "Target session is no longer active",
+            ));
+        }
+        let token = tower_pal::read_private(
+            &self
+                .paths
+                .token_path(&session.id)
+                .map_err(|_| error("internal_error", "Invalid session identity"))?,
+        )
+        .map_err(|_| error("internal_error", "Session credential is unavailable"))?;
+        let token = String::from_utf8(token)
+            .map_err(|_| error("internal_error", "Invalid session credential"))?;
+        match launcher::send_message(&binding.plan, &token, text, false) {
+            Err(e)
+                if matches!(e.data.code.as_str(), "channel_unavailable" | "unsupported")
+                    && injection::allowed(&self.paths, binding.plan.spec.harness)
+                    && state.private.get("pty_supported")
+                        == Some(&serde_json::Value::Bool(true)) =>
+            {
+                launcher::send_message(&binding.plan, &token, text, true)
+            }
+            Err(mut e) if e.data.code == "channel_unavailable" => {
+                e.data.code = "delivery_failed".into();
+                Err(e)
+            }
+            result => result,
+        }
+    }
+
+    fn conversations(
+        &self,
+        request: &tower_protocol::ConversationListParams,
+    ) -> Result<tower_protocol::ConversationList> {
+        let harness = request
+            .harness
+            .as_deref()
+            .map(|h| {
+                tower_agents::Harness::parse(h)
+                    .ok_or_else(|| error("unsupported", "Unknown harness"))
+            })
+            .transpose()?;
+        let found = self
+            .inventory
+            .lock()
+            .map_err(|_| error("internal_error", "Inventory unavailable"))?
+            .list(&tower_pal::environment(), harness, request.refresh);
+        let mut conversations = found
+            .candidates
+            .into_iter()
+            .filter(|c| {
+                request
+                    .cwd_prefix
+                    .as_ref()
+                    .is_none_or(|prefix| tower_pal::path_prefix(&c.cwd, prefix))
+            })
+            .map(|c| tower_protocol::Conversation {
+                protocol: self.protocol().into(),
+                harness: c.harness.id().into(),
+                native_session_id: c.native.id,
+                cwd: self.paths.display_cwd(&c.cwd).unwrap_or(c.cwd),
+                display_name: c.title,
+                updated_at: c.updated_at,
+                fork: c.harness.can_fork(),
+                tower_id: None,
+            })
+            .collect::<Vec<_>>();
+        let limit = request.limit.unwrap_or(100).min(1000);
+        let truncated = found.truncated || conversations.len() > limit;
+        conversations.truncate(limit);
+        Ok(tower_protocol::ConversationList {
+            conversations,
+            errors: found.errors,
+            truncated,
+        })
+    }
+    fn cleanup(&self, session: &ManagedSession) -> Result<()> {
+        if let Ok(binding) = binding(session)
+            && let Ok(state) = launcher::read_state(
+                &std::path::Path::new(&binding.plan.state_dir).join("state.json"),
+            )
+            && launcher_alive(&state)?
+        {
+            return Err(error(
+                "session_running",
+                "Cannot remove a live session's resources",
+            ));
+        }
+        self.paths
+            .token_path(&session.id)
+            .map_err(|_| error("invalid_params", "Invalid session ID"))?;
+        tower_pal::remove_private_tree(&self.paths.state.join("sessions").join(&session.id))
+            .map_err(|_| error("cleanup_failed", "Cannot remove private session resources"))
+    }
+    fn harnesses(&self) -> Vec<tower_protocol::HarnessInfo> {
+        let env = tower_pal::environment();
+        tower_agents::Harness::ALL
+            .iter()
+            .map(|h| tower_protocol::HarnessInfo {
+                harness: h.id().into(),
+                label: h.label().into(),
+                protocol: "terminal".into(),
+                executable: h.program().into(),
+                available: tower_pal::find_program(h.program(), &env).is_some(),
+                modes: if *h == tower_agents::Harness::Codex {
+                    vec!["app-server".into(), "native".into()]
+                } else {
+                    vec![]
+                },
+                resume: true,
+            })
+            .collect()
+    }
+    fn protocol(&self) -> &str {
+        "terminal"
+    }
+    fn features(&self) -> &'static [&'static str] {
+        &[
+            "sessions.codex-native.v1",
+            "sessions.codex-app-server.v1",
+            "sessions.agents.v1",
+            "sessions.resume.v1",
+            "sessions.conversations.v1",
+            "sessions.restart-options.v1",
+        ]
+    }
+    fn prepare(&self, id: &str, request: &SessionOpenParams) -> Result<PreparedSession> {
+        let harness = tower_agents::Harness::parse(&request.harness)
+            .ok_or_else(|| error("unsupported", "Unknown agent harness"))?;
+        let selected = request
+            .resume
+            .as_ref()
+            .map(|seed| {
+                self.inventory
+                    .lock()
+                    .map_err(|_| error("internal_error", "Inventory unavailable"))?
+                    .resolve(&tower_pal::environment(), harness, &seed.native_session_id)
+                    .map_err(|e| error("conversation_unavailable", &e.to_string()))
+            })
+            .transpose()?;
+        let mut effective = request.clone();
+        if let Some(c) = &selected {
+            effective.cwd = c.cwd.clone();
+        }
+        let mode = if harness == tower_agents::Harness::Codex {
+            Some(self.codex_mode(&effective)?)
+        } else {
+            request.mode.clone()
+        };
+        let spec = tower_agents::runtime::AgentSpec {
+            native_home: selected.as_ref().and_then(|c| c.namespace.clone()),
+            harness,
+            cwd: selected
+                .as_ref()
+                .map(|c| c.cwd.clone())
+                .unwrap_or_else(|| request.cwd.clone()),
+            args: request.args.clone(),
+            mode: mode.clone(),
+            resume: selected.map(|c| c.native),
+            fork: request.resume.as_ref().is_some_and(|s| s.fork),
+        };
+        tower_agents::config::validate(&spec)
+            .map_err(|e| error("invalid_params", &e.to_string()))?;
+        pool::ensure(&self.paths)
+            .map_err(|_| error("pool_unavailable", "Cannot connect to terminal pool"))?;
+        let mut bytes = [0; 8];
+        getrandom::fill(&mut bytes)
+            .map_err(|_| error("internal_error", "Random source unavailable"))?;
+        let generation: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let root = self.paths.state.join("sessions").join(id).join(&generation);
+        let run = self.paths.run.join("agents");
+        tower_pal::private_dir(&root)
+            .and_then(|_| tower_pal::private_dir(&run))
+            .map_err(|_| error("internal_error", "Cannot create session directory"))?;
+        let plan = tower_agents::runtime::LauncherPlan {
+            id: id.into(),
+            generation: generation.clone(),
+            state_dir: root.to_string_lossy().into_owned(),
+            tower_socket: self.paths.socket.to_string_lossy().into_owned(),
+            control_socket: run
+                .join(format!("{generation}.sock"))
+                .to_string_lossy()
+                .into_owned(),
+            spec: spec.clone(),
+        };
+        let binding = Binding {
+            name: id.into(),
+            plan,
+        };
+        Ok(PreparedSession {
+            harness: harness.id().into(),
+            cwd: spec.cwd.clone(),
+            native_session_id: (!spec.fork)
+                .then(|| spec.resume.as_ref().map(|n| n.id.clone()))
+                .flatten(),
+            binding: encode(&binding)?,
+            launch: encode(Plan {
+                spec,
+                headless: request.headless,
+            })?,
+            mode,
+            caps: Capabilities {
+                attach: true,
+                kill: true,
+                snapshot: true,
+                ..Capabilities::unavailable("not_implemented")
+            },
+            terminal: Some(TerminalState {
+                pool_session: id.into(),
+                attach_count: 0,
+            }),
+        })
+    }
+    fn start(&self, session: &ManagedSession, token: &Secret) -> Result<Observation> {
+        let binding = binding(session)?;
+        let plan: Plan = decode(
+            session
+                .launch
+                .as_ref()
+                .ok_or_else(|| error("invalid_params", "No launch plan"))?,
+        )?;
+        let path = std::path::Path::new(&binding.plan.state_dir).join("plan.json");
+        tower_pal::write_private(
+            &path,
+            &serde_json::to_vec(&binding.plan)
+                .map_err(|_| error("internal_error", "Cannot serialize launch plan"))?,
+        )
+        .map_err(|_| error("internal_error", "Cannot save launch plan"))?;
+        let launch = Launch {
+            name: binding.name.clone(),
+            argv: vec![
+                tower_pal::executable()
+                    .map_err(|_| error("internal_error", "Cannot find Tower executable"))?
+                    .to_string_lossy()
+                    .into_owned(),
+                "__agent".into(),
+                "run".into(),
+                path.to_string_lossy().into_owned(),
+            ],
+            cwd: plan.spec.cwd,
+            env: [
+                ("TOWER_AGENT_ID".into(), session.id.clone()),
+                ("TOWER_AGENT_TOKEN".into(), token.0.clone()),
+                (
+                    "TOWER_SOCKET".into(),
+                    self.paths.socket.to_string_lossy().into_owned(),
+                ),
+            ]
+            .into(),
+            size: plan.headless.then(Default::default),
+        };
+        pool::ensure(&self.paths)
+            .map_err(|_| error("pool_unavailable", "Cannot start terminal pool"))?;
+        if pool::list(&self.paths).is_ok_and(|records| {
+            records
+                .iter()
+                .any(|r| r.name == binding.name && r.state == "exited")
+        }) {
+            pool::request(&self.paths,&Request::Remove{name:binding.name.clone()}).map_err(|_|error("pool_incompatible","Pool cannot replace an exited session; restart the pool after stopping its sessions"))?;
+        }
+        match pool::request(&self.paths, &Request::Create { launch }) {
+            Ok(Reply::Created { session: created }) if created.name == binding.name => {
+                self.state(session, Some(&created))
+            }
+            _ => Err(error(
+                "launch_failed",
+                "Launch could not be confirmed; inspect the session before retrying",
+            )),
+        }
+    }
+    fn observe(&self, sessions: &[ManagedSession]) -> Result<Vec<Observation>> {
+        if sessions.is_empty() {
+            return Ok(vec![]);
+        }
+        pool::ensure(&self.paths)
+            .map_err(|_| error("backend_unavailable", "Cannot start terminal pool"))?;
+        let records = pool::list(&self.paths)
+            .map_err(|_| error("backend_unavailable", "Terminal pool unavailable"))?;
+        sessions
+            .iter()
+            .map(|s| {
+                let n = name(s)?;
+                let record = records.iter().find(|r| r.name == n);
+                self.state(s, record)
+            })
+            .collect()
+    }
+    fn stop(&self, session: &ManagedSession) -> Result<Observation> {
+        let name = name(session)?;
+        if let Ok(binding) = binding(session)
+            && let Ok(path) = self.paths.token_path(&session.id)
+            && let Ok(token) = tower_pal::read_private(&path)
+            && let Ok(token) = String::from_utf8(token)
+        {
+            let _ = launcher::stop(&binding.plan, &token);
+        }
+        if !matches!(
+            pool::request(&self.paths, &Request::Kill { name: name.clone() }),
+            Ok(Reply::Ok)
+        ) {
+            return Err(error(
+                "stop_unconfirmed",
+                "Terminal pool could not confirm termination",
+            ));
+        }
+        let records = pool::list(&self.paths)
+            .map_err(|_| error("stop_unconfirmed", "Cannot verify termination"))?;
+        self.state(session, records.iter().find(|r| r.name == name))
+    }
+    fn prepare_resume(
+        &self,
+        session: &ManagedSession,
+        mode: Option<&str>,
+        args: Option<&[String]>,
+    ) -> Result<PreparedSession> {
+        let old = binding(session)?;
+        let mut spec = old.plan.spec;
+        match launcher::read_state(&std::path::Path::new(&old.plan.state_dir).join("state.json")) {
+            Ok(state) => {
+                if state.generation != old.plan.generation || state.id != session.id {
+                    return Err(error(
+                        "resume_unavailable",
+                        "Session state belongs to another incarnation",
+                    ));
+                }
+                if state.private.get("native_resumable") == Some(&serde_json::Value::Bool(false)) {
+                    return Err(error(
+                        "resume_unavailable",
+                        "This native conversation is ephemeral",
+                    ));
+                }
+                spec.resume = Some(state.native.ok_or_else(|| {
+                    error(
+                        "resume_unavailable",
+                        "The agent has not reported a native session identity",
+                    )
+                })?);
+                spec.native_home = state
+                    .private
+                    .get("native_home")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_owned)
+                    .or(spec.native_home);
+                spec.cwd = state.cwd;
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && spec.resume.is_some()
+                    && !spec.fork => {}
+            Err(_) => {
+                return Err(error(
+                    "resume_unavailable",
+                    "No native session state is available",
+                ));
+            }
+        }
+        spec.args = match args {
+            Some(args) => args.to_vec(),
+            None => tower_agents::config::resume_options(spec.harness, &spec.args)
+                .map_err(|e| error("resume_options_required", &e.to_string()))?,
+        };
+        spec.fork = false;
+        spec.mode = mode.map(str::to_owned).or(spec.mode);
+        tower_agents::config::validate(&spec)
+            .map_err(|e| error("invalid_params", &e.to_string()))?;
+        let request = SessionOpenParams {
+            resume: None,
+            protocol: Some("terminal".into()),
+            harness: spec.harness.id().into(),
+            cwd: spec.cwd.clone(),
+            mode: spec.mode.clone(),
+            args: spec.args.clone(),
+            headless: true,
+        };
+        let mut prepared = self.prepare(&session.id, &request)?;
+        let mut binding: Binding = decode(&prepared.binding)?;
+        binding.plan.spec = spec.clone();
+        prepared.binding = encode(binding)?;
+        prepared.launch = encode(Plan {
+            spec,
+            headless: true,
+        })?;
+        Ok(prepared)
+    }
+    fn recover(&self, session: &ManagedSession) -> Result<Option<PreparedSession>> {
+        if !session.auto_resume || session.launch.is_none() {
+            return Ok(None);
+        }
+        pool::ensure(&self.paths)
+            .map_err(|_| error("backend_unavailable", "Cannot start terminal pool"))?;
+        let old = binding(session)?;
+        if pool::list(&self.paths)
+            .map_err(|_| error("backend_unavailable", "Cannot inspect pool"))?
+            .iter()
+            .any(|r| r.name == old.name)
+        {
+            return Ok(None);
+        }
+        match launcher::read_state(&std::path::Path::new(&old.plan.state_dir).join("state.json")) {
+            Ok(state) => {
+                if state.id != session.id || state.generation != old.plan.generation {
+                    return Err(error("backend_error", "Session state identity mismatch"));
+                }
+                if launcher_alive(&state)?
+                    || state.exit_code.is_some()
+                    || state.stop_requested
+                    || state.native.is_none()
+                    || state.private.get("native_resumable")
+                        == Some(&serde_json::Value::Bool(false))
+                {
+                    return Ok(None);
+                }
+                self.prepare_resume(session, None, None).map(Some)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let plan: Plan = decode(session.launch.as_ref().expect("checked above"))?;
+                self.prepare(
+                    &session.id,
+                    &SessionOpenParams {
+                        resume: None,
+                        protocol: Some("terminal".into()),
+                        harness: plan.spec.harness.id().into(),
+                        cwd: plan.spec.cwd,
+                        mode: plan.spec.mode,
+                        args: plan.spec.args,
+                        headless: plan.headless,
+                    },
+                )
+                .map(Some)
+            }
+            Err(_) => Err(error("backend_error", "Cannot read recovery state")),
+        }
+    }
+    fn terminal(&self) -> Option<&dyn TerminalAccess> {
+        Some(self)
+    }
+}
+impl TerminalAccess for TerminalBackend {
+    fn attach_info(&self, session: &ManagedSession) -> Result<AttachInfo> {
+        Ok(AttachInfo {
+            pool_socket: self.paths.pool_socket().to_string_lossy().into_owned(),
+            pool_session: name(session)?,
+        })
+    }
+    fn snapshot(&self, session: &ManagedSession) -> Result<SnapshotResult> {
+        let mut snapshot = pool::snapshot(&self.paths, &name(session)?)
+            .map_err(|_| error("snapshot_unavailable", "Terminal snapshot is unavailable"))?;
+        snapshot.id = session.id.clone();
+        Ok(snapshot)
+    }
+    fn pool_info(&self) -> PoolInfo {
+        let running = pool::list(&self.paths).is_ok();
+        PoolInfo {
+            running,
+            proto_version: running.then_some(ProtocolVersion {
+                major: tower_pool_proto::VERSION,
+                minor: 0,
+            }),
+        }
+    }
+}

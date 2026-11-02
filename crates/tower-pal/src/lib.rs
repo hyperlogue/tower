@@ -8,6 +8,17 @@ use std::{
 mod unix;
 #[cfg(unix)]
 pub use unix::*;
+mod command;
+mod process;
+pub use command::*;
+pub use process::*;
+mod services;
+pub use services::*;
+#[cfg(all(unix, feature = "terminal"))]
+#[allow(unsafe_code)]
+mod pty;
+#[cfg(all(unix, feature = "terminal"))]
+pub use pty::*;
 #[cfg(not(unix))]
 compile_error!("tower currently supports Linux and macOS");
 
@@ -23,6 +34,9 @@ pub struct Paths {
     pub home: PathBuf,
 }
 impl Paths {
+    pub fn pool_socket(&self) -> PathBuf {
+        self.run.join("pool.sock")
+    }
     pub fn discover() -> io::Result<Self> {
         let home = env::var_os("HOME")
             .map(PathBuf::from)

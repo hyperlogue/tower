@@ -9,10 +9,12 @@ fn record(id: &str, native: Option<&str>, pid: Option<u32>) -> AgentRecord {
         harness: "codex".into(),
         mode: None,
         ownership: "registered".into(),
+        protocol: None,
         trust: "weak".into(),
         native_session_id: native.map(str::to_owned),
         pid,
         pid_start_time: pid.map(|_| 1),
+        shared_process: false,
         cwd: "~/work/x".into(),
         status: "unknown".into(),
         status_detail: None,
@@ -47,6 +49,7 @@ fn rule(id: &str, action: &str) -> Rule {
 }
 fn update(id: &str, seq: u64, status: &str) -> UpdateParams {
     UpdateParams {
+        delivery: Patch::Missing,
         id: id.into(),
         token: Secret("unused-by-store".into()),
         seq,
@@ -257,4 +260,156 @@ impl LocalStore {
         let expected = target.map_or_else(|| candidate.id.clone(), |a| a.record.id);
         self.register(candidate, hash, &expected)
     }
+}
+
+#[test]
+fn version_three_migration_uses_terminal_binding_evidence_and_keeps_launch_intent_separate() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(include_str!("schema.sql")).unwrap();
+    conn.execute_batch("CREATE TABLE owned_launches(id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,data TEXT NOT NULL); PRAGMA user_version=3;").unwrap();
+    let mut terminal = record("terminal-session", None, None);
+    terminal.ownership = "owned".into();
+    terminal.pool_session = Some("different-resource-name".into());
+    let mut unknown = record("managed-unknown", None, None);
+    unknown.ownership = "owned".into();
+    for r in [&terminal, &unknown] {
+        let mut json = serde_json::to_value(r).unwrap();
+        json.as_object_mut().unwrap().remove("protocol");
+        json["caps"].as_object_mut().unwrap().remove("snapshot");
+        conn.execute("INSERT INTO agents(id,harness,ownership,public_json,token_hash) VALUES(?1,?2,?3,?4,?5)",params![r.id,r.harness,r.ownership,json.to_string(),b"hash".as_slice()]).unwrap();
+    }
+    let launch = serde_json::json!({"harness":"codex","mode":"native","cwd":"/tmp","argv":["codex","--no-daemon"]});
+    conn.execute(
+        "INSERT INTO owned_launches(id,data) VALUES(?1,?2)",
+        params![terminal.id, launch.to_string()],
+    )
+    .unwrap();
+    drop(conn);
+    let store = LocalStore::open(&path).unwrap();
+    let saved = store.managed_session(&terminal.id).unwrap();
+    assert_eq!(saved.protocol, "terminal");
+    assert_eq!(
+        serde_json::to_value(&saved.binding).unwrap()["name"],
+        "different-resource-name"
+    );
+    assert_eq!(
+        serde_json::to_value(saved.launch.as_ref().unwrap()).unwrap()["spec"],
+        launch
+    );
+    assert!(store.agent(&terminal.id).unwrap().record.caps.snapshot);
+    assert_eq!(
+        store
+            .agent(&terminal.id)
+            .unwrap()
+            .record
+            .protocol
+            .as_deref(),
+        Some("terminal")
+    );
+    assert!(store.agent(&unknown.id).unwrap().record.protocol.is_none());
+    assert!(matches!(
+        store.managed_session(&unknown.id),
+        Err(Error::NotFound)
+    ));
+    store.disable_managed_recovery(&terminal.id).unwrap();
+    drop(store);
+    let store = LocalStore::open(&path).unwrap();
+    assert!(!store.managed_session(&terminal.id).unwrap().auto_resume);
+    assert!(
+        store
+            .managed_session(&terminal.id)
+            .unwrap()
+            .launch
+            .is_some()
+    );
+    assert_eq!(
+        store.managed_session(&terminal.id).unwrap().binding,
+        saved.binding
+    );
+}
+
+#[test]
+fn shared_processes_keep_native_identities_separate_and_reject_ambiguous_pid_registration() {
+    let (_dir, store) = setup();
+    let mut a = record("shared-a", Some("thread-a"), Some(123));
+    a.shared_process = true;
+    a.mode = Some("app-server".into());
+    let mut b = record("shared-b", Some("thread-b"), Some(123));
+    b.shared_process = true;
+    b.mode = Some("app-server".into());
+    store.register(a.clone(), b"a", &a.id).unwrap();
+    store.register(b.clone(), b"b", &b.id).unwrap();
+    assert_eq!(
+        store
+            .agent_by_native_id(&a.harness, "thread-a")
+            .unwrap()
+            .record
+            .id,
+        a.id
+    );
+    assert_eq!(
+        store
+            .agent_by_native_id(&b.harness, "thread-b")
+            .unwrap()
+            .record
+            .id,
+        b.id
+    );
+    assert_eq!(
+        store.registration_target(&b).unwrap().unwrap().record.id,
+        b.id
+    );
+    let unknown = record("unknown", None, Some(123));
+    assert!(store.registration_target(&unknown).is_err());
+}
+
+#[test]
+fn policy_deltas_are_atomic_ordered_and_replay_safe_after_restart() {
+    let (dir, store) = setup();
+    store.put_rule(rule("local", "allow")).unwrap();
+    store
+        .apply_policy(7, &[rule("a", "deny"), rule("b", "ask")])
+        .unwrap();
+    let delta = tower_protocol::PolicyDelta {
+        policy_id: "tower".into(),
+        base_revision: 7,
+        revision: 8,
+        upserts: vec![rule("a", "allow")],
+        removed: vec!["b".into()],
+        order: vec!["a".into()],
+    };
+    assert!(store.apply_policy_delta(&delta).unwrap());
+    let before = store.rules().unwrap();
+    assert_eq!(before.allgather_rules, vec![rule("a", "allow")]);
+    assert!(before.local_rules.iter().any(|r| r.id == "local"));
+    drop(store);
+    let store = LocalStore::open(&dir.path().join("db")).unwrap();
+    assert!(!store.apply_policy_delta(&delta).unwrap());
+    let mut conflict = delta.clone();
+    conflict.upserts = vec![rule("a", "deny")];
+    assert!(store.apply_policy_delta(&conflict).is_err());
+    let mut wrong = delta.clone();
+    wrong.revision = 9;
+    assert!(store.apply_policy_delta(&wrong).is_err());
+    wrong.base_revision = 8;
+    wrong.removed.clear();
+    wrong.order.clear();
+    assert!(store.apply_policy_delta(&wrong).is_err());
+    assert_eq!(
+        store.rules().unwrap().allgather_rules,
+        before.allgather_rules
+    );
+    let empty = tower_protocol::PolicyDelta {
+        policy_id: "tower".into(),
+        base_revision: 8,
+        revision: 9,
+        upserts: vec![],
+        removed: vec!["a".into()],
+        order: vec![],
+    };
+    assert!(store.apply_policy_delta(&empty).unwrap());
+    assert!(store.rules().unwrap().allgather_rules.is_empty());
+    assert_eq!(store.rules().unwrap().local_rules, before.local_rules);
 }

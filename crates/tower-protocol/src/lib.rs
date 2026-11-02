@@ -1,12 +1,21 @@
 //! Extensible public wire types. This crate deliberately depends only on serde.
 
+mod execution;
+mod messaging;
+mod sync;
+pub mod terminal;
+pub use execution::*;
+pub use messaging::*;
+pub use sync::*;
 mod value;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
+pub use terminal::{AttachInfo, SnapshotResult};
 pub use value::{Number, Value};
 
-pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 4 };
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+pub const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolVersion {
@@ -171,6 +180,8 @@ pub struct PoolInfo {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AllgatherInfo {
     pub connected: bool,
+    #[serde(default)]
+    pub policy_current: bool,
     pub policy_revision: Option<u64>,
 }
 
@@ -183,10 +194,14 @@ pub struct AgentRecord {
     pub harness: String,
     pub mode: Option<String>,
     pub ownership: String,
+    #[serde(default)]
+    pub protocol: Option<String>,
     pub trust: String,
     pub native_session_id: Option<String>,
     pub pid: Option<u32>,
     pub pid_start_time: Option<u64>,
+    #[serde(default)]
+    pub shared_process: bool,
     pub cwd: String,
     pub status: String,
     pub status_detail: Option<Value>,
@@ -207,7 +222,11 @@ pub struct AgentRecord {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Capabilities {
     pub attach: bool,
+    #[serde(default)]
+    pub snapshot: bool,
     pub kill: bool,
+    #[serde(default)]
+    pub resume: bool,
     pub message: String,
     pub message_reason: Option<String>,
     pub wake_when_idle: bool,
@@ -218,7 +237,9 @@ impl Capabilities {
     pub fn unavailable(reason: &str) -> Self {
         Self {
             attach: false,
+            snapshot: false,
             kill: false,
+            resume: false,
             message: "none".into(),
             message_reason: Some(reason.into()),
             wake_when_idle: false,
@@ -229,6 +250,12 @@ impl Capabilities {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RegisterParams {
+    #[serde(default)]
+    pub shared_process: bool,
+    #[serde(default)]
+    pub delivery: Option<DeliveryEndpoint>,
+    #[serde(default)]
+    pub protocol: Option<String>,
     pub harness: String,
     pub cwd: String,
     pub native_session_id: Option<String>,
@@ -273,6 +300,8 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Patch<T> {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UpdateParams {
+    #[serde(default, skip_serializing_if = "Patch::is_missing")]
+    pub delivery: Patch<DeliveryUpdate>,
     pub id: String,
     pub token: Secret,
     pub seq: u64,
@@ -294,6 +323,7 @@ pub struct AgentCredential {
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AgentFilter {
+    pub protocol: Option<String>,
     pub harness: Option<String>,
     pub status: Option<String>,
     pub cwd_prefix: Option<String>,
@@ -355,4 +385,106 @@ pub struct TokenResult {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NameParams {
     pub name: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionOpenParams {
+    #[serde(default)]
+    pub protocol: Option<String>,
+    pub harness: String,
+    pub cwd: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub headless: bool,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub resume: Option<ConversationSeed>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ConversationSeed {
+    pub native_session_id: String,
+    #[serde(default)]
+    pub fork: bool,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ConversationListParams {
+    pub protocol: Option<String>,
+    pub harness: Option<String>,
+    pub cwd_prefix: Option<String>,
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub refresh: bool,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Conversation {
+    pub protocol: String,
+    pub harness: String,
+    pub native_session_id: String,
+    pub cwd: String,
+    pub display_name: Option<String>,
+    pub updated_at: u64,
+    pub fork: bool,
+    pub tower_id: Option<String>,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ConversationList {
+    pub conversations: Vec<Conversation>,
+    pub errors: Vec<String>,
+    pub truncated: bool,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionOpenResult {
+    #[serde(default)]
+    pub protocol: Option<String>,
+    #[serde(default)]
+    pub caps: Option<Capabilities>,
+    pub id: String,
+    pub mode: Option<String>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionRestartParams {
+    pub id: String,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub args: Option<Vec<String>>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HarnessInfo {
+    pub harness: String,
+    pub label: String,
+    pub protocol: String,
+    pub executable: String,
+    pub available: bool,
+    pub modes: Vec<String>,
+    pub resume: bool,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SubscribeParams {
+    pub topics: Vec<String>,
+    #[serde(default)]
+    pub approval_id: Option<String>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SubscribeResult {
+    pub subscription_id: String,
+    pub cursor: u64,
+    pub agents: Vec<AgentRecord>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EventNotification {
+    pub jsonrpc: String,
+    pub method: String,
+    pub params: EventParams,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EventParams {
+    pub seq: u64,
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub record: Option<AgentRecord>,
+    #[serde(default, flatten)]
+    pub data: BTreeMap<String, Value>,
 }

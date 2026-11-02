@@ -1,0 +1,428 @@
+use crate::{
+    Harness,
+    runtime::{NativeSession, RuntimeState},
+};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EventKind {
+    Ready,
+    Working,
+    ToolStart,
+    ToolEnd,
+    Approval,
+    ApprovalResolved,
+    Idle,
+    End,
+    Metadata,
+    Failure,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentEvent {
+    pub kind: EventKind,
+    pub native_id: Option<String>,
+    pub resume_ref: Option<String>,
+    pub cwd: Option<String>,
+    pub title: Option<String>,
+    pub tool: Option<String>,
+    pub tool_id: Option<String>,
+    pub model: Option<String>,
+    pub context_tokens: Option<u64>,
+    pub child: bool,
+    #[serde(default)]
+    pub root_confirmed: bool,
+    #[serde(default)]
+    pub resumable: Option<bool>,
+    pub background_jobs: Option<u32>,
+    pub continuing: bool,
+    pub authoritative_status: Option<String>,
+}
+fn text(value: &Value, paths: &[&str], max: usize) -> Option<String> {
+    paths
+        .iter()
+        .find_map(|path| value.pointer(path).and_then(Value::as_str))
+        .filter(|v| !v.is_empty())
+        .map(|s| s.chars().filter(|c| !c.is_control()).take(max).collect())
+        .filter(|s: &String| !s.is_empty())
+}
+fn count(value: &Value, paths: &[&str]) -> Option<u64> {
+    paths
+        .iter()
+        .find_map(|p| value.pointer(p).and_then(Value::as_u64))
+}
+pub fn native_id(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphanumeric())
+        && value.len() <= 512
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-.:".contains(&b))
+}
+fn event_kind(name: &str) -> Option<EventKind> {
+    Some(match name {
+        "SessionStart" | "session-start" => EventKind::Ready,
+        "UserPromptSubmit" | "TurnStarted" | "PreInvocation" | "prompt-submit" | "working" => {
+            EventKind::Working
+        }
+        "PreToolUse" | "pre-tool-use" => EventKind::ToolStart,
+        "PostToolUse" | "PostToolUseFailure" | "post-tool-use" | "post-tool-use-failure" => {
+            EventKind::ToolEnd
+        }
+        "PermissionRequest" | "permission-request" | "Elicitation" => EventKind::Approval,
+        "PermissionResult" | "ElicitationResult" | "permission-resolved" | "elicitation-result" => {
+            EventKind::ApprovalResolved
+        }
+        "Stop" | "Interrupt" | "StopCancelled" | "stop" => EventKind::Idle,
+        "SessionEnd" | "session-end" => EventKind::End,
+        "PreCompact" | "pre-compact" => EventKind::Working,
+        "PostCompact" | "post-compact" | "model-switch" | "status-update" | "cwd-changed"
+        | "metadata" | "PostModelSwitch" => EventKind::Metadata,
+        "StopFailure" | "stop-failure" => EventKind::Failure,
+        _ => return None,
+    })
+}
+pub fn parse(harness: Harness, name: &str, bytes: &[u8]) -> Result<AgentEvent, &'static str> {
+    if bytes.len() > 1024 * 1024 {
+        return Err("hook_too_large");
+    }
+    let value: Value = serde_json::from_slice(bytes).map_err(|_| "invalid_hook")?;
+    let mut kind = event_kind(name).ok_or("unknown_event")?;
+    let id = [
+        "/session_id",
+        "/sessionId",
+        "/sessionID",
+        "/conversationId",
+        "/conversation_id",
+        "/payload/0/event/properties/sessionID",
+        "/payload/0/sessionID",
+    ]
+    .iter()
+    .find_map(|p| value.pointer(p).and_then(Value::as_str))
+    .filter(|s| native_id(s))
+    .map(str::to_owned);
+    let mut event = AgentEvent {
+        kind,
+        native_id: id,
+        resume_ref: text(&value, &["/session_file", "/resume_ref"], 4096),
+        cwd: text(
+            &value,
+            &["/cwd", "/workspace_root", "/directory", "/workspacePaths/0"],
+            4096,
+        ),
+        title: text(
+            &value,
+            &[
+                "/session_title",
+                "/title",
+                "/payload/0/event/properties/info/title",
+            ],
+            200,
+        ),
+        tool: text(
+            &value,
+            &[
+                "/tool_name",
+                "/toolName",
+                "/toolCall/name",
+                "/payload/0/tool",
+            ],
+            128,
+        ),
+        tool_id: text(
+            &value,
+            &[
+                "/tool_use_id",
+                "/tool_call_id",
+                "/toolCallId",
+                "/toolUseId",
+                "/toolCall/id",
+            ],
+            256,
+        ),
+        model: text(
+            &value,
+            &[
+                "/model_id",
+                "/to_model",
+                "/modelId",
+                "/model_name",
+                "/modelName",
+                "/model/id",
+                "/model",
+            ],
+            128,
+        ),
+        context_tokens: count(&value, &["/context_tokens", "/contextTokens"]),
+        child: value.get("is_child").and_then(Value::as_bool) == Some(true)
+            || value.get("session_is_child").and_then(Value::as_bool) == Some(true)
+            || text(
+                &value,
+                &[
+                    "/subagent_type",
+                    "/subagentType",
+                    "/parent_session_id",
+                    "/parentSessionId",
+                ],
+                512,
+            )
+            .is_some()
+            || text(&value, &["/transcript_path"], 4096)
+                .is_some_and(|p| p.split('/').any(|part| part == "subagents")),
+        root_confirmed: value.get("root_confirmed").and_then(Value::as_bool) == Some(true)
+            || (kind == EventKind::Ready && harness != Harness::Opencode),
+        background_jobs: count(&value, &["/background_jobs"]).and_then(|n| n.try_into().ok()),
+        continuing: value.get("will_continue").and_then(Value::as_bool) == Some(true)
+            || value.get("will_retry").and_then(Value::as_bool) == Some(true),
+        authoritative_status: None,
+        resumable: value.get("ephemeral").and_then(Value::as_bool).map(|b| !b),
+    };
+    if harness == Harness::ClaudeCode && kind != EventKind::Ready {
+        event.cwd = None;
+    }
+    if harness == Harness::Grok {
+        if let Some(tasks) = value.get("backgroundTasks").and_then(Value::as_array) {
+            event.background_jobs = Some(
+                tasks
+                    .iter()
+                    .filter(|t| {
+                        !matches!(
+                            t.get("status").and_then(Value::as_str),
+                            Some("completed" | "failed" | "cancelled")
+                        )
+                    })
+                    .count()
+                    .min(u32::MAX as usize) as u32,
+            );
+        }
+        if let Some(crons) = value.get("sessionCrons").and_then(Value::as_array) {
+            event.background_jobs = Some(
+                event
+                    .background_jobs
+                    .unwrap_or(0)
+                    .saturating_add(crons.len().min(u32::MAX as usize) as u32),
+            );
+        }
+    }
+    if harness == Harness::Antigravity && name == "status-update" {
+        event.authoritative_status = if value
+            .get("tool_confirmation_pending")
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            Some("waiting_approval".into())
+        } else {
+            match value.get("agent_state").and_then(Value::as_str) {
+                Some("idle") => Some("idle".into()),
+                Some("thinking" | "working" | "running" | "streaming" | "tool_use") => {
+                    Some("working".into())
+                }
+                _ => None,
+            }
+        };
+        if count(&value, &["/context_window/context_window_size"]).is_some_and(|n| n > 0) {
+            event.context_tokens =
+                count(&value, &["/context_window/total_input_tokens"]).map(|n| {
+                    n.saturating_add(
+                        count(&value, &["/context_window/total_output_tokens"]).unwrap_or(0),
+                    )
+                });
+        }
+    }
+    if harness == Harness::Omp
+        && let Some(jobs) = value.get("async_jobs").and_then(Value::as_array)
+    {
+        event.background_jobs = Some(jobs.len().min(u32::MAX as usize) as u32);
+    }
+    if harness == Harness::Antigravity
+        && name == "Stop"
+        && value
+            .get("error")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+    {
+        kind = EventKind::Failure;
+    }
+    if name == "Elicitation" {
+        event.authoritative_status = Some("waiting_input".into());
+    }
+    if matches!(name, "stop-failure" | "StopFailure")
+        && value.get("aborted").and_then(Value::as_bool) == Some(true)
+    {
+        kind = EventKind::Idle;
+    }
+    if event.continuing && matches!(kind, EventKind::Idle | EventKind::Failure) {
+        kind = EventKind::Working;
+    }
+    event.kind = kind;
+    Ok(event)
+}
+
+pub fn apply(state: &mut RuntimeState, mut event: AgentEvent, now: u64) {
+    if event
+        .native_id
+        .as_ref()
+        .is_some_and(|id| state.private.get("fork_parent").and_then(Value::as_str) == Some(id))
+    {
+        return;
+    }
+    if event.native_id.as_ref().is_some_and(|s| !native_id(s)) {
+        return;
+    }
+    let clean = |value: &mut Option<String>, limit: usize| {
+        if let Some(s) = value {
+            *s = s.chars().filter(|c| !c.is_control()).take(limit).collect();
+        }
+    };
+    clean(&mut event.title, 200);
+    clean(&mut event.model, 128);
+    clean(&mut event.tool, 128);
+    clean(&mut event.tool_id, 256);
+    if event
+        .cwd
+        .as_ref()
+        .is_some_and(|s| s.len() > 4096 || s.chars().any(char::is_control))
+    {
+        event.cwd = None;
+    }
+    if event.resume_ref.as_ref().is_some_and(|s| {
+        s.len() > 4096 || !std::path::Path::new(s).is_absolute() || s.chars().any(char::is_control)
+    }) {
+        event.resume_ref = None;
+    }
+    if event.authoritative_status.as_deref().is_some_and(|s| {
+        !matches!(
+            s,
+            "starting" | "idle" | "working" | "waiting_input" | "waiting_approval" | "unknown"
+        )
+    }) {
+        event.authoritative_status = None;
+    }
+    if event.child || state.exit_code.is_some() || state.stop_requested {
+        return;
+    }
+    if let Some(id) = event.native_id {
+        if state.native.as_ref().is_some_and(|n| n.id != id)
+            && !(event.root_confirmed
+                && matches!(event.kind, EventKind::Ready | EventKind::Working))
+        {
+            return;
+        }
+        state.native = Some(NativeSession {
+            id: id.clone(),
+            resume_ref: event.resume_ref.or_else(|| {
+                state
+                    .native
+                    .as_ref()
+                    .filter(|n| n.id == id)
+                    .and_then(|n| n.resume_ref.clone())
+            }),
+        });
+    }
+    if let Some(resumable) = event.resumable {
+        state
+            .private
+            .insert("native_resumable".into(), resumable.into());
+    }
+    if let Some(cwd) = event
+        .cwd
+        .filter(|cwd| std::path::Path::new(cwd).is_absolute())
+    {
+        state.cwd = cwd;
+    }
+    if let Some(title) = event.title {
+        state.display_name = Some(title);
+    }
+    if let Some(model) = event.model {
+        state.detail.model = Some(model);
+    }
+    if let Some(tokens) = event.context_tokens {
+        state.detail.context_tokens = Some(tokens);
+    }
+    if let Some(tool) = &event.tool {
+        state.detail.last_tool = Some(tool.clone());
+    }
+    if let Some(jobs) = event.background_jobs {
+        state.detail.background_jobs = Some(jobs);
+    }
+    let waiting = |state: &RuntimeState| {
+        matches!(state.status.as_str(), "waiting_input" | "waiting_approval")
+    };
+    match event.kind {
+        EventKind::Ready if matches!(state.status.as_str(), "starting" | "unknown") => {
+            state.status = "idle".into()
+        }
+        EventKind::Working => {
+            state.status = "working".into();
+            state.detail.error = None;
+            state.private.remove("waiting_tool");
+        }
+        EventKind::ToolStart => {
+            if event.tool.as_deref().is_some_and(|t| {
+                matches!(
+                    t,
+                    "AskUserQuestion" | "ask" | "ask_user_question" | "question"
+                )
+            }) {
+                state.status = "waiting_input".into();
+                state.private.insert(
+                    "waiting_tool".into(),
+                    serde_json::json!(event.tool_id.or(event.tool)),
+                );
+            } else if !waiting(state) {
+                state.status = "working".into();
+            }
+        }
+        EventKind::ToolEnd => {
+            let key = event.tool_id.or(event.tool);
+            let matches = state
+                .private
+                .get("waiting_tool")
+                .and_then(Value::as_str)
+                .is_some_and(|w| key.as_deref() == Some(w));
+            if !waiting(state) || matches {
+                state.status = "working".into();
+                state.private.remove("waiting_tool");
+            }
+        }
+        EventKind::Approval => {
+            state.status = if event.tool.as_deref() == Some("AskUserQuestion") {
+                "waiting_input"
+            } else {
+                "waiting_approval"
+            }
+            .into();
+            state.private.insert(
+                "waiting_tool".into(),
+                serde_json::json!(event.tool_id.or(event.tool)),
+            );
+        }
+        EventKind::ApprovalResolved => {
+            state.status = "working".into();
+            state.private.remove("waiting_tool");
+        }
+        EventKind::Idle | EventKind::Failure => {
+            state.status = if state.detail.background_jobs.unwrap_or(0) > 0 {
+                "working"
+            } else {
+                "idle"
+            }
+            .into();
+            state.private.remove("waiting_tool");
+            if event.kind == EventKind::Failure {
+                state.detail.error = Some("agent_turn_failed".into());
+            }
+        }
+        EventKind::Metadata | EventKind::Ready | EventKind::End => {}
+    }
+    if let Some(status) = event.authoritative_status {
+        state.status = status;
+    }
+    state.seq = state.seq.saturating_add(1);
+    state.updated_at = now;
+}

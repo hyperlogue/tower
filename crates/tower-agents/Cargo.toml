@@ -9,3 +9,20 @@ description = "Agent launchers, harness adapters, hooks, and resume support."
 
 [lints]
 workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+sha2.workspace = true
+tower-pal.workspace = true
+tower-protocol.workspace = true
+tower-sessions.workspace = true
+
+tokio.workspace = true
+rusqlite.workspace = true
+futures-util = "0.3"
+tokio-tungstenite = "0.28"
+
+[dev-dependencies]
+tempfile.workspace = true

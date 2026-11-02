@@ -17,7 +17,13 @@ fn setup() -> (tempfile::TempDir, Arc<LocalStore>, Service) {
     paths.prepare().unwrap();
     tower_pal::private_file(&paths.database, true).unwrap();
     let store = Arc::new(LocalStore::open(&paths.database).unwrap());
-    let service = Service::new(paths, store.clone(), "test").unwrap();
+    let service = Service::new(
+        paths,
+        store.clone(),
+        "test",
+        tower_sessions::Backends::default(),
+    )
+    .unwrap();
     (dir, store, service)
 }
 fn call(
@@ -568,3 +574,9 @@ fn local_offline_management_does_not_change_received_policy() {
     assert_eq!(info["mode"], "allgather");
     assert_eq!(info["allgather"]["connected"], false);
 }
+
+mod managed;
+
+mod messaging;
+
+mod enrollment;

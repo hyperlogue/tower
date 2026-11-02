@@ -17,14 +17,43 @@ pub fn matches(selector: &str, subject: Subject<'_>) -> bool {
     if selector == "*" {
         true
     } else if let Some(h) = selector.strip_prefix("harness:") {
-        subject.harness == Some(h)
+        subject.harness.is_some_and(|s| wildcard(h, s))
     } else if let Some(p) = selector.strip_prefix("cwd:") {
-        subject
-            .cwd
-            .is_some_and(|cwd| tower_pal::path_prefix(cwd, p))
+        subject.cwd.is_some_and(|cwd| {
+            if p.contains(['*', '?']) {
+                wildcard(p, cwd)
+            } else {
+                tower_pal::path_prefix(cwd, p)
+            }
+        })
     } else {
-        selector == subject.id
+        wildcard(selector, subject.id)
     }
+}
+fn wildcard(pattern: &str, text: &str) -> bool {
+    let p: Vec<_> = pattern.chars().collect();
+    let t: Vec<_> = text.chars().collect();
+    let (mut i, mut j, mut star, mut retry) = (0, 0, None, 0);
+    while j < t.len() {
+        if i < p.len() && (p[i] == '?' || p[i] == t[j]) {
+            i += 1;
+            j += 1;
+        } else if i < p.len() && p[i] == '*' {
+            star = Some(i);
+            i += 1;
+            retry = j;
+        } else if let Some(s) = star {
+            retry += 1;
+            j = retry;
+            i = s + 1;
+        } else {
+            return false;
+        }
+    }
+    while i < p.len() && p[i] == '*' {
+        i += 1;
+    }
+    i == p.len()
 }
 pub fn evaluate(
     rules: &[Rule],
@@ -70,6 +99,6 @@ mod tests {
         assert!(!matches("cwd:~/work/x", s));
         assert!(matches("harness:codex", s));
         assert!(matches("*", s));
-        assert!(!matches("opaque-*", s));
+        assert!(matches("opaque-*", s));
     }
 }

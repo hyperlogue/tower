@@ -1,6 +1,10 @@
 //! Transactional local persistence. Runtime observations never contain message bodies.
 
+mod messaging;
+pub use messaging::{DeliveryState, MessageStore, StoredApproval};
+
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use sha2::{Digest, Sha256};
 use std::{
     path::Path,
     sync::{Mutex, MutexGuard},
@@ -9,6 +13,7 @@ use std::{
 use tower_protocol::{
     AgentFilter, AgentRecord, Patch, Rule, RulesView, TokenInfo, UpdateParams, UpdateResult, Value,
 };
+use tower_sessions::{ManagedSession, Observation};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -51,10 +56,26 @@ pub struct StoredToken {
     pub info: TokenInfo,
     pub hash: Vec<u8>,
 }
-
 /// Each mutation commits its identity, revision and metadata together.
 /// Callers never receive a raw database connection.
-pub trait Store: Send + Sync {
+pub trait Store: Send + Sync + MessageStore {
+    fn set_enrollment(&self, mode: &str, node: Option<&str>) -> Result<()>;
+    fn apply_policy(&self, revision: u64, rules: &[Rule]) -> Result<bool>;
+    fn apply_policy_delta(&self, delta: &tower_protocol::PolicyDelta) -> Result<bool>;
+    fn clear_policy(&self) -> Result<()>;
+
+    fn create_managed(
+        &self,
+        record: AgentRecord,
+        hash: &[u8],
+        session: &ManagedSession,
+    ) -> Result<()>;
+    fn managed_session(&self, id: &str) -> Result<ManagedSession>;
+    fn managed_sessions(&self) -> Result<Vec<ManagedSession>>;
+    fn observe_managed(&self, protocol: &str, observation: Observation, now: u64) -> Result<()>;
+    fn disable_managed_recovery(&self, id: &str) -> Result<()>;
+    fn replace_managed(&self, session: &ManagedSession, mode: Option<&str>, now: u64)
+    -> Result<()>;
     fn initialize(&self, host_id: &str, node_name: &str) -> Result<Host>;
     fn host(&self) -> Result<Host>;
     fn registration_target(&self, candidate: &AgentRecord) -> Result<Option<StoredAgent>>;
@@ -69,12 +90,21 @@ pub trait Store: Send + Sync {
     fn agent_by_token_hash(&self, hash: &[u8]) -> Result<StoredAgent>;
     fn agent_by_native_id(&self, harness: &str, native_id: &str) -> Result<StoredAgent>;
     fn agents(&self, filter: &AgentFilter) -> Result<Vec<AgentRecord>>;
-    fn update(&self, update: &UpdateParams, now: u64) -> Result<UpdateResult>;
+    fn update(&self, update: &UpdateParams, now: u64) -> Result<UpdateResult> {
+        self.update_with_delivery(update, now, None)
+    }
+    fn update_with_delivery(
+        &self,
+        update: &UpdateParams,
+        now: u64,
+        delivery: Option<DeliveryState>,
+    ) -> Result<UpdateResult>;
     fn heartbeat(&self, id: &str, now: u64) -> Result<()>;
     fn unregister(&self, id: &str, now: u64) -> Result<AgentRecord>;
     fn mark_lost(&self, id: &str, now: u64) -> Result<()>;
     fn mark_unconfirmed(&self, now: u64) -> Result<()>;
     fn expire(&self, now: u64, owned_retention_ms: u64) -> Result<Vec<String>>;
+    fn expiring_managed(&self, now: u64, retention_ms: u64) -> Result<Vec<ManagedSession>>;
     fn rules(&self) -> Result<RulesView>;
     fn put_rule(&self, rule: Rule) -> Result<()>;
     fn remove_rule(&self, id: &str) -> Result<()>;
@@ -96,7 +126,7 @@ impl LocalStore {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         let version: u32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version > 2 {
+        if version > 9 {
             return Err(Error::Schema);
         }
         if version == 0 {
@@ -109,6 +139,48 @@ impl LocalStore {
             let tx = conn.transaction()?;
             tx.execute_batch("CREATE INDEX agent_token_hash ON agents(token_hash); CREATE INDEX named_token_hash ON tokens(hash);")?;
             tx.pragma_update(None, "user_version", 2)?;
+            tx.commit()?;
+        }
+        if version < 3 {
+            let tx = conn.transaction()?;
+            tx.execute_batch("CREATE TABLE owned_launches(id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,data TEXT NOT NULL);")?;
+            tx.pragma_update(None, "user_version", 3)?;
+            tx.commit()?;
+        }
+        if version < 4 {
+            let tx = conn.transaction()?;
+            tx.execute_batch(include_str!("managed.sql"))?;
+            tx.pragma_update(None, "user_version", 4)?;
+            tx.commit()?;
+        }
+        if version < 5 {
+            let tx = conn.transaction()?;
+            tx.execute_batch("ALTER TABLE managed_sessions ADD COLUMN auto_resume INTEGER NOT NULL DEFAULT 1; UPDATE managed_sessions SET auto_resume=0 WHERE launch IS NULL;")?;
+            tx.pragma_update(None, "user_version", 5)?;
+            tx.commit()?;
+        }
+        if version < 6 {
+            let tx = conn.transaction()?;
+            tx.execute_batch("CREATE TABLE delivery(id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,data TEXT NOT NULL); CREATE TABLE approvals(id TEXT PRIMARY KEY,data TEXT NOT NULL,body_hash BLOB NOT NULL,consumed INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL); CREATE INDEX approvals_created ON approvals(created_at); CREATE INDEX approvals_expiry ON approvals(json_extract(data,'$.expires_at')) WHERE json_extract(data,'$.state')='pending';")?;
+            tx.pragma_update(None, "user_version", 6)?;
+            tx.commit()?;
+        }
+        if version < 7 {
+            let tx = conn.transaction()?;
+            tx.execute_batch("CREATE INDEX IF NOT EXISTS approvals_expiry ON approvals(json_extract(data,'$.expires_at')) WHERE json_extract(data,'$.state')='pending'; CREATE INDEX approvals_body_hash ON approvals(body_hash);")?;
+            tx.pragma_update(None, "user_version", 7)?;
+            tx.commit()?;
+        }
+        if version < 8 {
+            let tx = conn.transaction()?;
+            tx.execute_batch("DROP INDEX process_identity; CREATE UNIQUE INDEX process_identity ON agents(pid,pid_start) WHERE pid IS NOT NULL AND pid_start IS NOT NULL AND ownership='registered' AND coalesce(json_extract(public_json,'$.shared_process'),0)=0; CREATE INDEX process_observation ON agents(pid,pid_start);")?;
+            tx.pragma_update(None, "user_version", 8)?;
+            tx.commit()?;
+        }
+        if version < 9 {
+            let tx = conn.transaction()?;
+            tx.execute_batch("ALTER TABLE policy_snapshot ADD COLUMN delta_hash BLOB;")?;
+            tx.pragma_update(None, "user_version", 9)?;
             tx.commit()?;
         }
         Ok(Self {
@@ -156,7 +228,78 @@ impl LocalStore {
             }
         }
         write_rules(&tx, "allgather_rules", rules)?;
-        tx.execute("INSERT INTO policy_snapshot(singleton,revision,payload) VALUES(1,?1,?2) ON CONFLICT(singleton) DO UPDATE SET revision=excluded.revision,payload=excluded.payload", params![revision.to_string(), payload])?;
+        tx.execute("INSERT INTO policy_snapshot(singleton,revision,payload) VALUES(1,?1,?2) ON CONFLICT(singleton) DO UPDATE SET revision=excluded.revision,payload=excluded.payload,delta_hash=NULL", params![revision.to_string(), payload])?;
+        tx.commit()?;
+        Ok(true)
+    }
+    pub fn apply_policy_delta(&self, delta: &tower_protocol::PolicyDelta) -> Result<bool> {
+        use std::collections::{BTreeMap, BTreeSet};
+        if delta.revision <= delta.base_revision
+            || delta.upserts.len() > 1024
+            || delta.removed.len() > 1024
+            || delta.order.len() > 1024
+        {
+            return Err(Error::Conflict("invalid policy delta bounds"));
+        }
+        let digest = Sha256::digest(serde_json::to_vec(delta)?).to_vec();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let current: Option<(String, String, Option<Vec<u8>>)> = tx
+            .query_row(
+                "SELECT revision,payload,delta_hash FROM policy_snapshot WHERE singleton=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((revision, payload, previous_digest)) = current else {
+            return Err(Error::Conflict("policy delta base revision mismatch"));
+        };
+        let revision: u64 = revision.parse().map_err(|_| Error::Schema)?;
+        if revision == delta.revision {
+            return if previous_digest.as_ref() == Some(&digest) {
+                Ok(false)
+            } else {
+                Err(Error::Conflict("conflicting policy revision"))
+            };
+        }
+        if revision != delta.base_revision {
+            return Err(Error::Conflict("policy delta base revision mismatch"));
+        }
+        let previous: Vec<Rule> = serde_json::from_str(&payload)?;
+        let mut rules: BTreeMap<_, _> = previous.into_iter().map(|r| (r.id.clone(), r)).collect();
+        let mut changed = BTreeSet::new();
+        for id in &delta.removed {
+            if !changed.insert(id) {
+                return Err(Error::Conflict("duplicate policy delta identity"));
+            }
+            rules.remove(id);
+        }
+        for rule in &delta.upserts {
+            if !changed.insert(&rule.id) {
+                return Err(Error::Conflict("duplicate policy delta identity"));
+            }
+            rules.insert(rule.id.clone(), rule.clone());
+        }
+        let mut ordered = Vec::new();
+        for id in &delta.order {
+            ordered.push(
+                rules
+                    .remove(id)
+                    .ok_or(Error::Conflict("invalid policy delta order"))?,
+            );
+        }
+        if !rules.is_empty() {
+            return Err(Error::Conflict("incomplete policy delta order"));
+        }
+        write_rules(&tx, "allgather_rules", &ordered)?;
+        tx.execute(
+            "UPDATE policy_snapshot SET revision=?1,payload=?2,delta_hash=?3 WHERE singleton=1",
+            params![
+                delta.revision.to_string(),
+                serde_json::to_string(&ordered)?,
+                digest
+            ],
+        )?;
         tx.commit()?;
         Ok(true)
     }
@@ -174,6 +317,14 @@ impl LocalStore {
     }
 }
 
+fn disable_delivery(caps: &mut tower_protocol::Capabilities, reason: &str) {
+    caps.kill = false;
+    caps.message = "none".into();
+    caps.message_reason = Some(reason.into());
+    caps.wake_when_idle = false;
+    caps.reply_path = false;
+    caps.steer = false;
+}
 fn next_revision(tx: &Transaction<'_>) -> Result<u64> {
     let n: i64 = tx.query_row(
         "UPDATE counters SET value=value+1 WHERE name='registry' RETURNING value",
@@ -210,12 +361,31 @@ fn registration_target(conn: &Connection, candidate: &AgentRecord) -> Result<Opt
     };
     let process: Option<String> =
         if let (Some(pid), Some(start)) = (candidate.pid, candidate.pid_start_time) {
-            conn.query_row(
-                "SELECT id FROM agents WHERE pid=?1 AND pid_start=?2",
-                params![pid, start.to_string()],
-                |r| r.get(0),
-            )
-            .optional()?
+            let mut query =
+                conn.prepare("SELECT id FROM agents WHERE pid=?1 AND pid_start=?2 ORDER BY id")?;
+            let ids = query
+                .query_map(params![pid, start.to_string()], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let mut matches = Vec::new();
+            for id in ids {
+                let record = stored_agent(conn, &id)?.record;
+                if candidate.shared_process
+                    && record.shared_process
+                    && candidate.harness == record.harness
+                    && candidate.native_session_id.is_some()
+                    && record.native_session_id.is_some()
+                    && candidate.native_session_id != record.native_session_id
+                {
+                    continue;
+                }
+                matches.push(id);
+            }
+            if matches.len() > 1 {
+                return Err(Error::Conflict(
+                    "process hosts multiple sessions; provide a native session identity",
+                ));
+            }
+            matches.pop()
         } else {
             None
         };
@@ -304,6 +474,268 @@ fn host_info(conn: &Connection) -> Result<Host> {
     })
 }
 impl Store for LocalStore {
+    fn set_enrollment(&self, mode: &str, node: Option<&str>) -> Result<()> {
+        LocalStore::set_enrollment(self, mode, node)
+    }
+    fn apply_policy(&self, revision: u64, rules: &[Rule]) -> Result<bool> {
+        LocalStore::apply_policy(self, revision, rules)
+    }
+    fn apply_policy_delta(&self, delta: &tower_protocol::PolicyDelta) -> Result<bool> {
+        LocalStore::apply_policy_delta(self, delta)
+    }
+    fn clear_policy(&self) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM allgather_rules", [])?;
+        tx.execute("DELETE FROM policy_snapshot", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn create_managed(
+        &self,
+        mut record: AgentRecord,
+        hash: &[u8],
+        session: &ManagedSession,
+    ) -> Result<()> {
+        if record.ownership != "owned"
+            || record.id != session.id
+            || record.protocol.as_deref() != Some(&session.protocol)
+        {
+            return Err(Error::Conflict(
+                "managed reservation and backend binding disagree",
+            ));
+        }
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        record.revision = next_revision(&tx)?;
+        tx.execute("INSERT INTO agents(id,harness,ownership,public_json,token_hash,source_seq,recovery_pending,native_id) VALUES(?1,?2,'owned',?3,?4,'0',1,?5)", params![record.id, record.harness, serde_json::to_string(&record)?, hash,record.native_session_id])?;
+        tx.execute(
+            "INSERT INTO managed_sessions(id,protocol,binding,launch) VALUES(?1,?2,?3,?4)",
+            params![
+                session.id,
+                session.protocol,
+                serde_json::to_string(&session.binding)?,
+                session
+                    .launch
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+    fn managed_session(&self, id: &str) -> Result<ManagedSession> {
+        let conn = self.lock()?;
+        let row = conn
+            .query_row(
+                "SELECT protocol,binding,launch,auto_resume FROM managed_sessions WHERE id=?1",
+                [id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, bool>(3)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or(Error::NotFound)?;
+        Ok(ManagedSession {
+            id: id.into(),
+            protocol: row.0,
+            binding: serde_json::from_str(&row.1)?,
+            launch: row.2.map(|v| serde_json::from_str(&v)).transpose()?,
+            auto_resume: row.3,
+        })
+    }
+    fn managed_sessions(&self) -> Result<Vec<ManagedSession>> {
+        let conn = self.lock()?;
+        let mut query = conn.prepare("SELECT m.id,m.protocol,m.binding,m.launch,m.auto_resume FROM managed_sessions m JOIN agents a ON a.id=m.id WHERE a.ended_at IS NULL")?;
+        let rows = query.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, bool>(4)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, protocol, binding, launch, auto_resume) = row?;
+            Ok(ManagedSession {
+                id,
+                protocol,
+                binding: serde_json::from_str(&binding)?,
+                launch: launch.map(|v| serde_json::from_str(&v)).transpose()?,
+                auto_resume,
+            })
+        })
+        .collect()
+    }
+    fn observe_managed(&self, protocol: &str, o: Observation, now: u64) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let id = &o.id;
+        let mut stored = stored_agent(&tx, id)?;
+        if stored.record.ownership != "owned" || stored.record.protocol.as_deref() != Some(protocol)
+        {
+            return Err(Error::Conflict("observation belongs to another backend"));
+        }
+        if !matches!(
+            o.status.as_str(),
+            "starting"
+                | "idle"
+                | "working"
+                | "waiting_input"
+                | "waiting_approval"
+                | "unknown"
+                | "exited"
+                | "lost"
+        ) {
+            return Err(Error::Conflict("invalid session status"));
+        }
+        if stored.ended_at.is_some() {
+            return Ok(());
+        }
+        let ended = matches!(o.status.as_str(), "exited" | "lost");
+        let before = stored.record.clone();
+        let record = &mut stored.record;
+        if !ended || o.pid.is_some() {
+            record.pid = o.pid;
+            record.pid_start_time = o.pid_start_time;
+        }
+        record.pool_session = o.terminal.as_ref().map(|t| t.pool_session.clone());
+        record.attach_count = o.terminal.as_ref().map_or(0, |t| t.attach_count);
+        record.caps = o.caps;
+        record.status = o.status;
+        let mut native_conflict = false;
+        if let Some(native) = o.metadata.native_session_id {
+            let other: Option<String> = tx
+                .query_row(
+                    "SELECT id FROM agents WHERE harness=?1 AND native_id=?2 AND id<>?3",
+                    params![record.harness, native, id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if other.is_some() {
+                native_conflict = true;
+                record.native_session_id = None;
+            } else {
+                record.native_session_id = Some(native);
+            }
+        }
+        if let Some(name) = o.metadata.display_name {
+            record.display_name = Some(name);
+        }
+        if let Some(cwd) = o.metadata.cwd {
+            record.cwd = cwd;
+        }
+        if let Some(detail) = o.metadata.detail {
+            record.status_detail = Some(detail);
+        }
+        if native_conflict {
+            record.caps.resume = false;
+            tx.execute(
+                "UPDATE managed_sessions SET auto_resume=0 WHERE id=?1",
+                [id],
+            )?;
+            let mut detail = match record.status_detail.take() {
+                Some(tower_protocol::Value::Object(map)) => map,
+                _ => Default::default(),
+            };
+            detail.insert(
+                "error".into(),
+                tower_protocol::Value::String("native_identity_conflict".into()),
+            );
+            record.status_detail = Some(tower_protocol::Value::Object(detail));
+        }
+        if *record != before {
+            record.updated_at = now;
+            record.revision = next_revision(&tx)?;
+        } else if !ended
+            && o.binding.is_none()
+            && stored.recovery_pending == o.recovery_pending
+            && now.saturating_sub(record.last_seen) < 10_000
+        {
+            return Ok(());
+        }
+        if !ended {
+            record.last_seen = now;
+        }
+        tx.execute(
+            "UPDATE agents SET pid=?2,pid_start=?3,ended_at=?4,recovery_pending=?5,native_id=?6 WHERE id=?1",
+            params![
+                id,
+                record.pid,
+                record.pid_start_time.map(|n| n.to_string()),
+                ended.then_some(i64::try_from(now).map_err(|_| Error::Schema)?),
+                o.recovery_pending,
+                record.native_session_id
+            ],
+        )?;
+        if let Some(binding) = o.binding {
+            tx.execute(
+                "UPDATE managed_sessions SET binding=?2 WHERE id=?1 AND protocol=?3",
+                params![id, serde_json::to_string(&binding)?, protocol],
+            )?;
+        }
+        save_record(&tx, record)?;
+        tx.commit()?;
+        Ok(())
+    }
+    fn disable_managed_recovery(&self, id: &str) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE managed_sessions SET auto_resume=0 WHERE id=?1",
+            [id],
+        )?;
+        tx.execute("UPDATE agents SET recovery_pending=0 WHERE id=?1", [id])?;
+        tx.commit()?;
+        Ok(())
+    }
+    fn replace_managed(
+        &self,
+        session: &ManagedSession,
+        mode: Option<&str>,
+        now: u64,
+    ) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let mut stored = stored_agent(&tx, &session.id)?;
+        if stored.record.ownership != "owned"
+            || stored.record.protocol.as_deref() != Some(&session.protocol)
+        {
+            return Err(Error::Conflict("backend identity mismatch"));
+        }
+        tx.execute(
+            "UPDATE managed_sessions SET binding=?2,launch=?3,auto_resume=?4 WHERE id=?1",
+            params![
+                session.id,
+                serde_json::to_string(&session.binding)?,
+                session
+                    .launch
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
+                session.auto_resume
+            ],
+        )?;
+        stored.record.status = "starting".into();
+        stored.record.pid = None;
+        stored.record.pid_start_time = None;
+        stored.record.mode = mode.map(str::to_owned);
+        stored.record.caps = tower_protocol::Capabilities::unavailable("starting");
+        stored.record.updated_at = now;
+        stored.record.revision = next_revision(&tx)?;
+        tx.execute("UPDATE agents SET pid=NULL,pid_start=NULL,ended_at=NULL,recovery_pending=1 WHERE id=?1",[&session.id])?;
+        save_record(&tx, &stored.record)?;
+        tx.commit()?;
+        Ok(())
+    }
     fn initialize(&self, host_id: &str, node_name: &str) -> Result<Host> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
@@ -352,9 +784,13 @@ impl Store for LocalStore {
             // The caller supplies a newly observed or explicitly validated binding.
             existing.record.pid = candidate.pid;
             existing.record.pid_start_time = candidate.pid_start_time;
+            existing.record.caps.kill = candidate.caps.kill;
+            existing.record.shared_process = candidate.shared_process;
+            existing.record.mode = candidate.mode.or(existing.record.mode);
             if candidate.display_name.is_some() {
                 existing.record.display_name = candidate.display_name;
             }
+            existing.record.protocol = candidate.protocol.or(existing.record.protocol);
             existing.record.cwd = candidate.cwd;
             existing.record.last_seen = candidate.last_seen;
             existing.record.updated_at = candidate.updated_at;
@@ -433,6 +869,10 @@ impl Store for LocalStore {
                     && filter.harness.as_ref().is_none_or(|v| v == &r.harness)
                     && filter.status.as_ref().is_none_or(|v| v == &r.status)
                     && filter.ownership.as_ref().is_none_or(|v| v == &r.ownership)
+                    && filter
+                        .protocol
+                        .as_ref()
+                        .is_none_or(|v| r.protocol.as_ref() == Some(v))
                     && filter.cwd_prefix.as_ref().is_none_or(|p| {
                         r.cwd == *p
                             || r.cwd
@@ -442,7 +882,12 @@ impl Store for LocalStore {
             })
             .collect())
     }
-    fn update(&self, update: &UpdateParams, now: u64) -> Result<UpdateResult> {
+    fn update_with_delivery(
+        &self,
+        update: &UpdateParams,
+        now: u64,
+        delivery: Option<DeliveryState>,
+    ) -> Result<UpdateResult> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         let mut agent = stored_agent(&tx, &update.id)?;
@@ -460,8 +905,19 @@ impl Store for LocalStore {
                 revision: agent.record.revision,
             });
         }
+        if !update.delivery.is_missing() && delivery.is_none() {
+            return Err(Error::Conflict(
+                "delivery update requires adapter validation",
+            ));
+        }
+        if let Some(delivery) = delivery {
+            messaging::apply_delivery(&tx, &mut agent.record, &delivery.endpoint, delivery.caps)?;
+        }
         if let Some(status) = &update.status {
             agent.record.status = status.clone();
+            if matches!(status.as_str(), "exited" | "lost") {
+                disable_delivery(&mut agent.record.caps, "session_ended");
+            }
         }
         match &update.display_name {
             Patch::Missing => {}
@@ -522,6 +978,7 @@ impl Store for LocalStore {
         let mut agent = stored_agent(&tx, id)?;
         if agent.ended_at.is_none() {
             agent.record.status = "exited".into();
+            disable_delivery(&mut agent.record.caps, "session_ended");
             agent.record.updated_at = now;
             agent.record.last_seen = now;
             agent.record.revision = next_revision(&tx)?;
@@ -540,6 +997,7 @@ impl Store for LocalStore {
         let mut agent = stored_agent(&tx, id)?;
         if agent.ended_at.is_none() {
             agent.record.status = "lost".into();
+            disable_delivery(&mut agent.record.caps, "session_lost");
             agent.record.updated_at = now;
             agent.record.revision = next_revision(&tx)?;
             tx.execute(
@@ -555,7 +1013,10 @@ impl Store for LocalStore {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         for mut r in all_records(&tx)? {
-            if r.ownership == "registered" && !matches!(r.status.as_str(), "exited" | "lost") {
+            if !matches!(r.status.as_str(), "exited" | "lost") {
+                if r.ownership == "owned" {
+                    r.caps = tower_protocol::Capabilities::unavailable("backend_unavailable");
+                }
                 r.status = "unknown".into();
                 r.updated_at = now;
                 r.revision = next_revision(&tx)?;
@@ -589,6 +1050,22 @@ impl Store for LocalStore {
         }
         tx.commit()?;
         Ok(removed)
+    }
+    fn expiring_managed(&self, now: u64, retention_ms: u64) -> Result<Vec<ManagedSession>> {
+        if now < retention_ms {
+            return Ok(Vec::new());
+        }
+        let cutoff = now.saturating_sub(retention_ms);
+        let ids = {
+            let conn = self.lock()?;
+            let mut query=conn.prepare("SELECT a.id FROM agents a JOIN managed_sessions m ON a.id=m.id WHERE a.ended_at IS NOT NULL AND a.ended_at<=?1 AND a.recovery_pending=0")?;
+            query
+                .query_map([i64::try_from(cutoff).map_err(|_| Error::Schema)?], |r| {
+                    r.get::<_, String>(0)
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        ids.iter().map(|id| self.managed_session(id)).collect()
     }
     fn rules(&self) -> Result<RulesView> {
         let conn = self.lock()?;
