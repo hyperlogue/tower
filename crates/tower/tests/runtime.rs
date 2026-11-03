@@ -998,3 +998,46 @@ async fn allgather_status_policy_and_offline_mode_are_separate() {
     assert_eq!(f.run(&["daemon", "status"])["mode"], "standalone");
     assert!(!f.dir.path().join("state/tower/allgather.key").exists());
 }
+
+#[test]
+fn session_metadata_and_host_metrics_use_the_normal_cli_without_a_pool() {
+    let f = Fixture::new();
+    let registered = f.run(&["register", "--harness", "fixture", "--cwd", "~/project"]);
+    let id = registered["id"].as_str().unwrap();
+    let token = registered["token"].as_str().unwrap();
+    let tagged = f.run(&["tags", id, "--add", "pinned,review"]);
+    assert_eq!(tagged["tags"], json!(["pinned", "review"]));
+    for (seq, state) in [("1", "working"), ("2", "idle")] {
+        f.run(&[
+            "status", "--id", id, "--token", token, "--seq", seq, "--state", state,
+        ]);
+    }
+    assert_eq!(f.run(&["get", id])["needs_attention"], true);
+    assert_eq!(f.run(&["attention", "clear", id])["needs_attention"], false);
+    f.stop();
+    let recovered = f.run(&["get", id]);
+    assert_eq!(recovered["tags"], json!(["pinned", "review"]));
+    assert_eq!(recovered["needs_attention"], false);
+    f.run(&[
+        "status", "--id", id, "--token", token, "--seq", "3", "--state", "idle",
+    ]);
+    assert_eq!(f.run(&["get", id])["needs_attention"], false);
+    let sample = f.run(&["host", "metrics"]);
+    assert!(sample["sampled_at"].as_u64().unwrap() > 0);
+    assert!(sample["memory"].is_object());
+    assert!(sample["disk"].is_object());
+    let same = f.run(&["host", "metrics"]);
+    assert_eq!(sample, same);
+    failure(
+        f.command(&[
+            "--json",
+            "rpc",
+            "host.metrics",
+            r#"{"filesystem_paths":["/"]}"#,
+        ])
+        .output()
+        .unwrap(),
+        "invalid_params",
+    );
+    assert!(!f.dir.path().join("state/tower/run/pool.sock").exists());
+}

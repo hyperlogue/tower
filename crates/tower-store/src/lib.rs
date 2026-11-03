@@ -71,7 +71,47 @@ const MIGRATIONS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS approvals_expiry ON approvals(json_extract(data,'$.expires_at')) WHERE json_extract(data,'$.state')='pending'; CREATE INDEX approvals_body_hash ON approvals(body_hash);",
     "DROP INDEX process_identity; CREATE UNIQUE INDEX process_identity ON agents(pid,pid_start) WHERE pid IS NOT NULL AND pid_start IS NOT NULL AND ownership='registered' AND coalesce(json_extract(public_json,'$.shared_process'),0)=0; CREATE INDEX process_observation ON agents(pid,pid_start);",
     "ALTER TABLE policy_snapshot ADD COLUMN delta_hash BLOB;",
+    "ALTER TABLE agents ADD COLUMN observed_status TEXT; ALTER TABLE agents ADD COLUMN stop_requested INTEGER NOT NULL DEFAULT 0; UPDATE agents SET observed_status=json_extract(public_json,'$.status');",
 ];
+
+fn observe_status(tx: &Transaction<'_>, record: &mut AgentRecord, status: &str) -> Result<()> {
+    let (previous, stopping): (Option<String>, bool) = tx.query_row(
+        "SELECT observed_status,stop_requested FROM agents WHERE id=?1",
+        [&record.id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let previous = previous.as_deref().unwrap_or(&record.status);
+    if status != "unknown" && previous != status {
+        if matches!(status, "starting" | "working")
+            || stopping && matches!(status, "exited" | "lost")
+        {
+            record.needs_attention = false;
+        } else if matches!(
+            status,
+            "waiting_input" | "waiting_approval" | "lost" | "exited"
+        ) || status == "idle" && previous == "working"
+        {
+            record.needs_attention = true;
+        }
+        tx.execute(
+            "UPDATE agents SET observed_status=?2 WHERE id=?1",
+            params![record.id, status],
+        )?;
+    }
+    record.status = status.into();
+    Ok(())
+}
+fn new_error(before: &AgentRecord, after: &AgentRecord) -> bool {
+    fn error(record: &AgentRecord) -> Option<&str> {
+        if let Some(Value::Object(fields)) = &record.status_detail
+            && let Some(Value::String(error)) = fields.get("error")
+        {
+            return (!error.is_empty()).then_some(error);
+        }
+        None
+    }
+    error(after).is_some() && error(after) != error(before)
+}
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
@@ -499,7 +539,7 @@ impl Store {
         record.pool_session = o.terminal.as_ref().map(|t| t.pool_session.clone());
         record.attach_count = o.terminal.as_ref().map_or(0, |t| t.attach_count);
         record.caps = o.caps;
-        record.status = o.status;
+        observe_status(&tx, record, &o.status)?;
         let mut native_conflict = false;
         if let Some(native) = o.metadata.native_session_id {
             let other: Option<String> = tx
@@ -540,6 +580,9 @@ impl Store {
                 tower_protocol::Value::String("native_identity_conflict".into()),
             );
             record.status_detail = Some(tower_protocol::Value::Object(detail));
+        }
+        if new_error(&before, record) {
+            record.needs_attention = true;
         }
         if *record != before {
             record.updated_at = now;
@@ -582,7 +625,10 @@ impl Store {
             "UPDATE managed_sessions SET auto_resume=0 WHERE id=?1",
             [id],
         )?;
-        tx.execute("UPDATE agents SET recovery_pending=0 WHERE id=?1", [id])?;
+        tx.execute(
+            "UPDATE agents SET recovery_pending=0,stop_requested=1 WHERE id=?1",
+            [id],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -613,7 +659,11 @@ impl Store {
                 session.auto_resume
             ],
         )?;
-        stored.record.status = "starting".into();
+        tx.execute(
+            "UPDATE agents SET stop_requested=0 WHERE id=?1",
+            [&session.id],
+        )?;
+        observe_status(&tx, &mut stored.record, "starting")?;
         stored.record.pid = None;
         stored.record.pid_start_time = None;
         stored.record.mode = mode.map(str::to_owned);
@@ -693,7 +743,7 @@ impl Store {
             }
             existing.record.revision = next_revision(&tx)?;
             tx.execute(
-                "UPDATE agents SET native_id=?2,pid=?3,pid_start=?4,ended_at=NULL WHERE id=?1",
+                "UPDATE agents SET native_id=?2,pid=?3,pid_start=?4,ended_at=NULL,stop_requested=0,observed_status=NULL WHERE id=?1",
                 params![
                     id,
                     existing.record.native_session_id,
@@ -802,8 +852,9 @@ impl Store {
         if let Some(delivery) = delivery {
             messaging::apply_delivery(&tx, &mut agent.record, &delivery.endpoint, delivery.caps)?;
         }
+        let before = agent.record.clone();
         if let Some(status) = &update.status {
-            agent.record.status = status.clone();
+            observe_status(&tx, &mut agent.record, status)?;
             if matches!(status.as_str(), "exited" | "lost") {
                 disable_delivery(&mut agent.record.caps, "session_ended");
             }
@@ -829,6 +880,9 @@ impl Store {
             }
             Patch::Set(_) => return Err(Error::Conflict("detail must be an object or null")),
         }
+        if new_error(&before, &agent.record) {
+            agent.record.needs_attention = true;
+        }
         agent.record.updated_at = now;
         agent.record.revision = next_revision(&tx)?;
         let ended = matches!(agent.record.status.as_str(), "exited" | "lost").then_some(now);
@@ -849,6 +903,55 @@ impl Store {
             revision: agent.record.revision,
         })
     }
+    pub fn edit_session(
+        &self,
+        id: &str,
+        add: &[String],
+        remove: &[String],
+        clear_attention: bool,
+        now: u64,
+    ) -> Result<AgentRecord> {
+        fn valid(tags: &[String]) -> bool {
+            tags.len() <= 64
+                && tags.iter().all(|tag| {
+                    !tag.is_empty()
+                        && tag.chars().count() <= 64
+                        && tag.trim() == tag
+                        && !tag.chars().any(char::is_control)
+                })
+        }
+        if !valid(add) || !valid(remove) || add.iter().any(|tag| remove.contains(tag)) {
+            return Err(Error::Conflict(
+                "Tags must be distinct additions/removals, at most 64 nonempty values of 64 characters without control characters or surrounding whitespace",
+            ));
+        }
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let mut record = stored_agent(&tx, id)?.record;
+        let before = record.clone();
+        for tag in remove {
+            record.tags.remove(tag);
+        }
+        record.tags.extend(add.iter().cloned());
+        if record.tags.len() > 64 {
+            return Err(Error::Conflict("A session may have at most 64 tags"));
+        }
+        if clear_attention {
+            record.needs_attention = false;
+        }
+        if record != before {
+            record.updated_at = now;
+            record.revision = next_revision(&tx)?;
+            save_record(&tx, &record)?;
+        }
+        tx.commit()?;
+        Ok(record)
+    }
+    pub fn expect_stop(&self, id: &str) -> Result<()> {
+        self.lock()?
+            .execute("UPDATE agents SET stop_requested=1 WHERE id=?1", [id])?;
+        Ok(())
+    }
     pub fn heartbeat(&self, id: &str, now: u64) -> Result<()> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
@@ -866,7 +969,8 @@ impl Store {
         let tx = conn.transaction()?;
         let mut agent = stored_agent(&tx, id)?;
         if agent.ended_at.is_none() {
-            agent.record.status = "exited".into();
+            tx.execute("UPDATE agents SET stop_requested=1 WHERE id=?1", [id])?;
+            observe_status(&tx, &mut agent.record, "exited")?;
             disable_delivery(&mut agent.record.caps, "session_ended");
             agent.record.updated_at = now;
             agent.record.last_seen = now;
@@ -885,7 +989,7 @@ impl Store {
         let tx = conn.transaction()?;
         let mut agent = stored_agent(&tx, id)?;
         if agent.ended_at.is_none() {
-            agent.record.status = "lost".into();
+            observe_status(&tx, &mut agent.record, "lost")?;
             disable_delivery(&mut agent.record.caps, "session_lost");
             agent.record.updated_at = now;
             agent.record.revision = next_revision(&tx)?;

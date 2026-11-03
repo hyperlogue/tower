@@ -474,6 +474,8 @@ impl Service {
                     last_seen: now,
                     revision: 0,
                     labels: BTreeMap::new(),
+                    tags: Default::default(),
+                    needs_attention: false,
                     task_refs: Vec::new(),
                     sync_state: "pending".into(),
                 };

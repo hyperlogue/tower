@@ -61,6 +61,34 @@ Unmanaged sessions can also carry protocol metadata:
 ./target/debug/tower ls --protocol acp
 ```
 
+## Session metadata and host metrics
+
+Tags are shared session metadata. A `pinned` tag has no special lifecycle meaning:
+
+```sh
+tower tags SESSION_ID --add pinned,review
+tower tags SESSION_ID --remove review
+tower attention clear SESSION_ID
+tower host metrics
+```
+
+Tower sets `needs_attention` when observed work becomes idle, input or approval is
+needed, or a session is lost or exits unexpectedly. Starting work and explicit
+acknowledgement clear it. Acknowledgement is an atomic update with no revision
+argument. Repeated observations and daemon restart do not re-arm an acknowledged
+transition. Tags and attention are available in `agent.get`, `agent.list`, local
+events, and `tower ls`. Metadata edits require local administrative authority.
+These fields are not included in the existing Allgather status projection until
+an extension is negotiated.
+
+`host.metrics {}` takes no parameters. It returns a sample timestamp, CPU
+utilization, used/total memory, and available space on the filesystem containing
+the Tower user's home. Unavailable measurements are null; the first CPU sample
+can be null until a second counter reading exists. Concurrent requests share a
+short cache. Sampling does not block registry or session operations. Filesystem
+browsing and directory completion remain the responsibility of the client or its
+SSH transport; Tower does not expose `fs.*` methods.
+
 ## Managed terminal sessions
 
 Install or copy the single `tower` executable. It starts separate daemon and pool

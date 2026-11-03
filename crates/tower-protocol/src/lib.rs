@@ -1,6 +1,8 @@
 //! Extensible public wire types. This crate deliberately depends only on serde.
 
-pub mod clipboard;
+pub mod metrics;
+pub use metrics::{DiskMetrics, HostMetrics, MemoryMetrics};
+mod clipboard;
 pub use clipboard::*;
 
 mod execution;
@@ -218,6 +220,10 @@ pub struct AgentRecord {
     pub revision: u64,
     #[serde(default)]
     pub labels: BTreeMap<String, String>,
+    #[serde(default)]
+    pub tags: std::collections::BTreeSet<String>,
+    #[serde(default)]
+    pub needs_attention: bool,
     #[serde(default)]
     pub task_refs: Vec<String>,
     pub sync_state: String,
@@ -490,4 +496,13 @@ pub struct EventParams {
     pub record: Option<AgentRecord>,
     #[serde(default, flatten)]
     pub data: BTreeMap<String, Value>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SessionTagsPatch {
+    pub id: String,
+    #[serde(default)]
+    pub add: Vec<String>,
+    #[serde(default)]
+    pub remove: Vec<String>,
 }

@@ -8,6 +8,8 @@ use std::{
 mod unix;
 #[cfg(unix)]
 pub use unix::*;
+mod metrics;
+pub use metrics::{HostSample, HostSampler};
 mod command;
 mod process;
 pub use command::*;

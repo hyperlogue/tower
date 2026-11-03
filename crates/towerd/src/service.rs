@@ -144,6 +144,7 @@ impl Actor {
 pub(super) struct Service {
     paths: Paths,
     pub(crate) clipboard: Arc<tower_clipboard::Broker>,
+    pub(crate) metrics: crate::metrics::Metrics,
     store: Arc<Store>,
     backends: tower_sessions::Backends,
     startup: String,
@@ -208,6 +209,7 @@ impl Service {
         Ok(Self {
             paths: paths.clone(),
             clipboard: Arc::new(tower_clipboard::Broker::new(paths.state.join("clipboard"))),
+            metrics: crate::metrics::Metrics::new(paths.home.clone()),
             store,
             backends,
             startup: startup.into(),
@@ -225,6 +227,17 @@ impl Service {
             events: tokio::sync::broadcast::channel(256).0,
             published: Mutex::new(events::Published::default()),
         })
+    }
+    pub(crate) fn authorize_host_metrics(
+        &self,
+        request: &Request,
+        peer: Peer,
+    ) -> std::result::Result<(), RpcError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Empty {}
+        let _: Empty = params(&request.params)?;
+        require(&self.actor(&request.context, peer)?, "read")
     }
     pub fn recover_registry(&self) -> Result<()> {
         self.store.mark_unconfirmed(now_ms())?;
@@ -550,6 +563,8 @@ impl Service {
             last_seen: now,
             revision: 0,
             labels: BTreeMap::new(),
+            tags: Default::default(),
+            needs_attention: false,
             task_refs: Vec::new(),
             sync_state: if host.mode == "allgather" {
                 "pending"
@@ -894,6 +909,26 @@ impl Service {
                 }
                 self.managed_restart(p, request.method == "session.restart")
             }
+            "session.tags.patch" => {
+                require(&actor, "admin")?;
+                let p: SessionTagsPatch = params(&request.params)?;
+                let id = self.resolve(&p.id)?.record.id;
+                value(
+                    self.store
+                        .edit_session(&id, &p.add, &p.remove, false, now)
+                        .map_err(storage)?,
+                )
+            }
+            "session.attention.clear" => {
+                require(&actor, "admin")?;
+                let p: IdParams = params(&request.params)?;
+                let id = self.resolve(&p.id)?.record.id;
+                value(
+                    self.store
+                        .edit_session(&id, &[], &[], true, now)
+                        .map_err(storage)?,
+                )
+            }
             "session.attach_info" => {
                 require(&actor, "admin")?;
                 self.clipboard_attach_info(&request.params)
@@ -930,6 +965,7 @@ impl Service {
                     tower_pal::terminate_process(pid, start).map_err(|_| {
                         app("stop_unconfirmed", "Cannot signal this process incarnation")
                     })?;
+                    self.store.expect_stop(&record.id).map_err(storage)?;
                     value(serde_json::json!({"id":record.id,"state":"signal_sent"}))
                 } else {
                     self.managed_kill(&p.id)
@@ -958,6 +994,8 @@ impl Service {
                     "events.registry.v1".into(),
                     "sessions.managed.v1".into(),
                     "clipboard.images.v1".into(),
+                    "sessions.metadata.v1".into(),
+                    "host.metrics.v1".into(),
                 ];
                 capabilities.extend(
                     self.backends

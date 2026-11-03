@@ -127,6 +127,22 @@ enum Command {
         command: DaemonCommand,
     },
     Ls(ListArgs),
+    /// Read or atomically change a session's tags.
+    Tags {
+        id: String,
+        #[arg(long, value_delimiter = ',')]
+        add: Vec<String>,
+        #[arg(long, value_delimiter = ',')]
+        remove: Vec<String>,
+    },
+    Attention {
+        #[command(subcommand)]
+        command: AttentionCommand,
+    },
+    Host {
+        #[command(subcommand)]
+        command: HostCommand,
+    },
     Get {
         id: String,
     },
@@ -238,6 +254,16 @@ enum Command {
         #[arg(default_value = "{}")]
         params: String,
     },
+}
+#[derive(Subcommand)]
+enum AttentionCommand {
+    /// Clear the session's current needs-attention flag.
+    Clear { id: String },
+}
+#[derive(Subcommand)]
+enum HostCommand {
+    /// Sample host CPU, memory, and free space on the home filesystem.
+    Metrics,
 }
 #[derive(Subcommand)]
 enum PoolCommand {
@@ -994,7 +1020,9 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
                 print_json(&r)?;
             } else {
                 let records: Vec<AgentRecord> = serde_json::from_value(serde_json::to_value(r)?)?;
-                println!("ID\tNAME\tHARNESS\tPROTOCOL\tMODE\tSTATUS\tMESSAGE\tTRUST\tCWD\tATTACH");
+                println!(
+                    "ID\tNAME\tHARNESS\tPROTOCOL\tMODE\tSTATUS\tATTENTION\tTAGS\tMESSAGE\tTRUST\tCWD\tATTACH"
+                );
                 for r in records {
                     let message = if r.caps.message == "none" {
                         format!("none: {}", r.caps.message_reason.unwrap_or_default())
@@ -1002,13 +1030,15 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
                         r.caps.message
                     };
                     println!(
-                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                         visible(&r.id),
                         visible(r.display_name.as_deref().unwrap_or("-")),
                         visible(&r.harness),
                         visible(r.protocol.as_deref().unwrap_or("-")),
                         visible(r.mode.as_deref().unwrap_or("-")),
                         visible(&r.status),
+                        if r.needs_attention { "yes" } else { "-" },
+                        serde_json::to_string(&r.tags)?,
                         visible(&message),
                         if r.trust == "weak" { "WEAK" } else { "strong" },
                         visible(&r.cwd),
@@ -1217,6 +1247,34 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
                             protocol: None,
                         },
                     )
+                    .await?,
+            )?;
+        }
+        Command::Host {
+            command: HostCommand::Metrics,
+        } => {
+            print_json(&client.call("host.metrics", &serde_json::json!({})).await?)?;
+        }
+        Command::Tags { id, add, remove } => {
+            if add.is_empty() && remove.is_empty() {
+                let record: AgentRecord = serde_json::from_value(serde_json::to_value(
+                    client.call("agent.get", &IdParams { id }).await?,
+                )?)?;
+                print_json(&record.tags)?;
+            } else {
+                print_json(
+                    &client
+                        .call("session.tags.patch", &SessionTagsPatch { id, add, remove })
+                        .await?,
+                )?;
+            }
+        }
+        Command::Attention {
+            command: AttentionCommand::Clear { id },
+        } => {
+            print_json(
+                &client
+                    .call("session.attention.clear", &IdParams { id })
                     .await?,
             )?;
         }

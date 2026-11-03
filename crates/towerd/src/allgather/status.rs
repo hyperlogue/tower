@@ -118,7 +118,7 @@ impl Publisher {
                 return Ok(None);
             }
         }
-        let full = json!({"jsonrpc":"2.0","method":"state.push","params":{"seq":seq,"full":true,"records":records}});
+        let full = json!({"jsonrpc":"2.0","method":"state.push","params":{"seq":seq,"full":true,"records":next.values().collect::<Vec<_>>()}});
         let frame = if delta && self.deltas_safe && self.acknowledged.is_some() {
             let patch = json!({"jsonrpc":"2.0","method":"state.delta","params":{"seq":seq,"base_seq":self.acknowledged_sequence,"upserts":changed,"removed":removed}});
             if serde_json::to_vec(&patch)?.len() < serde_json::to_vec(&full)?.len() {
@@ -300,5 +300,33 @@ mod tests {
             p.prepare(&records, false).unwrap().unwrap()["method"],
             "state.push"
         );
+    }
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+    #[test]
+    fn baseline_projection_never_sends_unnegotiated_session_metadata() {
+        let record: AgentRecord=serde_json::from_value(json!({"id":"a","node":"machine","harness":"fixture","ownership":"registered","trust":"weak","cwd":"/project","status":"idle","caps":tower_protocol::Capabilities::unavailable("fixture"),"attach_count":0,"sources":[],"registered_at":1,"updated_at":1,"last_seen":1,"revision":1,"sync_state":"pending","tags":["pinned"],"needs_attention":true})).unwrap();
+        let mut publisher = Publisher::default();
+        let full = publisher
+            .prepare(std::slice::from_ref(&record), true)
+            .unwrap()
+            .unwrap();
+        let public = &full["params"]["records"][0];
+        assert!(public.get("tags").is_none());
+        assert!(public.get("needs_attention").is_none());
+        publisher
+            .acknowledge(&SyncAck {
+                cursor: full["params"]["seq"].as_u64().unwrap(),
+                rejected: vec![],
+            })
+            .unwrap();
+        let mut changed = record;
+        changed.tags.clear();
+        changed.needs_attention = false;
+        changed.revision += 1;
+        assert!(publisher.prepare(&[changed], true).unwrap().is_none());
     }
 }

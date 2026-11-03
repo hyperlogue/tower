@@ -27,6 +27,8 @@ fn record(id: &str, native: Option<&str>, pid: Option<u32>) -> AgentRecord {
         last_seen: 100,
         revision: 0,
         labels: Default::default(),
+        tags: Default::default(),
+        needs_attention: false,
         task_refs: Vec::new(),
         sync_state: "synced".into(),
     }
@@ -418,4 +420,84 @@ fn policy_deltas_are_atomic_ordered_and_replay_safe_after_restart() {
     assert!(store.apply_policy_delta(&empty).unwrap());
     assert!(store.rules().unwrap().allgather_rules.is_empty());
     assert_eq!(store.rules().unwrap().local_rules, before.local_rules);
+}
+
+#[test]
+fn session_tags_and_attention_are_atomic_and_survive_reconstruction() {
+    let (dir, s) = setup();
+    s.register_test(record("a", None, None), b"token").unwrap();
+    s.edit_session(
+        "a",
+        &["pinned".into(), "review".into(), "pinned".into()],
+        &[],
+        false,
+        101,
+    )
+    .unwrap();
+    assert_eq!(
+        s.agent("a")
+            .unwrap()
+            .record
+            .tags
+            .into_iter()
+            .collect::<Vec<_>>(),
+        ["pinned", "review"]
+    );
+    s.update(&update("a", 1, "working"), 102).unwrap();
+    assert!(!s.agent("a").unwrap().record.needs_attention);
+    s.update(&update("a", 2, "idle"), 103).unwrap();
+    assert!(s.agent("a").unwrap().record.needs_attention);
+    let cleared = s
+        .edit_session("a", &[], &["review".into()], true, 104)
+        .unwrap();
+    assert!(!cleared.needs_attention);
+    assert_eq!(cleared.tags.into_iter().collect::<Vec<_>>(), ["pinned"]);
+    s.mark_unconfirmed(105).unwrap();
+    drop(s);
+    let s = Store::open(&dir.path().join("db")).unwrap();
+    s.update(&update("a", 3, "idle"), 106).unwrap();
+    assert!(!s.agent("a").unwrap().record.needs_attention);
+    s.update(&update("a", 4, "waiting_approval"), 107).unwrap();
+    assert!(s.agent("a").unwrap().record.needs_attention);
+    s.edit_session("a", &[], &[], true, 108).unwrap();
+    s.mark_unconfirmed(109).unwrap();
+    s.update(&update("a", 5, "waiting_approval"), 110).unwrap();
+    assert!(!s.agent("a").unwrap().record.needs_attention);
+    s.update(&update("a", 6, "working"), 111).unwrap();
+    s.update(&update("a", 7, "idle"), 112).unwrap();
+    assert!(s.agent("a").unwrap().record.needs_attention);
+    assert!(
+        s.edit_session("a", &["bad\ntag".into()], &[], false, 113)
+            .is_err()
+    );
+    assert!(
+        s.edit_session("a", &["tag".into()], &["tag".into()], false, 113)
+            .is_err()
+    );
+    assert!(
+        s.edit_session(
+            "a",
+            &(0..64).map(|n| n.to_string()).collect::<Vec<_>>(),
+            &[],
+            false,
+            113
+        )
+        .is_err()
+    );
+    assert!(s.agent("a").unwrap().record.needs_attention);
+}
+
+#[test]
+fn expected_stop_does_not_raise_attention_but_lost_process_does() {
+    let (_dir, s) = setup();
+    for id in ["expected", "unexpected"] {
+        s.register_test(record(id, None, None), b"token").unwrap();
+        s.update(&update(id, 1, "working"), 101).unwrap();
+    }
+    s.expect_stop("expected").unwrap();
+    for id in ["expected", "unexpected"] {
+        s.mark_lost(id, 102).unwrap();
+    }
+    assert!(!s.agent("expected").unwrap().record.needs_attention);
+    assert!(s.agent("unexpected").unwrap().record.needs_attention);
 }

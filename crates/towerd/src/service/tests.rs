@@ -580,3 +580,65 @@ mod managed;
 mod messaging;
 
 mod enrollment;
+
+#[test]
+fn metadata_mutations_require_user_authority_and_attention_ack_has_no_revision() {
+    let (_dir, _store, s) = setup();
+    let registered = call(
+        &s,
+        "agent.register",
+        serde_json::json!({"harness":"fixture","cwd":"~/work"}),
+        human(),
+    )
+    .unwrap();
+    let id = registered["id"].as_str().unwrap();
+    let token = registered["token"].as_str().unwrap();
+    let agent = CallerContext {
+        agent_token: Some(Secret(token.into())),
+        ..Default::default()
+    };
+    assert!(
+        call(
+            &s,
+            "session.tags.patch",
+            serde_json::json!({"id":id,"add":["pinned"]}),
+            agent.clone()
+        )
+        .is_err()
+    );
+    let tagged = call(
+        &s,
+        "session.tags.patch",
+        serde_json::json!({"id":id,"add":["pinned"]}),
+        human(),
+    )
+    .unwrap();
+    assert_eq!(tagged["tags"], serde_json::json!(["pinned"]));
+    for (seq, status) in [(1, "working"), (2, "idle")] {
+        call(
+            &s,
+            "agent.update",
+            serde_json::json!({"id":id,"token":token,"seq":seq,"status":status}),
+            agent.clone(),
+        )
+        .unwrap();
+    }
+    assert!(
+        call(
+            &s,
+            "session.attention.clear",
+            serde_json::json!({"id":id}),
+            agent
+        )
+        .is_err()
+    );
+    let cleared = call(
+        &s,
+        "session.attention.clear",
+        serde_json::json!({"id":id}),
+        human(),
+    )
+    .unwrap();
+    assert_eq!(cleared["needs_attention"], false);
+    assert_eq!(cleared["tags"], serde_json::json!(["pinned"]));
+}

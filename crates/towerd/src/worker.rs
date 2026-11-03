@@ -56,6 +56,7 @@ impl ServiceWorker {
             | "clipboard.consumed" | "clipboard.wait" | "clipboard.finish" | "clipboard.status" => {
                 self.clipboard_request(request, peer).await
             }
+            "host.metrics" => self.host_metrics(request, peer).await,
             "message.send" => self.send_message(request, peer).await,
             "approval.watch" => self.approval_watch(request, peer).await,
             "conversation.list" => self.conversations(request, peer).await,
@@ -72,6 +73,19 @@ impl ServiceWorker {
                 "Request processing failed",
             )),
         }
+    }
+    async fn host_metrics(
+        &self,
+        request: tower_protocol::Request,
+        peer: tower_pal::Peer,
+    ) -> Result<std::result::Result<tower_protocol::Value, tower_protocol::RpcError>> {
+        let check = request.clone();
+        self.execute(move |s| s.authorize_host_metrics(&check, peer))
+            .await??;
+        let sample = self.service.metrics.get().await?;
+        self.execute(move |s| s.authorize_host_metrics(&request, peer))
+            .await??;
+        Ok(Ok(serde_json::from_value(serde_json::to_value(sample)?)?))
     }
     async fn clipboard_request(
         &self,

@@ -5,6 +5,7 @@ pub mod client;
 mod clipboard;
 mod http;
 mod http_io;
+mod metrics;
 pub mod policy;
 mod service;
 mod sinks;
