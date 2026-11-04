@@ -9,6 +9,7 @@ mod metrics;
 pub mod policy;
 mod service;
 mod sinks;
+mod vcs;
 mod wire;
 mod worker;
 use service::Service;
@@ -62,6 +63,15 @@ pub async fn run(paths: Paths, startup: &str, backends: tower_sessions::Backends
             }
         }
     });
+    let vcs = service.vcs();
+    let checkout_refresh = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            vcs.refresh_all().await;
+        }
+    });
     let signals = tower_pal::shutdown_signal();
     tokio::pin!(signals);
     let result = loop {
@@ -93,6 +103,8 @@ pub async fn run(paths: Paths, startup: &str, backends: tower_sessions::Backends
     http.shutdown().await;
     tasks.abort_all();
     maintenance.abort();
+    checkout_refresh.abort();
+    let _ = checkout_refresh.await;
     while tasks.join_next().await.is_some() {}
     let _ = maintenance.await;
     service.drain().await?;

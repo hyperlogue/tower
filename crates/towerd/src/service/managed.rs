@@ -22,6 +22,12 @@ impl Service {
     ) -> std::result::Result<Value, RpcError> {
         self.sync_managed().map_err(storage)?;
         let record = self.resolve(&p.id)?.record;
+        let directory = self
+            .paths
+            .absolute_cwd(&record.cwd)
+            .map_err(|_| invalid("Invalid session directory"))?;
+        self.vcs_directory_available(&directory)?;
+        self.validate_session_checkout(&record)?;
         if record.ownership != "owned" {
             return Err(app("not_owned", "Session lifecycle is externally managed"));
         }
@@ -107,6 +113,24 @@ impl Service {
                 };
                 if observation.status == "lost" && session.auto_resume {
                     let record = self.store.agent(&session.id)?.record;
+                    if self.validate_session_checkout(&record).is_err()
+                        || self
+                            .paths
+                            .absolute_cwd(&record.cwd)
+                            .ok()
+                            .is_some_and(|path| self.vcs_directory_available(&path).is_err())
+                    {
+                        observation.status = "unknown".into();
+                        observation.recovery_pending = true;
+                        observation.metadata.detail = Some(
+                            value(serde_json::json!({"error":"checkout_busy"}))
+                                .map_err(|_| tower_store::Error::Schema)?,
+                        );
+                        self.store
+                            .observe_managed(backend.protocol(), observation, now_ms())?;
+                        continue;
+                    }
+
                     if self
                         .session_policy(
                             &Actor::Human,
@@ -248,6 +272,7 @@ impl Service {
             .map_err(|_| app("internal_error", "Cannot write session credential"))?;
         let now = now_ms();
         let record = AgentRecord {
+            checkout_id: None,
             id: id.clone(),
             display_name: None,
             node: host.node_name,
@@ -295,6 +320,13 @@ impl Service {
         if let Err(error) = self.store.create_managed(record, &hash(&token), &session) {
             let _ = tower_pal::remove_private(&path);
             return Err(storage(error));
+        }
+        if let Some(checkout) = &p.checkout_id {
+            self.store
+                .link_session_checkout(&id, checkout)
+                .map_err(storage)?;
+        } else {
+            self.link_checkout(&id, &p.cwd)?;
         }
         let observation = match backend.start(&session, &token) {
             Ok(observation) if observation.id == id => observation,

@@ -8,6 +8,7 @@ mod attach;
 mod clipboard;
 mod hooks;
 mod mcp;
+mod vcs;
 mod wrapper;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -63,6 +64,8 @@ enum Command {
     },
     Open {
         harness: String,
+        #[arg(long)]
+        checkout: Option<String>,
         #[arg(long)]
         protocol: Option<String>,
         #[arg(long)]
@@ -255,6 +258,18 @@ enum Command {
         #[command(subcommand)]
         command: AgentsCommand,
     },
+    /// Registered local VCS working copies.
+    Checkout {
+        #[command(subcommand)]
+        command: vcs::CheckoutCommand,
+    },
+    /// Inspect or execute a reviewed version-control operation.
+    Vcs {
+        #[command(subcommand)]
+        command: vcs::VcsCommand,
+    },
+    /// Show the cached repository catalog and its freshness.
+    Catalog,
     /// Invoke an implemented JSON-RPC method. Prints the result as JSON.
     Rpc {
         method: String,
@@ -836,8 +851,12 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
             )?,
         },
         Command::Run { harness, args } => wrapper::run(paths, &mut client, harness, args).await?,
+        Command::Checkout { command } => vcs::checkout(&mut client, command).await?,
+        Command::Vcs { command } => vcs::vcs(&mut client, command).await?,
+        Command::Catalog => print_json(&client.call("catalog.get", &serde_json::json!({})).await?)?,
         Command::Open {
             harness,
+            checkout,
             protocol,
             cwd,
             mode,
@@ -847,6 +866,7 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
             args,
         } => {
             let params = SessionOpenParams {
+                checkout_id: checkout.clone(),
                 harness,
                 protocol,
                 mode,
@@ -856,7 +876,11 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
                     native_session_id,
                     fork,
                 }),
-                cwd: cwd.unwrap_or(tower_pal::cwd()?.to_string_lossy().into_owned()),
+                cwd: cwd.unwrap_or(if checkout.is_some() {
+                    String::new()
+                } else {
+                    tower_pal::cwd()?.to_string_lossy().into_owned()
+                }),
             };
             let r = client.call("session.open", &params).await?;
             let opened: SessionOpenResult = serde_json::from_value(serde_json::to_value(&r)?)?;

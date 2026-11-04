@@ -9,8 +9,8 @@ opencode, Pi, Antigravity, and omp. Codex uses one host app-server shared by its
 The public interface is Tower's JSON-RPC API; Miao clients need a Tower adapter.
 Native Claude/Codex messages, approvals, process discovery, MCP, loopback HTTP/SSE,
 and Allgather status/policy synchronization are available. Allgather supports browser enrollment, incremental state and policy synchronization,
-and managed sessions for Codex, Claude Code, and Antigravity. Clipboard sharing
-remains separate integration work.
+and managed sessions for Codex, Claude Code, and Antigravity. Image clipboard
+sharing uses a separate opt-in provider connection.
 
 ## Development
 
@@ -88,6 +88,93 @@ can be null until a second counter reading exists. Concurrent requests share a
 short cache. Sampling does not block registry or session operations. Filesystem
 browsing and directory completion remain the responsibility of the client or its
 SSH transport; Tower does not expose `fs.*` methods.
+
+## Repositories, checkouts, and worktrees
+
+Allgather owns the project and repository catalog. Tower owns local checkout IDs,
+directories, and working-copy observations. One repository can have several clones
+and worktrees on a host. These features use the existing machine login and `/tower`
+connection; they require no second credential. Tower pairs with one Allgather.
+Install Git on the Tower host and make it available on `PATH`.
+
+Register an existing working copy or bare repository, then use checkout IDs:
+
+```sh
+tower checkout register "$PWD"
+tower checkout list
+tower vcs status CHECKOUT_ID
+tower open codex --checkout CHECKOUT_ID
+```
+
+Registration discovers linked worktrees too. Bare storage is not a checkout; it
+has no working directory or public checkout ID. IDs survive daemon restart and
+verified worktree moves. A different working copy at an old path gets a different
+ID. Sessions report an optional `checkout_id`; other managed protocols do not
+need a filesystem checkout.
+
+If a local remote matches exactly one catalog repository or an approved alias,
+Tower associates it automatically. SSH usernames are part of remote identity.
+Use `tower checkout bind CHECKOUT_ID REPOSITORY_ID` to select a matching repository
+explicitly, or `tower checkout unbind CHECKOUT_ID` to keep it local. Repositories
+without a published upstream URL can be bound explicitly. Binding does not clone
+files or change Git configuration. `tower catalog` shows the cached catalog and
+whether it is current. An unavailable checkout can be removed from Tower metadata
+with `tower checkout forget CHECKOUT_ID`; this does not delete files.
+
+VCS mutations use a reviewed plan followed by execution:
+
+```sh
+tower vcs prepare CHECKOUT_ID checkout.create --options \
+  '{"name":"feature","target":{"kind":"new_branch","branch":"feature"}}'
+tower vcs execute PLAN_ID --wait
+tower vcs operation PLAN_ID
+
+# Other operations use the same prepare/execute flow.
+tower vcs prepare CHECKOUT_ID checkout.move --options '{"name":"renamed"}'
+tower vcs prepare CHECKOUT_ID checkout.remove
+tower vcs prepare CHECKOUT_ID checkout.repair --options '{"name":"moved-externally"}'
+tower vcs prepare CHECKOUT_ID push
+tower vcs prepare CHECKOUT_ID pull
+
+# Prepare a first working copy from bare storage.
+tower checkout register /path/to/repository.git --create \
+  '{"name":"first","target":{"kind":"detached","revision":"HEAD"}}'
+```
+
+Creation also accepts `existing_branch` and `detached` targets. Push and pull
+accept configured remote names and a `reference` in their options. Push never
+forces an update; pull only fast-forwards. Plans expire after ten minutes and
+recheck native identity, refs, configuration, policy, and session use before
+mutation. Active sessions, including owned sessions with uncertain termination,
+block moves, removal, and updates that affect their working directory. Removal
+refuses dirty, untracked, ignored, locked, or main worktrees.
+
+New and moved worktrees use a single directory name under a host-configured root:
+
+```toml
+[vcs]
+worktree_root = "~/worktrees"
+```
+
+The default is `~/worktrees`. Native Git access uses the host's configured
+credentials. Tower does not obtain Git credentials from Allgather. Local read
+credentials can inspect checkouts; registration, binding, and mutation require
+local administrative authority. VCS methods accept checkout or plan IDs, never
+an arbitrary working-directory path. Paths enter through explicit registration.
+
+A `completed` receipt records native success. `result.refresh_pending` means
+checkout observations may still be catching up. Repeating execution of the same
+plan returns its retained receipt. Interrupted operations with uncertain effects
+stay `unknown` and are not retried. They reserve the repository until an
+administrator inspects Git state and any remaining processes, then runs
+`tower vcs release PLAN_ID --yes`. Release preserves the unknown outcome.
+
+Allgather receives machine-scoped checkout observations, not Git contents or
+credentials. Catalog and checkout updates use acknowledged deltas when smaller,
+with full snapshots on reconnect. Renames update the existing checkout ID.
+Offline, cached mappings and local inspection remain available. An enrolled
+Tower requires a current connection, catalog, and policy for new VCS mutations.
+Logout clears remote associations and preserves local checkout IDs and files.
 
 ## Managed terminal sessions
 

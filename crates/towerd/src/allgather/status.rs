@@ -26,7 +26,7 @@ const FIELDS: &[&str] = &[
     "revision",
 ];
 
-fn projection(records: &[AgentRecord]) -> Result<Projection> {
+fn projection(records: &[AgentRecord], checkouts: bool) -> Result<Projection> {
     if records.len() > MAX_SYNC_RECORDS {
         return Err(tower_protocol::RpcError::application(
             "sync_record_limit",
@@ -40,7 +40,9 @@ fn projection(records: &[AgentRecord]) -> Result<Projection> {
             let Value::Object(mut fields) = serde_json::to_value(record)? else {
                 unreachable!()
             };
-            fields.retain(|key, _| FIELDS.contains(&key.as_str()));
+            fields.retain(|key, _| {
+                FIELDS.contains(&key.as_str()) || checkouts && key == "checkout_id"
+            });
             Ok((record.id.clone(), fields))
         })
         .collect()
@@ -55,6 +57,7 @@ struct Pending {
 
 #[derive(Default)]
 pub(super) struct Publisher {
+    checkouts: bool,
     sequence: u64,
     acknowledged_sequence: u64,
     acknowledged: Option<Projection>,
@@ -63,6 +66,10 @@ pub(super) struct Publisher {
 }
 
 impl Publisher {
+    pub fn include_checkouts(&mut self, enabled: bool) {
+        self.checkouts = enabled;
+        self.resync();
+    }
     pub fn waiting(&self) -> bool {
         self.pending.is_some()
     }
@@ -75,7 +82,7 @@ impl Publisher {
         if self.waiting() {
             return Ok(None);
         }
-        let next = projection(records)?;
+        let next = projection(records, self.checkouts)?;
         let seq = self
             .sequence
             .checked_add(1)
@@ -308,7 +315,7 @@ mod metadata_tests {
     use super::*;
     #[test]
     fn baseline_projection_never_sends_unnegotiated_session_metadata() {
-        let record: AgentRecord=serde_json::from_value(json!({"id":"a","node":"machine","harness":"fixture","ownership":"registered","trust":"weak","cwd":"/project","status":"idle","caps":tower_protocol::Capabilities::unavailable("fixture"),"attach_count":0,"sources":[],"registered_at":1,"updated_at":1,"last_seen":1,"revision":1,"sync_state":"pending","tags":["pinned"],"needs_attention":true})).unwrap();
+        let record: AgentRecord=serde_json::from_value(json!({"id":"a","checkout_id":"checkout-one","node":"machine","harness":"fixture","ownership":"registered","trust":"weak","cwd":"/project","status":"idle","caps":tower_protocol::Capabilities::unavailable("fixture"),"attach_count":0,"sources":[],"registered_at":1,"updated_at":1,"last_seen":1,"revision":1,"sync_state":"pending","tags":["pinned"],"needs_attention":true})).unwrap();
         let mut publisher = Publisher::default();
         let full = publisher
             .prepare(std::slice::from_ref(&record), true)
@@ -317,6 +324,15 @@ mod metadata_tests {
         let public = &full["params"]["records"][0];
         assert!(public.get("tags").is_none());
         assert!(public.get("needs_attention").is_none());
+        assert!(public.get("checkout_id").is_none());
+        let mut negotiated = Publisher::default();
+        negotiated.include_checkouts(true);
+        let full = negotiated
+            .prepare(std::slice::from_ref(&record), true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(full["params"]["records"][0]["checkout_id"], "checkout-one");
+
         publisher
             .acknowledge(&SyncAck {
                 cursor: full["params"]["seq"].as_u64().unwrap(),

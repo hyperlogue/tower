@@ -2,6 +2,9 @@
 
 pub mod metrics;
 pub use metrics::{DiskMetrics, HostMetrics, MemoryMetrics};
+mod vcs;
+pub use vcs::*;
+
 mod clipboard;
 pub use clipboard::*;
 
@@ -208,6 +211,8 @@ pub struct AgentRecord {
     #[serde(default)]
     pub shared_process: bool,
     pub cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout_id: Option<String>,
     pub status: String,
     pub status_detail: Option<Value>,
     pub caps: Capabilities,
@@ -399,8 +404,11 @@ pub struct NameParams {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionOpenParams {
     #[serde(default)]
+    pub checkout_id: Option<String>,
+    #[serde(default)]
     pub protocol: Option<String>,
     pub harness: String,
+    #[serde(default)]
     pub cwd: String,
     #[serde(default)]
     pub args: Vec<String>,

@@ -7,6 +7,7 @@ mod messaging;
 mod scan;
 mod sync;
 mod terminal;
+mod vcs;
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
@@ -91,6 +92,7 @@ fn params<T: DeserializeOwned>(v: &Value) -> std::result::Result<T, RpcError> {
 #[derive(Default, Deserialize)]
 #[serde(default)]
 struct Config {
+    vcs: crate::vcs::Config,
     history: History,
     messaging: messaging::Limits,
     scan: scan::Config,
@@ -144,6 +146,7 @@ impl Actor {
 pub(super) struct Service {
     paths: Paths,
     pub(crate) clipboard: Arc<tower_clipboard::Broker>,
+    pub(crate) vcs: Arc<crate::vcs::Vcs>,
     pub(crate) metrics: crate::metrics::Metrics,
     store: Arc<Store>,
     backends: tower_sessions::Backends,
@@ -154,6 +157,7 @@ pub(super) struct Service {
     connected: std::sync::atomic::AtomicBool,
     remote_epoch: std::sync::atomic::AtomicU64,
     policy_epoch: std::sync::atomic::AtomicU64,
+    catalog_epoch: std::sync::atomic::AtomicU64,
     message_limits: messaging::Limits,
     traffic: Mutex<messaging::Traffic>,
     scan: scan::Config,
@@ -206,7 +210,14 @@ impl Service {
             base32(&random(3)?)[..4].to_owned()
         );
         store.initialize(&host_id, &node)?;
+        store.recover_vcs_operations()?;
+        let vcs = Arc::new(crate::vcs::Vcs::new(
+            paths.clone(),
+            store.clone(),
+            config.vcs,
+        )?);
         Ok(Self {
+            vcs,
             paths: paths.clone(),
             clipboard: Arc::new(tower_clipboard::Broker::new(paths.state.join("clipboard"))),
             metrics: crate::metrics::Metrics::new(paths.home.clone()),
@@ -219,6 +230,7 @@ impl Service {
             connected: std::sync::atomic::AtomicBool::new(false),
             remote_epoch: std::sync::atomic::AtomicU64::new(0),
             policy_epoch: std::sync::atomic::AtomicU64::new(0),
+            catalog_epoch: std::sync::atomic::AtomicU64::new(0),
             message_limits: config.messaging,
             traffic: Mutex::new(messaging::Traffic::default()),
             scan: config.scan,
@@ -252,6 +264,7 @@ impl Service {
         self.sync_managed()?;
         self.scan_processes()?;
         self.maintain_clipboard().map_err(Error::Rpc)?;
+        self.store.expire_vcs_plans(now_ms())?;
         let now = now_ms();
         for r in self.store.agents(&AgentFilter::default())? {
             if r.ownership != "registered" {
@@ -547,6 +560,7 @@ impl Service {
         );
         let token = secret().map_err(|_| app("internal_error", "Random source unavailable"))?;
         let mut candidate = AgentRecord {
+            checkout_id: None,
             id: id.clone(),
             display_name: p.display_name,
             node: host.node_name,
@@ -677,6 +691,7 @@ impl Service {
                 delivery: endpoint,
             })?;
         }
+        self.link_checkout(&registered.agent.record.id, &registered.agent.record.cwd)?;
         value(RegisterResult {
             id: registered.agent.record.id,
             token,
@@ -879,7 +894,8 @@ impl Service {
             }
             "session.open" => {
                 require(&actor, "admin")?;
-                let p: SessionOpenParams = params(&request.params)?;
+                let mut p: SessionOpenParams = params(&request.params)?;
+                self.resolve_checkout_launch(&mut p)?;
                 let cwd = self
                     .paths
                     .display_cwd(&p.cwd)
@@ -1005,6 +1021,8 @@ impl Service {
                     "events.registry.v1".into(),
                     "sessions.managed.v1".into(),
                     "clipboard.images.v1".into(),
+                    "checkouts.v1".into(),
+                    "vcs.checked-operations.v1".into(),
                     "sessions.metadata.v1".into(),
                     "host.metrics.v1".into(),
                 ];

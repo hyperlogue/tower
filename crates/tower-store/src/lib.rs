@@ -1,7 +1,9 @@
 //! Transactional local persistence. Runtime observations never contain message bodies.
 
 mod messaging;
+mod vcs;
 pub use messaging::{DeliveryState, StoredApproval};
+pub use vcs::{StoredCheckout, StoredVcsOperation};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
@@ -72,6 +74,7 @@ const MIGRATIONS: &[&str] = &[
     "DROP INDEX process_identity; CREATE UNIQUE INDEX process_identity ON agents(pid,pid_start) WHERE pid IS NOT NULL AND pid_start IS NOT NULL AND ownership='registered' AND coalesce(json_extract(public_json,'$.shared_process'),0)=0; CREATE INDEX process_observation ON agents(pid,pid_start);",
     "ALTER TABLE policy_snapshot ADD COLUMN delta_hash BLOB;",
     "ALTER TABLE agents ADD COLUMN observed_status TEXT; ALTER TABLE agents ADD COLUMN stop_requested INTEGER NOT NULL DEFAULT 0; UPDATE agents SET observed_status=json_extract(public_json,'$.status');",
+    include_str!("vcs.sql"),
 ];
 
 fn observe_status(tx: &Transaction<'_>, record: &mut AgentRecord, status: &str) -> Result<()> {

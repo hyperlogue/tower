@@ -206,6 +206,9 @@ impl Service {
             "session-status.v1".into(),
             "session-status-delta.v1".into(),
             "policy-delta.v1".into(),
+            "repository-catalog.v1".into(),
+            "repository-catalog-delta.v1".into(),
+            "checkout-sync.v1".into(),
         ];
         if !harness_controls.is_empty() {
             capabilities.extend(
@@ -465,6 +468,7 @@ impl Service {
             .set_enrollment("standalone", None)
             .map_err(storage)?;
         self.store.clear_policy().map_err(storage)?;
+        self.store.catalog_pairing("").map_err(storage)?;
         self.refresh_approvals()?;
         tower_pal::remove_private(&self.paths.state.join("allgather-server"))
             .map_err(|_| app("internal_error", "Cannot remove enrollment binding"))?;

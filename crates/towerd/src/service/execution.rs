@@ -273,6 +273,7 @@ impl Service {
                 .map_err(|_| invalid("Working directory must exist"))?
                 .to_string_lossy()
                 .into_owned();
+            self.vcs_directory_available(std::path::Path::new(&cwd))?;
             let previous = views
                 .iter()
                 .rev()
@@ -443,6 +444,7 @@ impl Service {
                 let mut caps = Capabilities::unavailable("structured_control_required");
                 caps.kill = true;
                 let record = AgentRecord {
+                    checkout_id: None,
                     id: session.id.clone(),
                     display_name: None,
                     node: host.node_name,
@@ -486,6 +488,7 @@ impl Service {
             }
             Err(e) => return Err(storage(e)),
         }
+        self.link_checkout(&session.id, &b.cwd)?;
         Ok(())
     }
 }

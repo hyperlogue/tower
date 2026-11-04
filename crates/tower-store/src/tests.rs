@@ -3,6 +3,7 @@ use tower_protocol::{Capabilities, Secret};
 
 fn record(id: &str, native: Option<&str>, pid: Option<u32>) -> AgentRecord {
     AgentRecord {
+        checkout_id: None,
         id: id.into(),
         display_name: None,
         node: "node".into(),

@@ -908,6 +908,7 @@ impl ManagedBackend for TerminalBackend {
         tower_agents::config::validate(&spec)
             .map_err(|e| error("invalid_params", &e.to_string()))?;
         let request = SessionOpenParams {
+            checkout_id: None,
             resume: None,
             protocol: Some("terminal".into()),
             harness: spec.harness.id().into(),
@@ -961,6 +962,7 @@ impl ManagedBackend for TerminalBackend {
                 self.prepare(
                     &session.id,
                     &SessionOpenParams {
+                        checkout_id: None,
                         resume: None,
                         protocol: Some("terminal".into()),
                         harness: plan.spec.harness.id().into(),
