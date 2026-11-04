@@ -21,7 +21,7 @@ use tower_pal::{Paths, Peer};
 use tower_protocol::*;
 use tower_store::{Store, StoredAgent};
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -691,7 +691,7 @@ impl Service {
                 delivery: endpoint,
             })?;
         }
-        self.link_checkout(&registered.agent.record.id, &registered.agent.record.cwd)?;
+        self.vcs.link_session(&registered.agent.record.id)?;
         value(RegisterResult {
             id: registered.agent.record.id,
             token,

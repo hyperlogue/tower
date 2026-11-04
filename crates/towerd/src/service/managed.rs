@@ -326,7 +326,7 @@ impl Service {
                 .link_session_checkout(&id, checkout)
                 .map_err(storage)?;
         } else {
-            self.link_checkout(&id, &p.cwd)?;
+            self.vcs.link_session(&id)?;
         }
         let observation = match backend.start(&session, &token) {
             Ok(observation) if observation.id == id => observation,

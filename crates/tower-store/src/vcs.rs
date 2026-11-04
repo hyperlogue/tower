@@ -9,7 +9,7 @@ pub struct StoredCheckout {
     pub association_manual: bool,
     pub record: Checkout,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct StoredVcsOperation {
     pub actor: String,
     pub prepared: serde_json::Value,
@@ -32,6 +32,18 @@ fn decode_checkout(
         identity,
         binding: serde_json::from_str(&binding)?,
         association_manual,
+        record: serde_json::from_str(&record)?,
+    })
+}
+fn operation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(String, String, String)> {
+    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+}
+fn decode_operation(
+    (actor, prepared, record): (String, String, String),
+) -> Result<StoredVcsOperation> {
+    Ok(StoredVcsOperation {
+        actor,
+        prepared: serde_json::from_str(&prepared)?,
         record: serde_json::from_str(&record)?,
     })
 }
@@ -394,7 +406,6 @@ impl Store {
                 save_record(&tx, &record)?;
             }
         }
-        tx.execute("DELETE FROM session_checkouts WHERE checkout_id=?1", [id])?;
         if tx.execute("DELETE FROM checkouts WHERE id=?1", [id])? == 0 {
             return Err(Error::NotFound);
         }
@@ -402,17 +413,35 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
-    pub fn checkout_cursor(&self) -> Result<u64> {
-        Ok(self.lock()?.query_row(
+    pub fn checkout_snapshot(&self, since: Option<u64>) -> Result<Option<(u64, Vec<Checkout>)>> {
+        let conn = self.lock()?;
+        let cursor = conn.query_row(
             "SELECT value FROM counters WHERE name='checkouts'",
             [],
             |r| r.get::<_, i64>(0),
-        )? as u64)
+        )? as u64;
+        if since == Some(cursor) {
+            return Ok(None);
+        }
+        let records = conn
+            .prepare("SELECT record FROM checkouts ORDER BY id")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+            .into_iter()
+            .map(|record| serde_json::from_str(&record).map_err(Error::from))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Some((cursor, records)))
     }
     pub fn link_session_checkout(&self, session: &str, checkout: &str) -> Result<()> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
-        tx.execute("INSERT INTO session_checkouts(session_id,checkout_id) VALUES(?1,?2) ON CONFLICT(session_id) DO UPDATE SET checkout_id=excluded.checkout_id",params![session,checkout])?;
+        if !tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM checkouts WHERE id=?1)",
+            [checkout],
+            |r| r.get::<_, bool>(0),
+        )? {
+            return Err(Error::NotFound);
+        }
         let data: String = tx.query_row(
             "SELECT public_json FROM agents WHERE id=?1",
             [session],
@@ -428,16 +457,6 @@ impl Store {
         Ok(())
     }
 
-    pub fn session_checkout(&self, session: &str) -> Result<Option<String>> {
-        Ok(self
-            .lock()?
-            .query_row(
-                "SELECT checkout_id FROM session_checkouts WHERE session_id=?1",
-                [session],
-                |r| r.get(0),
-            )
-            .optional()?)
-    }
     pub fn save_vcs_plan(&self, op: &StoredVcsOperation) -> Result<()> {
         let conn = self.lock()?;
         let n: i64 = conn.query_row(
@@ -448,24 +467,29 @@ impl Store {
         if n >= 128 {
             return Err(Error::Conflict("VCS operation capacity reached"));
         }
-        conn.execute("INSERT INTO vcs_operations(id,actor,checkout_id,state,prepared,record) VALUES(?1,?2,?3,?4,?5,?6)",params![op.record.plan_id,op.actor,op.record.checkout_id,op.record.state,serde_json::to_string(&op.prepared)?,serde_json::to_string(&op.record)?])?;
+        conn.execute(
+            "INSERT INTO vcs_operations(id,actor,state,prepared,record) VALUES(?1,?2,?3,?4,?5)",
+            params![
+                op.record.plan_id,
+                op.actor,
+                op.record.state,
+                serde_json::to_string(&op.prepared)?,
+                serde_json::to_string(&op.record)?
+            ],
+        )?;
         Ok(())
     }
     pub fn vcs_operation(&self, id: &str) -> Result<StoredVcsOperation> {
         let conn = self.lock()?;
-        let (actor, prepared, record): (String, String, String) = conn
-            .query_row(
+        decode_operation(
+            conn.query_row(
                 "SELECT actor,prepared,record FROM vcs_operations WHERE id=?1",
                 [id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                operation_row,
             )
             .optional()?
-            .ok_or(Error::NotFound)?;
-        Ok(StoredVcsOperation {
-            actor,
-            prepared: serde_json::from_str(&prepared)?,
-            record: serde_json::from_str(&record)?,
-        })
+            .ok_or(Error::NotFound)?,
+        )
     }
     pub fn claim_vcs_operation(&self, id: &str, actor: &str, now: u64) -> Result<bool> {
         let mut conn = self.lock()?;
@@ -500,40 +524,16 @@ impl Store {
         self.lock()?.execute("UPDATE vcs_operations SET state=?2,record=?3,prepared=CASE WHEN ?2='unknown' THEN prepared ELSE 'null' END WHERE id=?1 AND (state='running' OR state='completed' AND ?2='completed')",params![record.plan_id,record.state,serde_json::to_string(record)?])?;
         Ok(())
     }
-    pub fn running_vcs_operations(&self) -> Result<Vec<StoredVcsOperation>> {
+    fn vcs_operations(&self, query: &str) -> Result<Vec<StoredVcsOperation>> {
         let conn = self.lock()?;
         let rows = conn
-            .prepare("SELECT actor,prepared,record FROM vcs_operations WHERE state='running'")?
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            })?
+            .prepare(query)?
+            .query_map([], operation_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        rows.into_iter()
-            .map(|(actor, p, r)| {
-                Ok(StoredVcsOperation {
-                    actor,
-                    prepared: serde_json::from_str(&p)?,
-                    record: serde_json::from_str(&r)?,
-                })
-            })
-            .collect()
+        rows.into_iter().map(decode_operation).collect()
     }
     pub fn reserved_vcs_operations(&self) -> Result<Vec<StoredVcsOperation>> {
-        let conn = self.lock()?;
-        let rows=conn.prepare("SELECT actor,prepared,record FROM vcs_operations WHERE state IN ('running','unknown') AND released=0")?.query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>()?;
-        rows.into_iter()
-            .map(|(actor, p, r)| {
-                Ok(StoredVcsOperation {
-                    actor,
-                    prepared: serde_json::from_str(&p)?,
-                    record: serde_json::from_str(&r)?,
-                })
-            })
-            .collect()
+        self.vcs_operations("SELECT actor,prepared,record FROM vcs_operations WHERE state IN ('running','unknown') AND released=0")
     }
     pub fn release_vcs_operation(&self, id: &str) -> Result<VcsOperation> {
         let mut conn = self.lock()?;
@@ -559,7 +559,9 @@ impl Store {
         Ok(record)
     }
     pub fn recover_vcs_operations(&self) -> Result<()> {
-        for mut op in self.running_vcs_operations()? {
+        for mut op in self.vcs_operations(
+            "SELECT actor,prepared,record FROM vcs_operations WHERE state='running'",
+        )? {
             op.record.state = "unknown".into();
             op.record.error = Some(tower_protocol::RpcError::application(
                 "execution_unknown",
@@ -623,6 +625,93 @@ mod tests {
         }
     }
     #[test]
+    fn version_eleven_migration_preserves_links_and_operation_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+        let conn = Connection::open(&path).unwrap();
+        for sql in &MIGRATIONS[..11] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 11).unwrap();
+        let legacy = Store {
+            conn: Mutex::new(conn),
+        };
+        legacy.initialize("host", "node").unwrap();
+        let mut checkout = checkout();
+        checkout.record.repository_id = None;
+        legacy.save_checkout(checkout).unwrap();
+        let record: AgentRecord = serde_json::from_value(serde_json::json!({
+            "id":"session", "node":"node", "harness":"fixture", "ownership":"registered", "trust":"weak",
+            "cwd":"~/work/repo", "status":"idle", "caps":tower_protocol::Capabilities::unavailable("fixture"),
+            "attach_count":0, "sources":[], "registered_at":1, "updated_at":1, "last_seen":1, "revision":0, "sync_state":"synced"
+        })).unwrap();
+        legacy.register(record, &[0; 32], "session").unwrap();
+        legacy
+            .link_session_checkout("session", "checkout_one")
+            .unwrap();
+        legacy
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO session_checkouts VALUES('session','checkout_one')",
+                [],
+            )
+            .unwrap();
+        let op = StoredVcsOperation {
+            actor: "human".into(),
+            prepared: serde_json::json!({"native":"plan"}),
+            record: VcsOperation {
+                plan_id: "plan".into(),
+                checkout_id: Some("checkout_one".into()),
+                operation: "push".into(),
+                state: "prepared".into(),
+                created_at: 1,
+                expires_at: 999,
+                review: Value::Null,
+                released: false,
+                result: None,
+                error: None,
+            },
+        };
+        legacy.save_vcs_plan(&op).unwrap();
+        legacy
+            .lock()
+            .unwrap()
+            .execute("UPDATE vcs_operations SET checkout_id='checkout_one'", [])
+            .unwrap();
+        legacy.claim_vcs_operation("plan", "human", 2).unwrap();
+        let before = legacy.agent("session").unwrap().record;
+        drop(legacy);
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.agent("session").unwrap().record, before);
+        assert_eq!(
+            store
+                .vcs_operation("plan")
+                .unwrap()
+                .record
+                .checkout_id
+                .as_deref(),
+            Some("checkout_one")
+        );
+        assert!(!store.claim_vcs_operation("plan", "human", 3).unwrap());
+        store.recover_vcs_operations().unwrap();
+        assert_eq!(store.vcs_operation("plan").unwrap().record.state, "unknown");
+        assert_eq!(store.reserved_vcs_operations().unwrap().len(), 1);
+        assert!(matches!(
+            store.link_session_checkout("session", "missing"),
+            Err(Error::NotFound)
+        ));
+        assert_eq!(store.agent("session").unwrap().record, before);
+        store.forget_checkout("checkout_one").unwrap();
+        let cleared = store.agent("session").unwrap().record;
+        assert!(cleared.checkout_id.is_none());
+        assert!(cleared.revision > before.revision);
+        drop(store);
+        let store = Store::open(&path).unwrap();
+        assert!(store.agent("session").unwrap().record.checkout_id.is_none());
+        assert_eq!(store.vcs_operation("plan").unwrap().record.state, "unknown");
+    }
+    #[test]
     fn catalog_updates_are_atomic_and_pairing_change_preserves_local_checkout_identity() {
         let s = Store::open(Path::new(":memory:")).unwrap();
         s.catalog_pairing("pairing-a").unwrap();
@@ -680,16 +769,21 @@ mod tests {
         s.catalog_pairing("pairing").unwrap();
         s.apply_catalog(&catalog()).unwrap();
         let a = s.save_checkout(checkout()).unwrap();
-        let cursor = s.checkout_cursor().unwrap();
+        let (cursor, records) = s.checkout_snapshot(None).unwrap().unwrap();
+        assert_eq!(records, vec![a.clone()]);
+        assert!(s.checkout_snapshot(Some(cursor)).unwrap().is_none());
         let mut next = s.checkout(&a.id).unwrap();
         next.record.observed_at = 20;
         assert_eq!(s.save_checkout(next).unwrap().id, a.id);
-        assert_eq!(s.checkout_cursor().unwrap(), cursor);
+        assert_eq!(s.checkout_snapshot(None).unwrap().unwrap().0, cursor);
         let mut moved = s.checkout(&a.id).unwrap();
         moved.record.path = "~/work/moved".into();
         let moved = s.save_checkout(moved).unwrap();
         assert_eq!(moved.id, a.id);
         assert!(moved.revision > a.revision);
+        let (changed, records) = s.checkout_snapshot(Some(cursor)).unwrap().unwrap();
+        assert!(changed > cursor);
+        assert_eq!(records, vec![moved]);
     }
     #[test]
     fn observations_cannot_replace_bindings_or_restore_deleted_catalog_links() {

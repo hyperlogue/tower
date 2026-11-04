@@ -488,7 +488,7 @@ impl Service {
             }
             Err(e) => return Err(storage(e)),
         }
-        self.link_checkout(&session.id, &b.cwd)?;
+        self.vcs.link_session(&session.id)?;
         Ok(())
     }
 }

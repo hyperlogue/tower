@@ -1,6 +1,6 @@
 use super::*;
+use crate::vcs::Vcs;
 use std::path::{Path, PathBuf};
-use tower_vcs::Prepared;
 
 impl Service {
     pub(crate) fn vcs_authorize(
@@ -14,28 +14,27 @@ impl Service {
             "checkout.list" | "checkout.get" | "vcs.status" | "vcs.operation" | "catalog.get"
         );
         require(&actor, if read { "read" } else { "admin" })?;
-        if matches!(r.method.as_str(), "vcs.prepare" | "vcs.execute") {
-            self.vcs_write_policy(&actor, None)?;
-        }
-        if r.method == "vcs.prepare" {
-            let p: VcsPrepare = params(&r.params)?;
-            let c = self.vcs.checkout(&p.checkout_id)?;
-            self.vcs_write_policy(&actor, Some(&c.record.path))?;
-        }
-        if r.method == "checkout.register" {
-            let p: CheckoutRegister = params(&r.params)?;
-            if p.create.is_some() {
-                let cwd = self
-                    .paths
-                    .display_cwd(&p.directory)
-                    .map_err(|_| invalid("Invalid directory"))?;
-                self.vcs_write_policy(&actor, Some(&cwd))?;
+        match r.method.as_str() {
+            "vcs.prepare" => {
+                let p: VcsPrepare = params(&r.params)?;
+                let checkout = self.vcs.checkout(&p.checkout_id)?;
+                self.vcs_write_policy(&actor, None)?;
+                self.vcs_write_policy(&actor, Some(&checkout.record.path))?;
+                let binding = Vcs::binding(&checkout)?;
+                self.vcs_repository_available(&binding.repository_key(), None)?;
             }
-        }
-        if r.method == "vcs.prepare" {
-            let p: VcsPrepare = params(&r.params)?;
-            let binding = crate::vcs::Vcs::binding(&self.vcs.checkout(&p.checkout_id)?)?;
-            self.vcs_repository_available(&binding.repository_key(), None)?;
+            "vcs.execute" => self.vcs_write_policy(&actor, None)?,
+            "checkout.register" => {
+                let p: CheckoutRegister = params(&r.params)?;
+                if p.create.is_some() {
+                    let cwd = self
+                        .paths
+                        .display_cwd(&p.directory)
+                        .map_err(|_| invalid("Invalid directory"))?;
+                    self.vcs_write_policy(&actor, Some(&cwd))?;
+                }
+            }
+            _ => {}
         }
         Ok(actor.id())
     }
@@ -77,8 +76,7 @@ impl Service {
             if except == Some(op.record.plan_id.as_str()) {
                 continue;
             }
-            let prepared: Prepared = serde_json::from_value(op.prepared)
-                .map_err(|_| app("internal_error", "Invalid stored VCS plan"))?;
+            let prepared = Vcs::prepared(&op)?;
             if prepared.repository_key() == key {
                 return Err(app(
                     "vcs_busy",
@@ -116,12 +114,11 @@ impl Service {
                 .map_err(|_| invalid("Invalid checkout directory"))?;
             self.vcs_write_policy(&actor, Some(&cwd))?;
         }
-        let prepared: Prepared = serde_json::from_value(op.prepared)
-            .map_err(|_| app("internal_error", "Invalid stored VCS plan"))?;
+        let prepared = Vcs::prepared(&op)?;
         if prepared.operation_kind() != operation {
             return Err(app("stale_plan", "VCS operation changed"));
         }
-        self.vcs_unused(&crate::vcs::Vcs::active_paths(&prepared))
+        self.vcs_unused(&Vcs::active_paths(&prepared))
     }
     pub(crate) fn vcs_unused(&self, paths: &[PathBuf]) -> std::result::Result<(), RpcError> {
         let paths = paths
@@ -132,6 +129,15 @@ impl Service {
             .store
             .checkouts(&CheckoutFilter::default())
             .map_err(storage)?;
+        let directories = checkouts
+            .iter()
+            .filter_map(|c| {
+                Vcs::binding(c)
+                    .ok()?
+                    .directory
+                    .map(|p| (c.record.id.as_str(), p))
+            })
+            .collect::<BTreeMap<_, _>>();
         for a in self
             .store
             .agents(&AgentFilter {
@@ -148,12 +154,7 @@ impl Service {
                 .absolute_cwd(&a.cwd)
                 .map_err(|_| invalid("Invalid session directory"))?;
             let cwd = cwd.canonicalize().unwrap_or(cwd);
-            let linked = a
-                .checkout_id
-                .as_ref()
-                .and_then(|id| checkouts.iter().find(|c| &c.record.id == id))
-                .and_then(|c| crate::vcs::Vcs::binding(c).ok())
-                .and_then(|b| b.directory);
+            let linked = a.checkout_id.as_deref().and_then(|id| directories.get(id));
             if paths.iter().any(|path| {
                 cwd.starts_with(path) || linked.as_ref().is_some_and(|p| p.starts_with(path))
             }) {
@@ -184,8 +185,7 @@ impl Service {
         if op.record.state != "prepared" {
             return Ok((op, false));
         }
-        let prepared: Prepared = serde_json::from_value(op.prepared.clone())
-            .map_err(|_| app("internal_error", "Invalid stored VCS plan"))?;
+        let prepared = Vcs::prepared(&op)?;
         for path in prepared.affected_paths() {
             let cwd = self
                 .paths
@@ -193,7 +193,7 @@ impl Service {
                 .map_err(|_| invalid("Invalid checkout directory"))?;
             self.vcs_write_policy(&actor, Some(&cwd))?;
         }
-        self.vcs_unused(&crate::vcs::Vcs::active_paths(&prepared))?;
+        self.vcs_unused(&Vcs::active_paths(&prepared))?;
         self.vcs_repository_available(&prepared.repository_key(), Some(id))?;
         let claimed = self
             .store
@@ -204,9 +204,8 @@ impl Service {
     pub(crate) fn vcs_directory_available(&self, path: &Path) -> std::result::Result<(), RpcError> {
         let path = path.canonicalize().unwrap_or_else(|_| path.to_owned());
         for op in self.store.reserved_vcs_operations().map_err(storage)? {
-            let prepared: Prepared = serde_json::from_value(op.prepared)
-                .map_err(|_| app("internal_error", "Invalid stored VCS plan"))?;
-            if crate::vcs::Vcs::active_paths(&prepared)
+            let prepared = Vcs::prepared(&op)?;
+            if Vcs::active_paths(&prepared)
                 .iter()
                 .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
                 .any(|p| path.starts_with(&p) || p.starts_with(&path))
@@ -228,7 +227,7 @@ impl Service {
             if !c.record.available {
                 return Err(app("checkout_unavailable", "Checkout is not available"));
             }
-            let binding = crate::vcs::Vcs::binding(&c)?;
+            let binding = Vcs::binding(&c)?;
             tower_vcs::validate_binding(&binding).map_err(crate::vcs::native)?;
             let root = binding
                 .directory
@@ -262,7 +261,7 @@ impl Service {
     ) -> std::result::Result<(), RpcError> {
         if let Some(id) = &record.checkout_id {
             let checkout = self.vcs.checkout(id)?;
-            let binding = crate::vcs::Vcs::binding(&checkout)?;
+            let binding = Vcs::binding(&checkout)?;
             tower_vcs::validate_binding(&binding).map_err(crate::vcs::native)?;
         }
         Ok(())
@@ -279,49 +278,10 @@ impl Service {
                 "Only unavailable checkouts can be forgotten; remove the worktree first",
             ));
         }
-        let binding = crate::vcs::Vcs::binding(&c)?;
+        let binding = Vcs::binding(&c)?;
         self.vcs_repository_available(&binding.repository_key(), None)?;
         self.vcs_unused(&binding.directory.into_iter().collect::<Vec<_>>())?;
         self.store.forget_checkout(id).map_err(storage)
-    }
-    pub(crate) fn link_checkout(
-        &self,
-        session: &str,
-        cwd: &str,
-    ) -> std::result::Result<(), RpcError> {
-        let Ok(cwd) = self.paths.absolute_cwd(cwd).and_then(|p| p.canonicalize()) else {
-            return Ok(());
-        };
-        if self
-            .store
-            .session_checkout(session)
-            .map_err(storage)?
-            .is_some()
-        {
-            return Ok(());
-        }
-        let mut candidates = self
-            .store
-            .checkouts(&CheckoutFilter::default())
-            .map_err(storage)?
-            .into_iter()
-            .filter_map(|c| {
-                let b = crate::vcs::Vcs::binding(&c).ok()?;
-                let path = b.directory.as_ref()?;
-                if !c.record.available || !cwd.starts_with(path) {
-                    return None;
-                }
-                tower_vcs::validate_binding(&b).ok()?;
-                Some((path.components().count(), c.record.id))
-            })
-            .collect::<Vec<_>>();
-        candidates.sort();
-        if let Some((_, id)) = candidates.pop() {
-            self.store
-                .link_session_checkout(session, &id)
-                .map_err(storage)?;
-        }
-        Ok(())
     }
     pub(crate) fn sync_catalog_pairing(
         &self,
@@ -374,18 +334,11 @@ impl Service {
     pub(crate) fn sync_checkouts(
         &self,
         epoch: u64,
-    ) -> std::result::Result<(u64, Vec<Checkout>), RpcError> {
+        since: Option<u64>,
+    ) -> std::result::Result<Option<(u64, Vec<Checkout>)>, RpcError> {
         let actor = self.remote_actor(epoch)?;
         require(&actor, "read")?;
-        Ok((
-            self.store.checkout_cursor().map_err(storage)?,
-            self.store
-                .checkouts(&CheckoutFilter::default())
-                .map_err(storage)?
-                .into_iter()
-                .map(|c| c.record)
-                .collect(),
-        ))
+        self.store.checkout_snapshot(since).map_err(storage)
     }
     pub(crate) fn catalog_view(&self) -> std::result::Result<Value, RpcError> {
         value(

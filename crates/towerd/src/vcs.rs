@@ -1,4 +1,4 @@
-use crate::service::Service;
+use crate::service::{Service, now_ms};
 use serde::Deserialize;
 use serde_json::json;
 use std::{
@@ -30,13 +30,6 @@ pub(crate) fn decode<T: serde::de::DeserializeOwned>(v: &Value) -> Result<T> {
     serde_json::from_value(serde_json::to_value(v).map_err(failure)?)
         .map_err(|_| RpcError::application("invalid_params", "Invalid checkout parameters"))
 }
-fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .min(u64::MAX as u128) as u64
-}
 fn id(prefix: &str) -> Result<String> {
     let mut b = [0; 16];
     getrandom::fill(&mut b).map_err(failure)?;
@@ -45,17 +38,37 @@ fn id(prefix: &str) -> Result<String> {
         b.iter().map(|b| format!("{b:02x}")).collect::<String>()
     ))
 }
+fn operation(kind: &str, options: Value) -> Result<tower_vcs::Operation> {
+    let mut options = match serde_json::to_value(options).map_err(failure)? {
+        serde_json::Value::Null => json!({}),
+        serde_json::Value::Object(v) => v.into(),
+        _ => {
+            return Err(RpcError::application(
+                "invalid_params",
+                "VCS options must be an object",
+            ));
+        }
+    };
+    options["kind"] = kind.replace('.', "_").into();
+    serde_json::from_value(options)
+        .map_err(|_| RpcError::application("unsupported", "Unsupported VCS operation or options"))
+}
 #[derive(Clone, Default, Deserialize)]
 #[serde(default)]
 pub(crate) struct Config {
     pub worktree_root: Option<String>,
+}
+struct Refresh {
+    last_run: Instant,
+    session_offset: usize,
+    checkout_offset: usize,
 }
 pub(crate) struct Vcs {
     pub store: Arc<Store>,
     pub paths: tower_pal::Paths,
     pub root: PathBuf,
     pub gate: Arc<tokio::sync::Semaphore>,
-    refresh: tokio::sync::Mutex<(Instant, usize, usize)>,
+    refresh: tokio::sync::Mutex<Refresh>,
 }
 impl Vcs {
     pub fn new(
@@ -72,11 +85,19 @@ impl Vcs {
             paths,
             root,
             gate: Arc::new(tokio::sync::Semaphore::new(4)),
-            refresh: tokio::sync::Mutex::new((Instant::now() - Duration::from_secs(30), 0, 0)),
+            refresh: tokio::sync::Mutex::new(Refresh {
+                last_run: Instant::now() - Duration::from_secs(30),
+                session_offset: 0,
+                checkout_offset: 0,
+            }),
         })
     }
     pub fn binding(c: &StoredCheckout) -> Result<Binding> {
         serde_json::from_value(c.binding.clone()).map_err(failure)
+    }
+    pub fn prepared(op: &StoredVcsOperation) -> Result<Prepared> {
+        Prepared::deserialize(&op.prepared)
+            .map_err(|_| RpcError::application("internal_error", "Invalid stored VCS plan"))
     }
     pub fn checkout(&self, id: &str) -> Result<StoredCheckout> {
         self.store.checkout(id).map_err(|e| match e {
@@ -208,7 +229,7 @@ impl Vcs {
             tracking_ref: snapshot.tracking_ref,
             ahead: snapshot.ahead,
             behind: snapshot.behind,
-            observed_at: now(),
+            observed_at: now_ms(),
             revision: old.as_ref().map_or(0, |c| c.record.revision),
         };
         self.store
@@ -228,18 +249,41 @@ impl Vcs {
     ) -> Result<Vec<Checkout>> {
         let directory = self.paths.absolute_cwd(directory).map_err(failure)?;
         let discovery = tower_vcs::discover(&directory).await.map_err(native)?;
+        self.observe_worktrees(discovery.worktrees, repository)
+            .await
+    }
+    pub async fn register_request(&self, p: CheckoutRegister, actor: String) -> Result<Value> {
+        let directory = self.paths.absolute_cwd(&p.directory).map_err(failure)?;
+        let discovery = tower_vcs::discover(&directory).await.map_err(native)?;
+        let rows = self
+            .observe_worktrees(discovery.worktrees, p.repository_id.as_deref())
+            .await?;
+        let plan = if let Some(options) = p.create {
+            let operation = operation("checkout.create", options).map_err(|_| {
+                RpcError::application("invalid_params", "Invalid worktree creation options")
+            })?;
+            Some(
+                self.prepare_binding(&discovery.source, operation, actor, None, p.repository_id)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        encode(json!({"checkouts": rows, "plan": plan}))
+    }
+    async fn observe_worktrees(
+        &self,
+        worktrees: Vec<Binding>,
+        repository: Option<&str>,
+    ) -> Result<Vec<Checkout>> {
         let mut results = Vec::new();
-        for binding in discovery.worktrees {
+        for binding in worktrees {
             match self.observe(binding, repository).await {
                 Ok(record) => results.push(record),
                 Err(e) if e.data.code == "checkout_unavailable" => {}
                 Err(e) => return Err(e),
             }
         }
-        self.link_sessions()?;
-        Ok(results)
-    }
-    fn link_sessions(&self) -> Result<()> {
         let checkouts = self
             .store
             .checkouts(&CheckoutFilter::default())
@@ -249,33 +293,51 @@ impl Vcs {
             .agents(&AgentFilter::default())
             .map_err(failure)?
         {
-            if session.checkout_id.is_some() {
-                continue;
-            }
-            let Ok(cwd) = self
-                .paths
-                .absolute_cwd(&session.cwd)
-                .and_then(|p| p.canonicalize())
-            else {
-                continue;
-            };
-            let best = checkouts
-                .iter()
-                .filter(|c| c.record.available)
-                .filter_map(|c| {
-                    Self::binding(c)
-                        .ok()
-                        .and_then(|b| b.directory.map(|p| (p, c)))
-                })
-                .filter(|(p, _)| cwd.starts_with(p))
-                .max_by_key(|(p, _)| p.components().count());
-            if let Some((_, c)) = best
-                && session.checkout_id.as_deref() != Some(&c.record.id)
-            {
-                self.store
-                    .link_session_checkout(&session.id, &c.record.id)
-                    .map_err(failure)?;
-            }
+            self.link_from(&session, &checkouts)?;
+        }
+        Ok(results)
+    }
+    pub fn link_session(&self, session: &str) -> Result<()> {
+        let session = self.store.agent(session).map_err(failure)?.record;
+        if session.checkout_id.is_none() {
+            self.link_from(
+                &session,
+                &self
+                    .store
+                    .checkouts(&CheckoutFilter::default())
+                    .map_err(failure)?,
+            )?;
+        }
+        Ok(())
+    }
+    fn link_from(&self, session: &AgentRecord, checkouts: &[StoredCheckout]) -> Result<()> {
+        if session.checkout_id.is_some() {
+            return Ok(());
+        }
+        let Ok(cwd) = self
+            .paths
+            .absolute_cwd(&session.cwd)
+            .and_then(|p| p.canonicalize())
+        else {
+            return Ok(());
+        };
+        let best = checkouts
+            .iter()
+            .filter(|c| c.record.available)
+            .filter_map(|c| {
+                let binding = Self::binding(c).ok()?;
+                let path = binding.directory.as_ref()?;
+                if !cwd.starts_with(path) {
+                    return None;
+                }
+                tower_vcs::validate_binding(&binding).ok()?;
+                Some((path.components().count(), &c.record.id))
+            })
+            .max();
+        if let Some((_, id)) = best {
+            self.store
+                .link_session_checkout(&session.id, id)
+                .map_err(failure)?;
         }
         Ok(())
     }
@@ -288,19 +350,16 @@ impl Vcs {
                 if matches!(
                     e.data.code.as_str(),
                     "missing"
-                        | "not_found"
                         | "stale_checkout"
                         | "not_a_checkout"
                         | "identity_changed"
-                        | "io"
-                        | "path_missing"
                         | "path_unavailable"
                         | "not_repository"
                         | "not_directory"
                 ) =>
             {
                 c.record.available = false;
-                c.record.observed_at = now();
+                c.record.observed_at = now_ms();
                 self.store.save_checkout(c).map_err(failure)
             }
             Err(e) => Err(e),
@@ -310,10 +369,10 @@ impl Vcs {
         let Ok(mut last) = self.refresh.try_lock() else {
             return;
         };
-        if last.0.elapsed() < Duration::from_secs(10) {
+        if last.last_run.elapsed() < Duration::from_secs(10) {
             return;
         }
-        last.0 = Instant::now();
+        last.last_run = Instant::now();
         let Ok(_permit) = self.gate.clone().try_acquire_owned() else {
             return;
         };
@@ -322,9 +381,9 @@ impl Vcs {
             ..Default::default()
         }) {
             if !sessions.is_empty() {
-                let offset = last.1 % sessions.len();
+                let offset = last.session_offset % sessions.len();
                 sessions.rotate_left(offset);
-                last.1 = (offset + 4) % sessions.len();
+                last.session_offset = (offset + 4) % sessions.len();
             }
             let mut seen = std::collections::BTreeSet::new();
             for session in sessions.into_iter().take(4) {
@@ -343,9 +402,9 @@ impl Vcs {
         if checkouts.is_empty() {
             return;
         }
-        let offset = last.2 % checkouts.len();
+        let offset = last.checkout_offset % checkouts.len();
         checkouts.rotate_left(offset);
-        last.2 = (offset + 16) % checkouts.len();
+        last.checkout_offset = (offset + 16) % checkouts.len();
         let mut groups = std::collections::BTreeSet::new();
         for c in checkouts.into_iter().take(16) {
             if let Ok(binding) = Self::binding(&c)
@@ -371,20 +430,7 @@ impl Vcs {
     pub async fn prepare(&self, p: VcsPrepare, actor: String) -> Result<VcsOperation> {
         let c = self.checkout(&p.checkout_id)?;
         let b = Self::binding(&c)?;
-        let mut options = match serde_json::to_value(p.options).map_err(failure)? {
-            serde_json::Value::Null => json!({}),
-            serde_json::Value::Object(v) => v.into(),
-            _ => {
-                return Err(RpcError::application(
-                    "invalid_params",
-                    "VCS options must be an object",
-                ));
-            }
-        };
-        options["kind"] = p.operation.replace('.', "_").into();
-        let operation: tower_vcs::Operation = serde_json::from_value(options).map_err(|_| {
-            RpcError::application("unsupported", "Unsupported VCS operation or options")
-        })?;
+        let operation = operation(&p.operation, p.options)?;
         self.prepare_binding(
             &b,
             operation,
@@ -394,7 +440,7 @@ impl Vcs {
         )
         .await
     }
-    pub async fn prepare_binding(
+    async fn prepare_binding(
         &self,
         b: &Binding,
         operation: tower_vcs::Operation,
@@ -414,8 +460,8 @@ impl Vcs {
             checkout_id,
             operation: prepared.operation_kind().into(),
             state: "prepared".into(),
-            created_at: now(),
-            expires_at: now() + 600_000,
+            created_at: now_ms(),
+            expires_at: now_ms() + 600_000,
             review: encode(review)?,
             released: false,
             result: None,
@@ -438,7 +484,7 @@ impl Vcs {
         mut op: StoredVcsOperation,
         _permit: tokio::sync::OwnedSemaphorePermit,
     ) {
-        let prepared = serde_json::from_value::<Prepared>(op.prepared.clone()).map_err(failure);
+        let prepared = Self::prepared(&op);
         let result = match prepared {
             Ok(prepared) => {
                 let check = service.clone();

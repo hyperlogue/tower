@@ -1,4 +1,4 @@
-mod checkouts;
+mod catalog;
 pub(crate) mod enrollment;
 mod execution;
 mod status;
@@ -337,33 +337,14 @@ async fn connection(
         .all(|c| {
             hello.capabilities.iter().any(|v| v == c) && ack.capabilities.iter().any(|v| v == c)
         });
-    let catalog_enabled = hello
-        .capabilities
-        .iter()
-        .any(|c| c == "repository-catalog.v1")
-        && ack
-            .capabilities
-            .iter()
-            .any(|c| c == "repository-catalog.v1");
-    let catalog_delta_enabled = catalog_enabled
-        && ack
-            .capabilities
-            .iter()
-            .any(|c| c == "repository-catalog-delta.v1");
-    let checkout_enabled = catalog_enabled
-        && hello.capabilities.iter().any(|c| c == "checkout-sync.v1")
-        && ack.capabilities.iter().any(|c| c == "checkout-sync.v1");
-    if catalog_enabled {
+    let mut catalog = catalog::Sync::new(&hello.capabilities, &ack.capabilities);
+    if catalog.enabled() {
         let url = config.url.clone();
         worker
             .execute(move |s| s.sync_catalog_pairing(&url, &catalog_node, epoch))
             .await??;
     }
-    publisher.include_checkouts(checkout_enabled);
-    let mut catalog_ready = false;
-    let mut checkout_publisher = checkouts::Publisher::default();
-    let mut checkout_cursor = None;
-    let mut checkout_pending: Option<tokio::time::Instant> = None;
+    publisher.include_checkouts(catalog.checkouts_enabled());
     let mut execution = execution::Publisher::default();
     let mut pending_since: Option<tokio::time::Instant> = None;
     let mut replies = tokio::task::JoinSet::new();
@@ -386,15 +367,8 @@ async fn connection(
                     }
                     previous_cursor=Some(cursor);
                 }
-                if checkout_enabled && catalog_ready {
-                    if checkout_pending.is_some_and(|at|at.elapsed()>=Duration::from_secs(30)){return Err(Error::Other("Checkout acknowledgement timed out".into()));}
-                    if !checkout_publisher.waiting() {
-                        let (cursor,records)=worker.execute(move|s|s.sync_checkouts(epoch)).await??;
-                        if checkout_cursor!=Some(cursor) {
-                            if let Some(frame)=checkout_publisher.prepare(records)? {write(&mut socket,&frame).await?;checkout_pending=Some(tokio::time::Instant::now());}
-                            checkout_cursor=Some(cursor);
-                        }
-                    }
+                if let Some(frame) = catalog.prepare(&worker, epoch).await? {
+                    write(&mut socket, &frame).await?;
                 }
                 if managed_enabled {for frame in execution.prepare(&worker,epoch).await? {write(&mut socket,&frame).await?;}}
             }
@@ -419,18 +393,25 @@ async fn connection(
                         request.context=Default::default();
                         let p=serde_json::to_value(&request.params)?;
                         match request.method.as_str(){
-                            "catalog.push"|"catalog.delta"=>{
-                                worker.execute(move|s|s.sync_catalog_pending(epoch)).await??;
-                                let result=if !catalog_enabled || request.method=="catalog.delta" && (!catalog_delta_enabled || !catalog_ready) {Err(tower_protocol::RpcError::application("unsupported","Repository catalog was not negotiated"))}
-                                else if request.method=="catalog.delta" {match serde_json::from_value::<tower_protocol::CatalogDelta>(p) {Ok(c)=>worker.execute(move|s|s.sync_catalog_delta(c,epoch)).await?,Err(_)=>Err(tower_protocol::RpcError::application("invalid_params","Invalid catalog delta"))}}
-                                else {match serde_json::from_value::<tower_protocol::RepositoryCatalog>(p) {Ok(c)=>worker.execute(move|s|s.sync_catalog(c,epoch)).await?,Err(_)=>Err(tower_protocol::RpcError::application("invalid_params","Invalid catalog snapshot"))}};
-                                let failed=result.is_err();catalog_ready = !failed;reply(&mut socket,request.id,result.and_then(|revision|public(json!({"revision":revision})).map_err(|_|tower_protocol::RpcError::application("internal_error","Cannot encode catalog reply")))).await?;
-                                if failed && catalog_enabled {write(&mut socket,&json!({"jsonrpc":"2.0","method":"catalog.resync","params":{}})).await?;}continue;
+                            "catalog.push" | "catalog.delta" => {
+                                let result = catalog.apply(&request.method, p, &worker, epoch).await?;
+                                let failed = result.is_err();
+                                let result = result.and_then(|revision| public(json!({"revision": revision})).map_err(|_| tower_protocol::RpcError::application("internal_error", "Cannot encode catalog reply")));
+                                reply(&mut socket, request.id, result).await?;
+                                if failed && catalog.enabled() {
+                                    write(&mut socket, &json!({"jsonrpc":"2.0","method":"catalog.resync","params":{}})).await?;
+                                }
+                                continue;
                             }
-                            "checkout.ack" if checkout_enabled=>{
-                                if let Some(cursor)=p["cursor"].as_u64() && checkout_publisher.acknowledge(cursor){checkout_pending=None;}continue;
+                            "checkout.ack" if catalog.checkouts_enabled() => {
+                                if let Some(cursor) = p["cursor"].as_u64() { catalog.acknowledge(cursor); }
+                                continue;
                             }
-                            "checkout.resync" if checkout_enabled=>{checkout_publisher.resync();checkout_pending=None;checkout_cursor=None;reply(&mut socket,request.id,Ok(public(json!({"scheduled":true}))?)).await?;continue;}
+                            "checkout.resync" if catalog.checkouts_enabled() => {
+                                catalog.resync();
+                                reply(&mut socket, request.id, Ok(public(json!({"scheduled":true}))?)).await?;
+                                continue;
+                            }
                             "policy.push"|"policy.delta"=>{
                                 worker.execute(move|s|s.sync_policy_pending(epoch)).await??;
                                 let result=if request.method=="policy.delta" {

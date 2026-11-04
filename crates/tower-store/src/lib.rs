@@ -75,6 +75,7 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE policy_snapshot ADD COLUMN delta_hash BLOB;",
     "ALTER TABLE agents ADD COLUMN observed_status TEXT; ALTER TABLE agents ADD COLUMN stop_requested INTEGER NOT NULL DEFAULT 0; UPDATE agents SET observed_status=json_extract(public_json,'$.status');",
     include_str!("vcs.sql"),
+    "DROP TABLE session_checkouts; ALTER TABLE vcs_operations DROP COLUMN checkout_id;",
 ];
 
 fn observe_status(tx: &Transaction<'_>, record: &mut AgentRecord, status: &str) -> Result<()> {

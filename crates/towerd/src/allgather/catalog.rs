@@ -1,10 +1,126 @@
 use super::{Error, Result, encode};
+use crate::worker::ServiceWorker;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::time::Duration;
 use tower_protocol::Checkout;
+use tower_protocol::{CatalogDelta, RepositoryCatalog, RpcError};
+
+pub(super) struct Sync {
+    enabled: bool,
+    deltas: bool,
+    checkouts: bool,
+    ready: bool,
+    publisher: Publisher,
+    cursor: Option<u64>,
+    pending_since: Option<tokio::time::Instant>,
+}
+impl Sync {
+    pub fn new(local: &[String], remote: &[String]) -> Self {
+        let supports =
+            |name: &str| local.iter().any(|c| c == name) && remote.iter().any(|c| c == name);
+        let enabled = supports("repository-catalog.v1");
+        Self {
+            enabled,
+            deltas: enabled && supports("repository-catalog-delta.v1"),
+            checkouts: enabled && supports("checkout-sync.v1"),
+            ready: false,
+            publisher: Publisher::default(),
+            cursor: None,
+            pending_since: None,
+        }
+    }
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+    pub fn checkouts_enabled(&self) -> bool {
+        self.checkouts
+    }
+    pub async fn apply(
+        &mut self,
+        method: &str,
+        params: Value,
+        worker: &ServiceWorker,
+        epoch: u64,
+    ) -> Result<std::result::Result<u64, RpcError>> {
+        worker
+            .execute(move |s| s.sync_catalog_pending(epoch))
+            .await??;
+        let result = if !self.enabled || method == "catalog.delta" && (!self.deltas || !self.ready)
+        {
+            Err(RpcError::application(
+                "unsupported",
+                "Repository catalog was not negotiated",
+            ))
+        } else if method == "catalog.delta" {
+            match serde_json::from_value::<CatalogDelta>(params) {
+                Ok(catalog) => {
+                    worker
+                        .execute(move |s| s.sync_catalog_delta(catalog, epoch))
+                        .await?
+                }
+                Err(_) => Err(RpcError::application(
+                    "invalid_params",
+                    "Invalid catalog delta",
+                )),
+            }
+        } else {
+            match serde_json::from_value::<RepositoryCatalog>(params) {
+                Ok(catalog) => {
+                    worker
+                        .execute(move |s| s.sync_catalog(catalog, epoch))
+                        .await?
+                }
+                Err(_) => Err(RpcError::application(
+                    "invalid_params",
+                    "Invalid catalog snapshot",
+                )),
+            }
+        };
+        self.ready = result.is_ok();
+        Ok(result)
+    }
+    pub async fn prepare(&mut self, worker: &ServiceWorker, epoch: u64) -> Result<Option<Value>> {
+        if !self.checkouts || !self.ready {
+            return Ok(None);
+        }
+        if self
+            .pending_since
+            .is_some_and(|at| at.elapsed() >= Duration::from_secs(30))
+        {
+            return Err(Error::Other("Checkout acknowledgement timed out".into()));
+        }
+        if self.publisher.waiting() {
+            return Ok(None);
+        }
+        let since = self.cursor;
+        let Some((cursor, records)) = worker
+            .execute(move |s| s.sync_checkouts(epoch, since))
+            .await??
+        else {
+            return Ok(None);
+        };
+        let frame = self.publisher.prepare(records)?;
+        self.cursor = Some(cursor);
+        if frame.is_some() {
+            self.pending_since = Some(tokio::time::Instant::now());
+        }
+        Ok(frame)
+    }
+    pub fn acknowledge(&mut self, cursor: u64) {
+        if self.publisher.acknowledge(cursor) {
+            self.pending_since = None;
+        }
+    }
+    pub fn resync(&mut self) {
+        self.publisher.resync();
+        self.pending_since = None;
+        self.cursor = None;
+    }
+}
 
 #[derive(Default)]
-pub(super) struct Publisher {
+struct Publisher {
     sequence: u64,
     acknowledged_sequence: u64,
     acknowledged: Option<BTreeMap<String, Checkout>>,
