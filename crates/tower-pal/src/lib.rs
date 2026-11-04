@@ -162,14 +162,28 @@ pub struct ProcessIdentity {
 }
 
 pub fn read_private(path: &Path) -> io::Result<Vec<u8>> {
+    read_private_bounded(path, 64 * 1024)
+}
+
+pub fn read_private_bounded(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
     use std::io::Read;
-    let mut file = private_file(path, false)?;
-    let mut bytes = Vec::new();
-    file.by_ref().take(65537).read_to_end(&mut bytes)?;
-    if bytes.len() > 65536 {
+    let read_limit = u64::try_from(limit)
+        .ok()
+        .and_then(|limit| limit.checked_add(1))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid private file limit"))?;
+    let file = private_file(path, false)?;
+    if file.metadata()?.len() >= read_limit {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "private metadata file is too large",
+            "private file is too large",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(read_limit).read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "private file is too large",
         ));
     }
     Ok(bytes)

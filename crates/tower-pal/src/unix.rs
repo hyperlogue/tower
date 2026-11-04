@@ -76,7 +76,12 @@ pub fn private_file(path: &Path, create: bool) -> io::Result<File> {
         .create(create)
         .truncate(false)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.uid() != uid() {
+        return Err(denied("invalid private file owner or type"));
+    }
     file.set_permissions(fs::Permissions::from_mode(0o600))?;
     Ok(file)
 }
@@ -602,6 +607,39 @@ mod tests {
         assert!(private_socket(&alias).is_err());
         assert!(prepare_socket_path(&alias).await.is_err());
         assert_eq!(fs::read(path).unwrap(), b"ordinary file");
+    }
+    #[test]
+    fn private_reads_apply_explicit_limits_and_reject_nonregular_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        private_dir(temp.path()).unwrap();
+        let path = temp.path().join("image");
+        let bytes = vec![42; 64 * 1024 + 1];
+        write_private(&path, &bytes).unwrap();
+        assert_eq!(
+            super::super::read_private(&path).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            super::super::read_private_bounded(&path, bytes.len()).unwrap(),
+            bytes
+        );
+        assert_eq!(
+            super::super::read_private_bounded(&path, bytes.len() - 1)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        assert!(super::super::read_private_bounded(&alias, bytes.len()).is_err());
+        assert!(super::super::read_private_bounded(temp.path(), bytes.len()).is_err());
+        let fifo = temp.path().join("fifo");
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        assert!(super::super::read_private_bounded(&fifo, bytes.len()).is_err());
     }
     #[test]
     fn rejects_symlinks_and_identifies_current_process() {

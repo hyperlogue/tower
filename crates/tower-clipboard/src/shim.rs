@@ -112,6 +112,21 @@ pub async fn consumed(image: &ClipboardImage) -> Result<()> {
     )
     .await
 }
+fn staged_bytes(image: &ClipboardImage) -> Result<Vec<u8>> {
+    if image.bytes > tower_protocol::MAX_CLIPBOARD_BYTES as u64 {
+        return Err(internal("invalid staged image size"));
+    }
+    let data = tower_pal::read_private_bounded(
+        Path::new(&image.path),
+        tower_protocol::MAX_CLIPBOARD_BYTES,
+    )
+    .map_err(internal)?;
+    if data.len() as u64 != image.bytes {
+        return Err(internal("invalid staged image size"));
+    }
+    Ok(data)
+}
+
 pub async fn run(program: &str, args: Vec<String>) -> Result<i32> {
     let program = Path::new(program)
         .file_name()
@@ -161,12 +176,7 @@ pub async fn run(program: &str, args: Vec<String>) -> Result<i32> {
                 println!("{}", image.path);
             } else {
                 use tokio::io::AsyncWriteExt;
-                let data = tower_pal::read_private(Path::new(&image.path)).map_err(internal)?;
-                if data.len() != image.bytes as usize
-                    || data.len() > tower_protocol::MAX_CLIPBOARD_BYTES
-                {
-                    return Err(internal("invalid staged image"));
-                }
+                let data = staged_bytes(&image)?;
                 tokio::time::timeout(Duration::from_secs(30), async {
                     let mut out = tokio::io::stdout();
                     out.write_all(&data).await?;
@@ -179,5 +189,32 @@ pub async fn run(program: &str, args: Vec<String>) -> Result<i32> {
             consumed(&image).await?;
             Ok(0)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staged_image_cannot_exceed_clipboard_limit_or_declared_size() {
+        let root = tempfile::tempdir().unwrap();
+        tower_pal::private_dir(root.path()).unwrap();
+        let path = root.path().join("image.png");
+        let file = tower_pal::private_file(&path, true).unwrap();
+        file.set_len(tower_protocol::MAX_CLIPBOARD_BYTES as u64 + 1)
+            .unwrap();
+        let mut image = ClipboardImage {
+            paste_id: "test".into(),
+            path: path.to_string_lossy().into_owned(),
+            format: ImageFormat::Png,
+            bytes: tower_protocol::MAX_CLIPBOARD_BYTES as u64,
+        };
+        assert_eq!(staged_bytes(&image).unwrap_err().data.code, "clipboard_io");
+        image.bytes += 1;
+        assert_eq!(staged_bytes(&image).unwrap_err().data.code, "clipboard_io");
+        file.set_len(1).unwrap();
+        image.bytes = 2;
+        assert!(staged_bytes(&image).is_err());
     }
 }

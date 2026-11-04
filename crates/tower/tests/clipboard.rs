@@ -226,6 +226,9 @@ async fn output(stream: &mut tower_pal::IpcStream, needle: &str) -> String {
     .expect("terminal output timed out")
 }
 fn image(red: u8) -> Vec<u8> {
+    image_size(red, 1, 1)
+}
+fn image_size(red: u8, width: u32, height: u32) -> Vec<u8> {
     fn chunk(out: &mut Vec<u8>, kind: &[u8], bytes: &[u8]) {
         out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
         let start = out.len();
@@ -241,16 +244,31 @@ fn image(red: u8) -> Vec<u8> {
         out.extend_from_slice(&(!crc).to_be_bytes());
     }
     let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
-    chunk(&mut out, b"IHDR", &[0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0]);
-    let raw = [0, red, 0, 0];
+    let mut header = Vec::new();
+    header.extend_from_slice(&width.to_be_bytes());
+    header.extend_from_slice(&height.to_be_bytes());
+    header.extend([8, 2, 0, 0, 0]);
+    chunk(&mut out, b"IHDR", &header);
+    let mut row = vec![0];
+    for _ in 0..width {
+        row.extend([red, 0, 0]);
+    }
+    let raw = row.repeat(height as usize);
     let mut a = 1u32;
     let mut b = 0u32;
-    for x in raw {
-        a = (a + u32::from(x)) % 65521;
+    for x in &raw {
+        a = (a + u32::from(*x)) % 65521;
         b = (b + a) % 65521;
     }
-    let mut data = vec![0x78, 0x01, 0x01, 4, 0, 0xfb, 0xff];
-    data.extend(raw);
+    let mut data = vec![0x78, 0x01];
+    let mut blocks = raw.chunks(u16::MAX as usize).peekable();
+    while let Some(block) = blocks.next() {
+        data.push(u8::from(blocks.peek().is_none()));
+        let len = block.len() as u16;
+        data.extend_from_slice(&len.to_le_bytes());
+        data.extend_from_slice(&(!len).to_le_bytes());
+        data.extend_from_slice(block);
+    }
     data.extend_from_slice(&((b << 16) | a).to_be_bytes());
     chunk(&mut out, b"IDAT", &data);
     chunk(&mut out, b"IEND", &[]);
@@ -259,7 +277,8 @@ fn image(red: u8) -> Vec<u8> {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn clipboard_two_clients_paste_sources_shims_detach_and_restart() {
     let f = Fixture::new();
-    let a_image = image(32);
+    let a_image = image_size(32, 256, 128);
+    assert!(a_image.len() > 64 * 1024);
     let b_image = image(224);
     let codex = f.call(&["open", "codex", "--headless"])["id"]
         .as_str()
@@ -316,7 +335,11 @@ async fn clipboard_two_clients_paste_sources_shims_detach_and_restart() {
         .await
         .unwrap();
         assert_eq!(
-            tower_pal::read_private(std::path::Path::new(&img.path)).unwrap(),
+            tower_pal::read_private_bounded(
+                std::path::Path::new(&img.path),
+                tower_protocol::MAX_CLIPBOARD_BYTES
+            )
+            .unwrap(),
             b_image
         );
         wire::write(&mut cb, &Request::Detach).await.unwrap();
@@ -343,7 +366,11 @@ async fn clipboard_two_clients_paste_sources_shims_detach_and_restart() {
         .await
         .unwrap();
         assert_eq!(
-            tower_pal::read_private(std::path::Path::new(&img.path)).unwrap(),
+            tower_pal::read_private_bounded(
+                std::path::Path::new(&img.path),
+                tower_protocol::MAX_CLIPBOARD_BYTES
+            )
+            .unwrap(),
             a_image
         );
         f.call(&["kill", &id]);
