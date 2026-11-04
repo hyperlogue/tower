@@ -10,6 +10,7 @@ members = [
     "crates/tower-terminal",
     "crates/tower-runtime",
     "crates/tower-clipboard",
+    "crates/tower-vcs",
     "crates/tower-agents",
     "crates/towerd",
     "crates/tower",
@@ -46,6 +47,7 @@ tower-sessions = { path = "crates/tower-sessions" }
 tower-terminal = { path = "crates/tower-terminal" }
 tower-runtime = { path = "crates/tower-runtime" }
 tower-clipboard = { path = "crates/tower-clipboard" }
+tower-vcs = { path = "crates/tower-vcs" }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

@@ -48,7 +48,7 @@
               || pkgs.lib.hasPrefix "LICENSE" (baseNameOf path);
           };
           strictDeps = true;
-          nativeCheckInputs = [pkgs.nodejs];
+          nativeCheckInputs = [pkgs.nodejs pkgs.git];
           cargoExtraArgs = "--workspace --locked";
           nativeBuildInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [pkgs.rustPlatform.bindgenHook];
         };

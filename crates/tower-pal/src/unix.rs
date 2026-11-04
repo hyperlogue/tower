@@ -15,6 +15,16 @@ pub type IpcStream = UnixStream;
 pub fn uid() -> u32 {
     rustix::process::geteuid().as_raw()
 }
+pub fn file_identity(path: &Path) -> io::Result<(u64, u64)> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() && !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Expected a regular file or directory",
+        ));
+    }
+    Ok((metadata.dev(), metadata.ino()))
+}
 fn denied(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, message)
 }

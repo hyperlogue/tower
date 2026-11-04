@@ -2341,6 +2341,7 @@ dependencies = [
  "thiserror",
  "tower-protocol",
  "tower-sessions",
+ "url",
 ]
 
 [[package]]
@@ -2361,6 +2362,19 @@ dependencies = [
  "tower-pool-proto",
  "tower-protocol",
  "tower-sessions",
+]
+
+[[package]]
+name = "tower-vcs"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tower-pal",
+ "url",
 ]
 
 [[package]]
@@ -2386,6 +2400,7 @@ dependencies = [
  "tower-protocol",
  "tower-sessions",
  "tower-store",
+ "tower-vcs",
 ]
 
 [[package]]
