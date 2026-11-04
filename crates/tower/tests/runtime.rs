@@ -345,7 +345,7 @@ fn standalone_executable_preserves_owned_session_and_both_attach_streams_on_rest
     let f = Fixture::standalone();
     let bin = f.dir.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
-    let harness = bin.join("codex");
+    let harness = bin.join("claude");
     let shell = Command::new("sh")
         .args(["-c", "command -v sh"])
         .output()
@@ -369,14 +369,7 @@ fn standalone_executable_preserves_owned_session_and_both_attach_streams_on_rest
             .output()
             .unwrap(),
     );
-    let opened = f.run(&[
-        "open",
-        "codex",
-        "--mode",
-        "native",
-        "--cwd",
-        f.dir.path().to_str().unwrap(),
-    ]);
+    let opened = f.run(&["open", "claude", "--cwd", f.dir.path().to_str().unwrap()]);
     let id = opened["id"].as_str().unwrap();
     assert_eq!(f.run(&["get", id])["status"], "starting");
     let info = f.run(&["rpc", "session.attach_info", &json!({"id":id}).to_string()]);
@@ -511,18 +504,9 @@ async fn explicit_protocol_selection_does_not_fall_back_on_an_old_daemon() {
         );
     });
     failure(
-        f.command(&[
-            "--json",
-            "--no-start",
-            "open",
-            "codex",
-            "--protocol",
-            "acp",
-            "--mode",
-            "native",
-        ])
-        .output()
-        .unwrap(),
+        f.command(&["--json", "--no-start", "open", "codex", "--protocol", "acp"])
+            .output()
+            .unwrap(),
         "unsupported",
     );
     peer.await.unwrap();

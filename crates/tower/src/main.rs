@@ -28,6 +28,15 @@ enum Command {
         #[command(subcommand)]
         command: PoolCommand,
     },
+    #[command(name = "__codex", hide = true)]
+    CodexHost {
+        #[command(subcommand)]
+        command: PoolCommand,
+    },
+    #[command(name = "__session-mcp", hide = true)]
+    SessionMcp {
+        context: std::path::PathBuf,
+    },
     #[command(name = "__acp", hide = true)]
     Acp {
         harness: String,
@@ -49,8 +58,6 @@ enum Command {
     },
     Run {
         harness: String,
-        #[arg(long,value_parser=["native"])]
-        mode: Option<String>,
         #[arg(last = true)]
         args: Vec<String>,
     },
@@ -60,7 +67,7 @@ enum Command {
         protocol: Option<String>,
         #[arg(long)]
         cwd: Option<String>,
-        #[arg(long)]
+        #[arg(long, hide = true, value_parser = ["app-server"])]
         mode: Option<String>,
         #[arg(long)]
         headless: bool,
@@ -97,7 +104,7 @@ enum Command {
     },
     Restart {
         id: String,
-        #[arg(long)]
+        #[arg(long, hide = true, value_parser = ["app-server"])]
         mode: Option<String>,
         #[arg(last = true)]
         args: Option<Vec<String>>,
@@ -533,6 +540,33 @@ fn execute(cli: Cli) -> Result<()> {
         return Ok(());
     }
     let paths = Paths::discover()?;
+    if let Command::SessionMcp { context } = &cli.command {
+        let credentials: tower_agents::codex_environment::SessionMcpContext =
+            serde_json::from_slice(&tower_pal::read_private(context)?)?;
+        let mut paths = paths;
+        if !credentials.socket.is_absolute() {
+            return Err("Invalid session control socket".into());
+        }
+        paths.socket = credentials.socket.clone();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(mcp::serve(paths, credentials.caller_context(), true))?;
+        return Ok(());
+    }
+    if let Command::CodexHost { command } = &cli.command {
+        if matches!(command, PoolCommand::Run { detach: true }) {
+            tower_pal::detach_codex_host(&paths)?;
+        }
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        match command {
+            PoolCommand::Run { .. } => runtime.block_on(tower_agents::codex_host::run(paths))?,
+            PoolCommand::Stop => runtime.block_on(tower_agents::codex_host::stop(&paths))?,
+        }
+        return Ok(());
+    }
     if let Command::Acp { harness } = &cli.command {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -801,11 +835,7 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
                     .await?,
             )?,
         },
-        Command::Run {
-            harness,
-            mode,
-            args,
-        } => wrapper::run(paths, &mut client, harness, mode, args).await?,
+        Command::Run { harness, args } => wrapper::run(paths, &mut client, harness, args).await?,
         Command::Open {
             harness,
             protocol,
@@ -990,6 +1020,8 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
             print_json(&result)?;
         }
         Command::Agent { .. }
+        | Command::CodexHost { .. }
+        | Command::SessionMcp { .. }
         | Command::Acp { .. }
         | Command::Runtime { .. }
         | Command::Hook { .. }

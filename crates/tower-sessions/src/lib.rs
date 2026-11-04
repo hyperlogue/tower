@@ -43,6 +43,7 @@ pub struct Observation {
 
 #[derive(Clone, Debug, Default)]
 pub struct SessionMetadata {
+    pub shared_process: Option<bool>,
     pub native_session_id: Option<String>,
     pub display_name: Option<String>,
     pub cwd: Option<String>,

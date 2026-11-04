@@ -61,11 +61,14 @@ fn observation(v: &RuntimeView) -> Result<Observation> {
         pid_start_time: m["pid_start_time"].as_u64(),
         caps: capabilities(
             !v.fenced,
-            native.is_some() && (!v.fenced || v.termination == "confirmed"),
+            native.is_some()
+                && (!v.fenced || v.termination == "confirmed")
+                && (v.binding.protocol != "codex-app-server" || m["native_resumable"] == true),
         ),
         terminal: None,
         recovery_pending: false,
         metadata: SessionMetadata {
+            shared_process: Some(v.binding.protocol == "codex-app-server"),
             native_session_id: native,
             display_name: None,
             cwd: Some(v.binding.cwd.clone()),

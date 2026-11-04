@@ -539,6 +539,9 @@ impl Store {
         record.pool_session = o.terminal.as_ref().map(|t| t.pool_session.clone());
         record.attach_count = o.terminal.as_ref().map_or(0, |t| t.attach_count);
         record.caps = o.caps;
+        if let Some(shared) = o.metadata.shared_process {
+            record.shared_process = shared;
+        }
         observe_status(&tx, record, &o.status)?;
         let mut native_conflict = false;
         if let Some(native) = o.metadata.native_session_id {

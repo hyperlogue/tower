@@ -358,6 +358,39 @@ pub(crate) fn prepare(paths: &tower_pal::Paths) -> Result<()> {
         _ => Err(error("runtime_storage", "Invalid runtime owner credential")),
     }
 }
+async fn recover_shared_codex(paths: &tower_pal::Paths, metadata: &Value) -> bool {
+    let (Some(pid), Some(start)) = (
+        metadata["pid"].as_u64().and_then(|v| u32::try_from(v).ok()),
+        metadata["pid_start_time"].as_u64(),
+    ) else {
+        return false;
+    };
+    let Some(thread) = metadata["native_session_id"].as_str() else {
+        return false;
+    };
+    let Ok(namespace) = tower_agents::codex_host::namespace(paths) else {
+        return false;
+    };
+    if metadata["native_home"] != namespace {
+        return false;
+    }
+    let cleanup = async {
+        let config = tower_agents::codex_service::Config::load(paths)?;
+        let mut client = tower_agents::codex_service::Client::connect(&config.endpoint).await?;
+        if !client
+            .process()
+            .is_some_and(|current| current.pid == pid && current.start_time == start)
+        {
+            return Err(tower_agents::codex_service::Error::Unconfirmed);
+        }
+        client.stop_thread(thread, None).await?;
+        client.wait_unloaded(thread, Duration::from_secs(5)).await
+    };
+    matches!(
+        tokio::time::timeout(Duration::from_secs(25), cleanup).await,
+        Ok(Ok(()))
+    )
+}
 pub async fn run(paths: tower_pal::Paths) -> Result<()> {
     paths.prepare().map_err(internal)?;
     let _lock =
@@ -394,14 +427,35 @@ pub async fn run(paths: tower_pal::Paths) -> Result<()> {
     )?);
     let boot = tower_pal::boot_id().map_err(internal)?;
     let mut recovery = Vec::new();
+    let mut shared_recovery = tokio::task::JoinSet::new();
     for binding in journal.bindings(None)? {
         let (_, fenced, termination) = journal.state(&binding)?;
         if fenced && termination == "confirmed" {
+            engine::cleanup_environment(&paths, &binding);
             continue;
         }
         let m = journal.metadata(&binding)?;
         if m["boot_id"].as_str().is_some_and(|old| old != boot) {
             journal.fence(&binding, "owner_restarted", "confirmed")?;
+            engine::cleanup_environment(&paths, &binding);
+            continue;
+        }
+        if binding.protocol == "codex-app-server" || m["shared_process"] == true {
+            journal.fence(&binding, "owner_restarted", "unknown")?;
+            if binding.protocol == "codex-app-server" {
+                if shared_recovery.len() >= 4
+                    && let Some(Ok((previous, confirmed))) = shared_recovery.join_next().await
+                    && confirmed
+                {
+                    journal.fence(&previous, "owner_restarted", "confirmed")?;
+                    engine::cleanup_environment(&paths, &previous);
+                }
+                let paths = paths.clone();
+                shared_recovery.spawn(async move {
+                    let confirmed = recover_shared_codex(&paths, &m).await;
+                    (binding, confirmed)
+                });
+            }
             continue;
         }
         if let (Some(pid), Some(start)) = (
@@ -438,6 +492,12 @@ pub async fn run(paths: tower_pal::Paths) -> Result<()> {
                 "unknown"
             },
         )?;
+    }
+    while let Some(result) = shared_recovery.join_next().await {
+        if let Ok((binding, true)) = result {
+            journal.fence(&binding, "owner_restarted", "confirmed")?;
+            engine::cleanup_environment(&paths, &binding);
+        }
     }
     journal.compact()?;
     let listener = tower_pal::IpcListener::bind(&paths.run.join("runtime.sock"))

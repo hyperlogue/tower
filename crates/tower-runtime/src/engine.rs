@@ -129,6 +129,10 @@ pub(crate) async fn run(
                 "denied"
                     | "authority_unavailable"
                     | "native_unavailable"
+                    | "app_server_unavailable"
+                    | "app_server_changed"
+                    | "native_configuration"
+                    | "thread_loaded"
                     | "environment_unavailable"
                     | "runtime_cancelled"
                     | "command_expired"
@@ -144,12 +148,45 @@ pub(crate) async fn run(
         );
     }
     let _ = handle.requests.retire_all();
+    if journal
+        .state(&binding)
+        .is_ok_and(|(_, fenced, termination)| fenced && termination == "confirmed")
+    {
+        cleanup_environment(&paths, &binding);
+    }
 }
 
+fn environment_path(paths: &tower_pal::Paths, binding: &Binding) -> Result<std::path::PathBuf> {
+    use sha2::Digest;
+    let name = sha2::Sha256::digest(
+        serde_json::to_vec(&(
+            binding.namespace(),
+            &binding.runtime_id,
+            &binding.generation,
+        ))
+        .map_err(internal)?,
+    )
+    .iter()
+    .map(|value| format!("{value:02x}"))
+    .collect::<String>();
+    Ok(paths.state.join("runtime/environments").join(name))
+}
+pub(crate) fn cleanup_environment(paths: &tower_pal::Paths, binding: &Binding) {
+    if binding.protocol == "codex-app-server"
+        && let Ok(path) = environment_path(paths, binding)
+    {
+        let _ = tower_pal::remove_private_tree(&path);
+    }
+}
+
+type NativeInput = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
+type NativeOutput = Box<dyn tokio::io::AsyncRead + Unpin + Send>;
 struct Process {
-    child: tokio::process::Child,
+    child: Option<tokio::process::Child>,
     identity: tower_pal::ProcessIdentity,
     reader: tokio::task::JoinHandle<()>,
+    connection: Option<tokio::task::JoinHandle<()>>,
+    codex: Option<tower_agents::codex_service::Config>,
 }
 async fn group_terminated(identity: tower_pal::ProcessIdentity) -> bool {
     for _ in 0..40 {
@@ -162,7 +199,12 @@ async fn group_terminated(identity: tower_pal::ProcessIdentity) -> bool {
 }
 impl Drop for Process {
     fn drop(&mut self) {
-        let _ = tower_pal::kill_protocol_group(self.identity);
+        if self.child.is_some() {
+            let _ = tower_pal::kill_protocol_group(self.identity);
+        }
+        if let Some(connection) = &self.connection {
+            connection.abort();
+        }
         self.reader.abort();
     }
 }
@@ -183,8 +225,10 @@ struct State<'a> {
     resume_native: Option<String>,
     acp: String,
     metadata: Value,
+    native_config: Value,
     active: Option<String>,
     stop_command: Option<String>,
+    stop_reason: Option<String>,
     streamed: std::collections::HashSet<String>,
     turn: Option<String>,
     pending: BTreeMap<String, (String, ResponseKind)>,
@@ -353,7 +397,7 @@ impl State<'_> {
     }
     async fn rpc(
         &mut self,
-        input: &mut tokio::process::ChildStdin,
+        input: &mut NativeInput,
         method: &str,
         params: Value,
         command: &str,
@@ -425,8 +469,15 @@ async fn run_inner(
         )
     })?;
     let mut env = env;
-    let native_home = tower_agents::Harness::parse(&b.harness)
-        .and_then(|h| tower_agents::inventory::namespace(h, &env));
+    let native_home = if b.protocol == "codex-app-server" {
+        Some(
+            tower_agents::codex_host::namespace(paths)
+                .map_err(|_| error("invalid_config", "Invalid host Codex configuration"))?,
+        )
+    } else {
+        tower_agents::Harness::parse(&b.harness)
+            .and_then(|h| tower_agents::inventory::namespace(h, &env))
+    };
     let resume_native = if b.resume_session_id.is_some() {
         let previous = journal
             .bindings(Some(&b.namespace()))?
@@ -489,6 +540,11 @@ async fn run_inner(
         "TOWER_AGENT_TOKEN".into(),
         String::from_utf8(token).map_err(internal)?,
     );
+    let prepared_codex = if b.protocol == "codex-app-server" {
+        Some(prepare_codex(paths, b, &env).await?)
+    } else {
+        None
+    };
     authorize(paths, b, &launch).await?;
     if control.try_recv().is_ok() {
         return Err(error(
@@ -499,34 +555,51 @@ async fn run_inner(
     if !journal.begin_dispatch(b, &launch.command_id)? {
         return Err(error("runtime_lost", "Launch dispatch is already fenced"));
     }
-    let argv = if b.protocol == "codex-app-server" {
-        vec!["codex".into(), "app-server".into(),"--stdio".into(),"-c".into(),format!("mcp_servers.tower.command={}",serde_json::to_string(&tower_pal::executable().map_err(internal)?.to_string_lossy()).map_err(internal)?),"-c".into(),"mcp_servers.tower.args=[\"mcp\"]".into(),"-c".into(),"mcp_servers.tower.env_vars=[\"TOWER_AGENT_ID\",\"TOWER_AGENT_TOKEN\",\"TOWER_SOCKET\"]".into()]
+    let NativeSetup {
+        mut input,
+        output: stdout,
+        child,
+        identity,
+        connection,
+        codex,
+        config: native_config,
+    } = if let Some(prepared) = prepared_codex {
+        prepared
     } else {
-        vec![
+        let argv = vec![
             tower_pal::executable()
                 .map_err(internal)?
                 .to_string_lossy()
                 .into_owned(),
             "__acp".into(),
             b.harness.clone(),
-        ]
+        ];
+        let mut child = tower_pal::spawn_protocol(&argv, &env, std::path::Path::new(&b.cwd))
+            .map_err(|_| error("native_unavailable", "Cannot start native agent"))?;
+        let identity = tower_pal::process_identity(
+            child
+                .id()
+                .ok_or_else(|| error("native_unavailable", "Missing native process"))?,
+        )
+        .map_err(internal)?;
+        let input = child
+            .stdin
+            .take()
+            .ok_or_else(|| error("native_protocol", "Missing native stdin"))?;
+        let output = child
+            .stdout
+            .take()
+            .ok_or_else(|| error("native_protocol", "Missing native stdout"))?;
+        NativeSetup {
+            input: Box::new(input),
+            output: Box::new(output),
+            child: Some(child),
+            identity,
+            connection: None,
+            codex: None,
+            config: Value::Null,
+        }
     };
-    let mut child = tower_pal::spawn_protocol(&argv, &env, std::path::Path::new(&b.cwd))
-        .map_err(|_| error("native_unavailable", "Cannot start native agent"))?;
-    let identity = tower_pal::process_identity(
-        child
-            .id()
-            .ok_or_else(|| error("native_unavailable", "Missing native process"))?,
-    )
-    .map_err(internal)?;
-    let mut input = child
-        .stdin
-        .take()
-        .ok_or_else(|| error("native_protocol", "Missing native stdin"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| error("native_protocol", "Missing native stdout"))?;
     let (tx, mut incoming) = mpsc::channel(32);
     let reader = tokio::spawn(async move {
         let mut r = BufReader::new(stdout);
@@ -549,6 +622,8 @@ async fn run_inner(
         child,
         identity,
         reader,
+        connection,
+        codex,
     };
     let mut s = State {
         journal,
@@ -557,9 +632,11 @@ async fn run_inner(
         native: String::new(),
         resume_native,
         acp: String::new(),
-        metadata: json!({"pid":identity.pid,"pid_start_time":identity.start_time,"boot_id":tower_pal::boot_id().map_err(internal)?,"native_home":native_home}),
+        metadata: json!({"pid":identity.pid,"pid_start_time":identity.start_time,"shared_process":b.protocol=="codex-app-server","boot_id":tower_pal::boot_id().map_err(internal)?,"native_home":native_home}),
+        native_config,
         active: None,
         stop_command: None,
+        stop_reason: None,
         streamed: Default::default(),
         turn: None,
         pending: BTreeMap::new(),
@@ -586,62 +663,63 @@ async fn run_inner(
     .await?;
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let started = tokio::time::Instant::now();
-    let result:Result<()>=async {loop {
-        tokio::select! {biased;
-            command=control.recv()=>{
-                match command {
-                    Some(Control::Stop(reason)) => {
-                        s.handle.requests.retire_all()?;
-                        let _ = tower_pal::kill_protocol_group(identity);
-                        process.child.wait().await.map_err(internal)?;
-                        let terminated = group_terminated(identity).await;
-                        journal.fence(b, &reason, if terminated { "confirmed" } else { "unknown" })?;
-                        return Ok(());
+    let result: Result<()> = async {
+        loop {
+            tokio::select! {biased;
+                command=control.recv()=>{
+                    match command {
+                        Some(Control::Stop(reason)) => {
+                            s.handle.requests.retire_all()?;
+                            s.stop_reason = Some(reason);
+                            return Ok(());
+                        }
+                        Some(Control::Command(c)) => dispatch(paths, &mut s, &mut input, c).await?,
+                        None => return Err(error("runtime_lost", "Runtime control channel closed")),
                     }
-                    Some(Control::Command(c)) => dispatch(paths, &mut s, &mut input, c).await?,
-                    None => return Err(error("runtime_lost", "Runtime control channel closed")),
                 }
-            }
-            message=incoming.recv()=>{
-                let Some(message) = message else {
-                    return Err(error("native_exited", "Native output closed"));
-                };
-                native(&mut s, &mut input, message?).await?;
-            }
-            command=normal.recv(),if s.queue.len()<16=>{
-                if let Some(c) = command {
-                    s.queue.push_back(c);
-                } else {
-                    return Err(error("runtime_lost", "Runtime command channel closed"));
+                message=incoming.recv()=>{
+                    let Some(message) = message else {
+                        return Err(error("native_exited", "Native output closed"));
+                    };
+                    native(&mut s, &mut input, message?).await?;
                 }
-            }
-            _=tick.tick()=>{
-                s.handle.requests.check_reply_timeout()?;
-                if s.text
-                    .as_ref()
-                    .is_some_and(|b| b.since.elapsed() >= Duration::from_millis(50))
-                {
-                    s.flush_text()?;
+                command=normal.recv(),if s.queue.len()<16=>{
+                    if let Some(c) = command {
+                        s.queue.push_back(c);
+                    } else {
+                        return Err(error("runtime_lost", "Runtime command channel closed"));
+                    }
                 }
-                if !s.ready() && started.elapsed() > Duration::from_secs(60) {
-                    return Err(error("native_timeout", "Native initialization timed out"));
-                }
-                if s.ready()
-                    && s.active.is_none()
-                    && let Some(c) = s.queue.pop_front()
-                {
-                    dispatch(paths, &mut s, &mut input, c).await?;
+                _=tick.tick()=>{
+                    s.handle.requests.check_reply_timeout()?;
+                    if s.text
+                        .as_ref()
+                        .is_some_and(|b| b.since.elapsed() >= Duration::from_millis(50))
+                    {
+                        s.flush_text()?;
+                    }
+                    if !s.ready() && started.elapsed() > Duration::from_secs(60) {
+                        return Err(error("native_timeout", "Native initialization timed out"));
+                    }
+                    if s.ready()
+                        && s.active.is_none()
+                        && let Some(c) = s.queue.pop_front()
+                    {
+                        dispatch(paths, &mut s, &mut input, c).await?;
+                    }
                 }
             }
         }
-    }}.await;
+    }
+    .await;
     s.handle.requests.retire_all()?;
-    let _ = input.shutdown().await;
-    let _ = tower_pal::kill_protocol_group(identity);
-    let reaped = tokio::time::timeout(Duration::from_secs(5), process.child.wait())
-        .await
-        .is_ok_and(|r| r.is_ok());
-    let terminated = reaped && group_terminated(identity).await;
+    let terminated = stop_process(&mut process, &mut s, &mut input, &mut incoming).await;
+    if let Some(reason) = s.stop_reason.take() {
+        if terminated && s.active.is_some() {
+            s.end_turn("cancelled")?;
+        }
+        journal.fence(b, &reason, if terminated { "confirmed" } else { "unknown" })?;
+    }
     if let Err(e) = result {
         if let Some(command) = s.stop_command.take() {
             if terminated {
@@ -664,10 +742,193 @@ async fn run_inner(
     Ok(())
 }
 
+struct NativeSetup {
+    input: NativeInput,
+    output: NativeOutput,
+    child: Option<tokio::process::Child>,
+    identity: tower_pal::ProcessIdentity,
+    connection: Option<tokio::task::JoinHandle<()>>,
+    codex: Option<tower_agents::codex_service::Config>,
+    config: Value,
+}
+async fn prepare_codex(
+    paths: &tower_pal::Paths,
+    b: &Binding,
+    env: &tower_pal::Environment,
+) -> Result<NativeSetup> {
+    let host = tower_agents::codex_host::ensure(paths).await.map_err(|_| {
+        error(
+            "app_server_unavailable",
+            "Host Codex app-server is unavailable",
+        )
+    })?;
+    let mut maintenance = tower_agents::codex_service::Client::connect(&host.config.endpoint)
+        .await
+        .map_err(|_| {
+            error(
+                "app_server_unavailable",
+                "Cannot inspect host Codex app-server",
+            )
+        })?;
+    if maintenance.process() != host.process {
+        return Err(error(
+            "app_server_changed",
+            "Codex app-server changed during launch",
+        ));
+    }
+    if let Some(native) = &b.resume_session_id {
+        maintenance
+            .wait_unloaded(native, Duration::from_secs(5))
+            .await
+            .map_err(|_| {
+                error(
+                    "thread_loaded",
+                    "Codex thread is still loaded; close its previous clients before resume",
+                )
+            })?;
+    }
+    let base = maintenance
+        .request("config/read", json!({"cwd":b.cwd,"includeLayers":false}))
+        .await
+        .map_err(|_| error("native_configuration", "Cannot read Codex execution policy"))?;
+    let root = environment_path(paths, b)?;
+    let mut config = json!({"thread_unload_delay_secs":0});
+    tower_agents::codex_environment::prepare(
+        &root,
+        &tower_pal::executable().map_err(internal)?,
+        env,
+        &base["config"],
+        &mut config,
+        &host.shell,
+    )
+    .map_err(|_| {
+        error(
+            "environment_unavailable",
+            "Cannot prepare private Codex session environment",
+        )
+    })?;
+    let (stream, connection, identity) = tower_agents::codex_host::channel(&host.config)
+        .await
+        .map_err(|_| error("app_server_unavailable", "Cannot connect Codex owner"))?;
+    if identity != host.process {
+        connection.abort();
+        return Err(error(
+            "app_server_changed",
+            "Codex app-server changed during launch",
+        ));
+    }
+    let Some(identity) = identity else {
+        connection.abort();
+        return Err(error(
+            "app_server_unavailable",
+            "Cannot verify Codex server process identity",
+        ));
+    };
+    let (output, input) = tokio::io::split(stream);
+    Ok(NativeSetup {
+        input: Box::new(input),
+        output: Box::new(output),
+        child: None,
+        identity,
+        connection: Some(connection),
+        codex: Some(host.config),
+        config,
+    })
+}
+
+async fn stop_process(
+    process: &mut Process,
+    s: &mut State<'_>,
+    input: &mut NativeInput,
+    incoming: &mut mpsc::Receiver<Result<Value>>,
+) -> bool {
+    if let Some(child) = &mut process.child {
+        let _ = input.shutdown().await;
+        let _ = tower_pal::kill_protocol_group(process.identity);
+        let reaped = tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .is_ok_and(|v| v.is_ok());
+        return reaped && group_terminated(process.identity).await;
+    }
+    let Some(config) = &process.codex else {
+        return false;
+    };
+    if s.native.is_empty()
+        && s.pending
+            .values()
+            .any(|(_, kind)| *kind == ResponseKind::Session)
+    {
+        let settled = tokio::time::timeout(Duration::from_secs(5), async {
+            while s.native.is_empty()
+                && s.pending
+                    .values()
+                    .any(|(_, kind)| *kind == ResponseKind::Session)
+            {
+                let v = incoming
+                    .recv()
+                    .await
+                    .ok_or_else(|| error("native_protocol", "Native setup response lost"))??;
+                if v.get("method").is_none() {
+                    native(s, input, v).await?;
+                }
+            }
+            Ok::<_, tower_protocol::RpcError>(())
+        })
+        .await;
+        if !matches!(settled, Ok(Ok(()))) {
+            return false;
+        }
+    }
+    if s.native.is_empty() {
+        if let Some(task) = process.connection.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        return true;
+    }
+    let thread = s.native.clone();
+    let turn = s.turn.clone();
+    let endpoint = config.endpoint.clone();
+    let identity = process.identity;
+    let cleanup = async {
+        let mut client = tower_agents::codex_service::Client::connect(&endpoint).await?;
+        if client.process() != Some(identity) {
+            return Err(tower_agents::codex_service::Error::Unconfirmed);
+        }
+        client.stop_thread(&thread, turn.as_deref()).await?;
+        Ok::<_, tower_agents::codex_service::Error>(client)
+    };
+    tokio::pin!(cleanup);
+    let mut live = true;
+    let cleaned = loop {
+        tokio::select! {
+            result=&mut cleanup=>break result,
+            message=incoming.recv(),if live=>match message {
+                Some(Ok(v))=>{
+                    if v.get("method").is_some() && v.get("id").is_some() {continue;}
+                    let _=native(s,input,v).await;
+                }
+                _=>live=false,
+            }
+        }
+    };
+    if let Some(task) = process.connection.take() {
+        task.abort();
+        let _ = task.await;
+    }
+    let _ = input.shutdown().await;
+    match cleaned {
+        Ok(mut client) => client
+            .wait_unloaded(&thread, Duration::from_secs(5))
+            .await
+            .is_ok(),
+        Err(_) => false,
+    }
+}
 async fn dispatch(
     paths: &tower_pal::Paths,
     s: &mut State<'_>,
-    input: &mut tokio::process::ChildStdin,
+    input: &mut NativeInput,
     c: ExecutionCommand,
 ) -> Result<()> {
     let checked = async {
@@ -853,7 +1114,7 @@ async fn dispatch(
     }
     Ok(())
 }
-async fn native(s: &mut State<'_>, input: &mut tokio::process::ChildStdin, v: Value) -> Result<()> {
+async fn native(s: &mut State<'_>, input: &mut NativeInput, v: Value) -> Result<()> {
     let codex = s.binding.protocol == "codex-app-server";
     if let Some(method) = v["method"].as_str() {
         let p = &v["params"];
@@ -884,6 +1145,9 @@ async fn native(s: &mut State<'_>, input: &mut tokio::process::ChildStdin, v: Va
                     | "mcpServer/elicitation/request"
                     | "elicitation/create"
             );
+            if codex && target != Some(s.native.as_str()) {
+                return Ok(());
+            }
             if !owned || s.active.is_none() || !supported {
                 wire::json_line(input,&json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"This runtime cannot answer this request"}})).await?;
                 return Ok(());
@@ -970,13 +1234,19 @@ async fn native(s: &mut State<'_>, input: &mut tokio::process::ChildStdin, v: Va
             return Ok(());
         }
         if codex {
-            if p.get("threadId")
-                .and_then(Value::as_str)
-                .is_some_and(|id| id != s.native)
-            {
+            if p.get("threadId").and_then(Value::as_str) != Some(s.native.as_str()) {
                 return Ok(());
             }
             match method {
+                "thread/closed" => {
+                    return Err(error("native_thread_closed", "Native thread was unloaded"));
+                }
+                "thread/status/changed"
+                    if p.pointer("/status/type").and_then(Value::as_str) == Some("systemError") =>
+                {
+                    s.metadata["error"] = json!("native_system_error");
+                    s.state("unknown")?;
+                }
                 "turn/started" => {
                     if s.active.is_some() {
                         s.turn = p
@@ -1139,7 +1409,7 @@ async fn native(s: &mut State<'_>, input: &mut tokio::process::ChildStdin, v: Va
         ResponseKind::Initialize => {
             if codex {
                 wire::json_line(input, &json!({"jsonrpc":"2.0","method":"initialized"})).await?;
-                let mut params = json!({"cwd":s.binding.cwd});
+                let mut params = json!({"cwd":s.binding.cwd,"config":s.native_config});
                 let method = if let Some(id) = &s.binding.resume_session_id {
                     params["threadId"] = json!(id);
                     "thread/resume"
@@ -1174,6 +1444,10 @@ async fn native(s: &mut State<'_>, input: &mut tokio::process::ChildStdin, v: Va
                     s.metadata["model"] = result["model"].clone();
                     s.metadata["effort"] = result["reasoningEffort"].clone();
                 }
+                s.metadata["native_resumable"] = json!(
+                    s.binding.resume_session_id.is_some()
+                        && result.pointer("/thread/ephemeral") != Some(&Value::Bool(true))
+                );
                 s.native = result
                     .pointer("/thread/id")
                     .and_then(Value::as_str)
@@ -1211,6 +1485,9 @@ async fn native(s: &mut State<'_>, input: &mut tokio::process::ChildStdin, v: Va
             s.done(&command, None, None)?;
         }
         ResponseKind::PromptStart => {
+            s.metadata["native_resumable"] = json!(true);
+            s.journal
+                .update_metadata(s.binding, "working", &s.metadata)?;
             s.turn = result
                 .pointer("/turn/id")
                 .and_then(Value::as_str)
@@ -1256,8 +1533,10 @@ mod tests {
             resume_native: None,
             acp: String::new(),
             metadata: json!({}),
+            native_config: Value::Null,
             active: Some("prompt".into()),
             stop_command: None,
+            stop_reason: None,
             streamed: Default::default(),
             turn: Some("turn".into()),
             pending: Default::default(),

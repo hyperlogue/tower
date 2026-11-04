@@ -5,7 +5,7 @@ shared terminal attachment, a local registry, scoped tokens, and live status eve
 The pool and terminal parser are implemented in Rust, without libshpool or libghostty.
 
 Managed launchers support Claude Code, Codex, Reasonix, Kimi Code, Grok Build,
-opencode, Pi, Antigravity, and omp. Codex supports native and app-server modes.
+opencode, Pi, Antigravity, and omp. Codex uses one host app-server shared by its sessions.
 The public interface is Tower's JSON-RPC API; Miao clients need a Tower adapter.
 Native Claude/Codex messages, approvals, process discovery, MCP, loopback HTTP/SSE,
 and Allgather status/policy synchronization are available. Allgather supports browser enrollment, incremental state and policy synchronization,
@@ -97,7 +97,7 @@ processes from the same executable. Install the desired agent CLIs on `PATH`:
 ```sh
 ./target/debug/tower agents supported
 ./target/debug/tower open claude --cwd "$PWD"
-./target/debug/tower open codex --mode app-server --cwd "$PWD"
+./target/debug/tower open codex --cwd "$PWD"
 ./target/debug/tower attach SESSION_ID
 ./target/debug/tower snapshot SESSION_ID --json
 ./target/debug/tower restart SESSION_ID
@@ -181,26 +181,33 @@ Reports continue while the daemon is stopped. Status stays `unknown` until the
 harness supplies evidence. Hook reports retain operational metadata, not prompt text.
 Projects with an `.envrc` require direnv approval before their agents start.
 
-Codex defaults to `app-server`. Each managed session has its own app-server process,
-with a local relay to its TUI. The server inherits that session's approved project
-environment. Stopping one session cannot stop another session's server. Native mode
-uses `--no-daemon`. To change modes while preserving the conversation, use
-`tower restart SESSION_ID --mode native` or `--mode app-server`.
+Codex requires version 0.166.0 or later and uses a shared host app-server for
+terminal and structured sessions. Tower starts this service when first needed.
+Each session has a separate native thread and private execution environment.
+The service survives daemon, terminal, and runtime-owner restarts. Stopping a
+session interrupts its turn, stops its background terminals, and waits for its
+thread to unload. If termination cannot be confirmed, Tower reports uncertainty
+and preserves the service and other sessions.
+
+To use an existing host service, set its Unix endpoint once in Tower configuration.
+Tower connects to this endpoint and leaves its process lifecycle to its owner.
+The endpoint cannot be overridden by session options or project configuration.
 
 ```toml
 [codex]
-default_mode = "app-server"
-[[codex.override]]
-cwd_prefix = "~/work/project"
-mode = "native"
+endpoint = "unix:///path/to/private/codex.sock"
 
 [history]
 owned_retention_days = 30
 ```
 
 Put these settings in `~/.config/tower/config.toml` (or `$XDG_CONFIG_HOME/tower/config.toml`).
-The longest matching directory prefix selects a Codex override. An explicit
-`--mode` takes precedence.
+Omit `codex.endpoint` to use the Tower-managed service. The service requires a
+Bash or Zsh execution shell. Approved project environment values and Tower MCP
+credentials are stored in private per-session files; they are not placed in
+native configuration values or applied to the shared server environment.
+Per-launch model and permission options remain available through `open -- …`.
+Codex native mode and directory-specific mode overrides are not supported.
 
 Restart and resume keep the Tower ID. They require a native conversation ID.
 Recovery after pool or host loss resumes previously active conversations; it
@@ -329,7 +336,7 @@ The scanner skips managed-process ownership markers. Scan-only records cannot
 receive messages until registration establishes a delivery channel. Installed
 hooks report external Claude/Codex state. Codex requires native hook trust review.
 `tower run` uses the current terminal and registers the process without starting a
-pool. The wrapper uses Codex native mode; use `open` for managed app-server mode.
+pool. Codex requires `tower open codex`, which uses the shared app-server.
 
 `tower mcp` serves the seven agent tools over stdio. Managed Claude/Codex sessions
 receive its configuration automatically. External installations can be removed
@@ -506,9 +513,9 @@ rust-toolchain.toml, and the workspace rust-version aligned. CI checks that the
 Fenix and rustup pins agree.
 
 Optional integration tests run the installed Codex CLI against a local Responses
-fixture. They use isolated home directories and no API credentials. They test native and
-app-server modes, real TTY attach, Kitty reattachment, simultaneous clients, daemon
-restart, switching an app-server conversation to native mode, and native message
+fixture. They use isolated home directories and no API credentials. They test
+shared app-server operation, real TTY attach, Kitty reattachment, simultaneous clients,
+daemon restart, same-thread restart, and native message
 delivery. The external app-server test verifies that approval requests reach the
 existing TUI. The Claude inbox test checks that delivered text reaches the model:
 

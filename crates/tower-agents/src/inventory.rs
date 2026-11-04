@@ -39,10 +39,22 @@ impl Inventory {
         harness: Option<Harness>,
         refresh: bool,
     ) -> InventoryResult {
+        let selected: Vec<_> = Harness::ALL
+            .into_iter()
+            .filter(|candidate| harness.is_none_or(|h| h == *candidate))
+            .collect();
+        self.list_selected(env, &selected, refresh)
+    }
+    pub fn list_selected(
+        &mut self,
+        env: &Environment,
+        selected: &[Harness],
+        refresh: bool,
+    ) -> InventoryResult {
         let mut result = InventoryResult::default();
         let until = Instant::now() + Duration::from_secs(5);
         for h in Harness::ALL {
-            if harness.is_some_and(|selected| selected != h) {
+            if !selected.contains(&h) {
                 continue;
             }
             let key = format!("{}:{:?}:{:?}", h.id(), roots(h, env), namespace(h, env));

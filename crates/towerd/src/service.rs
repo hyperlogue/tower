@@ -406,6 +406,18 @@ impl Service {
                     strong: false,
                 });
             }
+            if tower_pal::process_name(current)
+                .is_ok_and(|name| matches!(name.as_str(), "codex" | "node" | "bun"))
+                && tower_pal::inspect_process(current).is_ok_and(|process| {
+                    process.argv.iter().take(2).any(|arg| {
+                        std::path::Path::new(arg)
+                            .file_name()
+                            .is_some_and(|name| name == "codex")
+                    }) && process.argv.iter().take(3).any(|arg| arg == "app-server")
+                })
+            {
+                return Ok(Actor::Unregistered);
+            }
             if p.parent <= 1 {
                 break;
             }
@@ -523,11 +535,10 @@ impl Service {
             .transpose()?;
         let shared_codex = p.harness == "codex"
             && (endpoint.as_ref().is_some_and(|e| e.app_server.is_some())
-                || (p.native_session_id.is_some()
-                    && identity.is_some_and(|i| {
-                        tower_pal::inspect_process(i.pid)
-                            .is_ok_and(|p| p.argv.iter().take(3).any(|s| s == "app-server"))
-                    })));
+                || identity.is_some_and(|i| {
+                    tower_pal::inspect_process(i.pid)
+                        .is_ok_and(|p| p.argv.iter().take(3).any(|s| s == "app-server"))
+                }));
         let host = self.store.host().map_err(storage)?;
         let id = format!(
             "{}-{}",

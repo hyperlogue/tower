@@ -26,7 +26,16 @@ impl Fixture {
             fixture::NATIVE.replacen("#!/usr/bin/env node", &format!("#!{}", node.display()), 1);
         for name in ["codex", "claude", "agy"] {
             let path = root.path().join("bin").join(name);
-            std::fs::write(&path, &script).unwrap();
+            let source = if name == "codex" {
+                include_str!("fixtures/codex-host.mjs").replacen(
+                    "#!/usr/bin/env node",
+                    &format!("#!{}", node.display()),
+                    1,
+                )
+            } else {
+                script.clone()
+            };
+            std::fs::write(&path, source).unwrap();
             tower_pal::make_executable(&path).unwrap();
         }
         Self { root }
@@ -70,7 +79,11 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        for args in [["__runtime", "stop"], ["daemon", "stop"]] {
+        for args in [
+            ["__runtime", "stop"],
+            ["__codex", "stop"],
+            ["daemon", "stop"],
+        ] {
             let _ = self
                 .command(&args)
                 .stdout(Stdio::null())
@@ -566,13 +579,35 @@ async fn owner_crash_fences_uncertain_dispatch_without_replaying_the_prompt() {
                 .is_some_and(|a| a.iter().any(|e| e["kind"] == "user_message"))
     })
     .await;
-    let records = f.rpc("agent.list", json!({}));
-    let native = records.as_array().unwrap()[0]["pid"].as_u64().unwrap() as u32;
+    let terminal = f.rpc(
+        "session.open",
+        json!({"harness":"codex","protocol":"terminal","cwd":f.root.path(),"headless":true}),
+    );
+    let terminal_id = terminal["id"].as_str().unwrap();
+    let terminal_pid = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let record = f.rpc("agent.get", json!({"id":terminal_id}));
+            if record["status"] == "idle" {
+                break record["pid"].clone();
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let socket = tower_pal::connect(&f.root.path().join("state/tower/run/runtime.sock"))
+        .await
+        .unwrap();
     let owner =
-        tower_pal::process_identity(tower_pal::process_identity(native).unwrap().parent).unwrap();
+        tower_pal::process_identity(tower_pal::peer(&socket).unwrap().pid.unwrap()).unwrap();
+    drop(socket);
     tower_pal::force_terminate_process(owner.pid, owner.start_time).unwrap();
     s.until(|v| v["method"] == "runtime.lost" && v["params"]["runtime_id"] == "crash")
         .await;
+    let terminal_after = f.rpc("agent.get", json!({"id":terminal_id}));
+    assert_eq!(terminal_after["status"], "idle");
+    assert_eq!(terminal_after["pid"], terminal_pid);
+    f.cli(&["kill", terminal_id]);
     let receipt = s
         .call(
             "command.status",
@@ -723,5 +758,125 @@ async fn lost_private_reply_fences_the_owner_instead_of_waiting_forever() {
     .unwrap();
     let status=s.call("command.status",json!({"command_id":"prompt","runtime_id":"lost-reply","generation":"generation-lost-reply"})).await;
     assert_eq!(status["result"]["state"], "accepted");
-    assert_eq!(status["result"]["dispatch"]["state"], "unknown");
+    assert_eq!(status["result"]["dispatch"]["state"], "finished");
+    assert_eq!(status["result"]["result"]["outcome"], "cancelled");
+    assert!(
+        s.frames
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|v| v["method"] == "runtime.lost" && v["params"]["termination"] == "confirmed")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shared_codex_threads_isolate_duplicate_approval_ids_and_cleanup() {
+    let f = Fixture::new();
+    let s = Server::start(&f).await;
+    let mut requests = Vec::new();
+    let mut ids = Vec::new();
+    for runtime in ["left", "right"] {
+        let launch = command(
+            &format!("launch-{runtime}"),
+            runtime,
+            "launch",
+            json!({
+                "harness":"codex", "protocol":"codex-app-server", "generation":format!("generation-{runtime}"), "cwd":f.root.path()
+            }),
+        );
+        assert_eq!(
+            s.call("command.execute", launch).await["result"]["state"],
+            "accepted"
+        );
+        complete(&s, &format!("launch-{runtime}")).await;
+        let ready = s
+            .until(|v| {
+                v["method"] == "session.events"
+                    && v["params"]["runtime_id"] == runtime
+                    && v["params"]["events"].as_array().is_some_and(|a| {
+                        a.iter().any(|e| {
+                            e["kind"] == "runtime_state" && e["payload"]["state"] == "idle"
+                        })
+                    })
+            })
+            .await;
+        let id = ready["params"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["kind"] == "runtime_state")
+            .unwrap()["payload"]["tower_session_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        ids.push(id);
+        let prompt = command(
+            &format!("prompt-{runtime}"),
+            runtime,
+            "prompt",
+            json!({"content":[{"type":"text","text":"approve"}]}),
+        );
+        assert_eq!(
+            s.call("command.execute", prompt).await["result"]["state"],
+            "accepted"
+        );
+        requests.push(
+            s.until(|v| {
+                v["method"] == "session.request"
+                    && v["params"]["runtime_id"] == runtime
+                    && v["params"]["state"] == "pending"
+            })
+            .await["params"]
+                .clone(),
+        );
+    }
+    let left = f.rpc("agent.get", json!({"id":ids[0]}));
+    let right = f.rpc("agent.get", json!({"id":ids[1]}));
+    assert_eq!(left["pid"], right["pid"]);
+    assert_ne!(left["native_session_id"], right["native_session_id"]);
+    assert_eq!(left["shared_process"], true);
+    assert_eq!(
+        requests[0]["native_request_id"],
+        requests[1]["native_request_id"]
+    );
+    assert_ne!(
+        requests[0]["source_request_id"],
+        requests[1]["source_request_id"]
+    );
+    for (index, runtime) in ["left", "right"].iter().enumerate() {
+        let p = &requests[index];
+        let reply = command(
+            &format!("reply-{runtime}"),
+            runtime,
+            "reply",
+            json!({"request_id":"visible-request","source_request_id":p["source_request_id"],"request_revision":p["request_revision"],"generation":p["generation"],"response":{"outcome":{"outcome":"selected","optionId":"allow_once"}}}),
+        );
+        assert_eq!(
+            s.call("command.execute", reply).await["result"]["state"],
+            "accepted"
+        );
+        complete(&s, &format!("prompt-{runtime}")).await;
+        f.cli(&["kill", &ids[index]]);
+        s.until(|v| {
+            v["method"] == "runtime.lost"
+                && v["params"]["runtime_id"] == *runtime
+                && v["params"]["termination"] == "confirmed"
+        })
+        .await;
+        if index == 0 {
+            let waiting=s.call("command.status",json!({"command_id":"prompt-right","runtime_id":"right","generation":"generation-right"})).await;
+            assert_ne!(waiting["result"]["dispatch"]["state"], "finished");
+            assert_eq!(
+                f.rpc("agent.get", json!({"id":ids[1]}))["pid"],
+                right["pid"]
+            );
+        }
+    }
+    assert_eq!(
+        std::fs::read_to_string(f.root.path().join("dispatches"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
 }

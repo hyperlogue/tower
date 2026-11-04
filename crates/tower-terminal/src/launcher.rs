@@ -48,6 +48,12 @@ fn save(plan: &LauncherPlan, state: &RuntimeState) -> io::Result<()> {
     tower_pal::write_private(&file(plan), &serde_json::to_vec(state)?)
 }
 
+fn drain_observations(observed: &mut mpsc::Receiver<AgentEvent>, state: &mut RuntimeState) {
+    while let Ok(event) = observed.try_recv() {
+        events::apply(state, event, now());
+    }
+}
+
 pub fn hook(harness: &str, event: &str) {
     let _ = send_hook(harness, event);
 }
@@ -93,15 +99,22 @@ fn report(path: &Path, report: &Report) -> io::Result<()> {
         .enable_all()
         .build()?
         .block_on(async {
-            tokio::time::timeout(Duration::from_millis(400), async {
-                let mut stream = tower_pal::connect(path).await?;
-                stream.write_u32(bytes.len() as u32).await?;
-                stream.write_all(&bytes).await?;
-                if stream.read_u8().await? != 1 {
-                    return Err(io::Error::other("launcher rejected report"));
-                }
-                Ok(())
-            })
+            tokio::time::timeout(
+                if report.stop {
+                    Duration::from_secs(40)
+                } else {
+                    Duration::from_millis(400)
+                },
+                async {
+                    let mut stream = tower_pal::connect(path).await?;
+                    stream.write_u32(bytes.len() as u32).await?;
+                    stream.write_all(&bytes).await?;
+                    if stream.read_u8().await? != 1 {
+                        return Err(io::Error::other("launcher rejected report"));
+                    }
+                    Ok(())
+                },
+            )
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "launcher report timed out"))?
         })
@@ -212,7 +225,14 @@ async fn serve(
     let exe = tower_pal::executable()?;
     let mut env =
         project_environment(Path::new(&plan.spec.cwd), &exe, tower_pal::environment()).await?;
-    let native_home = tower_agents::inventory::namespace(plan.spec.harness, &env);
+    let native_home = if plan.spec.harness == Harness::Codex {
+        Some(
+            tower_agents::codex_host::namespace(&tower_pal::Paths::discover()?)
+                .map_err(io::Error::other)?,
+        )
+    } else {
+        tower_agents::inventory::namespace(plan.spec.harness, &env)
+    };
     if plan.spec.resume.is_some()
         && plan
             .spec
@@ -259,14 +279,6 @@ async fn serve(
             &plan.generation,
         )?;
     }
-    if plan.spec.harness == Harness::Codex {
-        let supported =
-            tower_agents::delivery::queue_supported(&invocation.env, Path::new(&plan.spec.cwd))
-                .await;
-        state
-            .private
-            .insert("queue_supported".into(), supported.into());
-    }
     let paths = tower_pal::Paths::discover()?;
     state.private.insert(
         "pty_supported".into(),
@@ -285,15 +297,13 @@ async fn serve(
     } else {
         None
     };
-    if let Some(server) = &server
-        && let Some(pid) = server.child.id()
-    {
+    if let Some(identity) = server.as_ref().and_then(|server| server.process) {
         state
             .private
-            .insert("service_pid".into(), serde_json::json!(pid));
+            .insert("server_pid".into(), serde_json::json!(identity.pid));
         state.private.insert(
-            "service_start_time".into(),
-            serde_json::json!(tower_pal::process_identity(pid).ok().map(|p| p.start_time)),
+            "server_start_time".into(),
+            serde_json::json!(identity.start_time),
         );
         save(plan, state)?;
     }
@@ -320,18 +330,32 @@ async fn serve(
     )>(64);
     let permits = Arc::new(Semaphore::new(32));
     let mut tick = tokio::time::interval(Duration::from_millis(100));
+    let mut child_exit = None;
+    let mut stop_confirmed = false;
     loop {
         tokio::select! {
-            result=child.wait()=>{
-                if let Some(server)=&mut server {server.shutdown().await;}
-                return Ok(result?.code().unwrap_or(128));
+            result=child.wait(), if child_exit.is_none()=>{
+                child_exit = Some(result?.code().unwrap_or(128));
+                if stop_confirmed || server.is_none() { return Ok(child_exit.unwrap()); }
+                state.stop_requested = true;
+                let cleaned = server.as_mut().unwrap().shutdown().await.is_ok();
+                drain_observations(&mut observed,state);
+                if cleaned {
+                    state.private.insert("codex_cleanup_confirmed".into(), true.into());
+                    return Ok(child_exit.unwrap());
+                }
+                state.status = "unknown".into();
+                state.detail.error = Some("codex_cleanup_unconfirmed".into());
+                state.seq = state.seq.saturating_add(1);
+                state.updated_at = now();
+                save(plan, state)?;
             }
             accepted=listener.accept()=>{
                 if let Ok((mut stream,_))=accepted && let Ok(permit)=permits.clone().try_acquire_owned() {
                     let tx=tx.clone();
                     tokio::spawn(async move {
                         let _permit=permit;
-                        let _=tokio::time::timeout(Duration::from_secs(15),async {
+                        let _=tokio::time::timeout(Duration::from_secs(40),async {
                             let n=stream.read_u32().await? as usize;
                             if n>65536 {return Err(io::Error::other("report too large"));}
                             let mut bytes=vec![0;n];stream.read_exact(&mut bytes).await?;
@@ -381,7 +405,28 @@ async fn serve(
                     });
                     continue;
                 }
-                if report.stop {terminated.store(true,Ordering::Relaxed);}else if plan.spec.mode.as_deref()!=Some("app-server") && let Some(event)=report.event
+                if report.stop {
+                    state.stop_requested = true;
+                    state.updated_at = now();
+                    save(plan,state)?;
+                    let cleaned=match &mut server {Some(server)=>server.shutdown().await.is_ok(),None=>true};
+                    drain_observations(&mut observed,state);
+                    if !cleaned {
+                        state.status = "unknown".into();
+                        state.detail.error = Some("codex_cleanup_unconfirmed".into());
+                        state.seq = state.seq.saturating_add(1);
+                        save(plan,state)?;
+                        let _=ack.send(Err(tower_protocol::RpcError::application("stop_unconfirmed","Codex thread cleanup is unconfirmed")));
+                        continue;
+                    }
+                    stop_confirmed = true;
+                    state.private.insert("codex_cleanup_confirmed".into(), true.into());
+                    save(plan,state)?;
+                    let _=ack.send(Ok(None));
+                    if let Some(code)=child_exit {return Ok(code);}
+                    tower_pal::terminate_own_group()?;
+                    continue;
+                }else if plan.spec.mode.as_deref()!=Some("app-server") && let Some(event)=report.event
                     && !(plan.spec.fork && plan.spec.resume.as_ref().is_some_and(|parent|event.native_id.as_ref()==Some(&parent.id))) {
                     let kind=event.kind;let before=state.seq;let was_idle=state.status=="idle";events::apply(state,event,now());
                     if state.seq!=before {
@@ -398,20 +443,42 @@ async fn serve(
             }
             _=tick.tick()=>{}
         }
-        if let Some(server) = &mut server
-            && server.child.try_wait()?.is_some()
-        {
-            state.detail.error = Some("app_server_unavailable".into());
-            return Ok(1);
-        }
-        if activity.refresh(state, now()) {
+        if server.is_none() && activity.refresh(state, now()) {
             save(plan, state)?;
         }
-        if terminated.load(Ordering::Relaxed) && !state.stop_requested {
+        if terminated.swap(false, Ordering::Relaxed) && !stop_confirmed {
             state.stop_requested = true;
             state.updated_at = now();
             save(plan, state)?;
+            let cleaned = match &mut server {
+                Some(server) => server.shutdown().await.is_ok(),
+                None => true,
+            };
+            drain_observations(&mut observed, state);
+            if !cleaned {
+                state.status = "unknown".into();
+                state.detail.error = Some("codex_cleanup_unconfirmed".into());
+                state.seq = state.seq.saturating_add(1);
+                save(plan, state)?;
+                continue;
+            }
+            stop_confirmed = true;
+            state
+                .private
+                .insert("codex_cleanup_confirmed".into(), true.into());
+            save(plan, state)?;
+            if let Some(code) = child_exit {
+                return Ok(code);
+            }
             tower_pal::terminate_own_group()?;
+        }
+        if server.as_ref().is_some_and(|server| !server.available()) && !state.stop_requested {
+            state.stop_requested = true;
+            state.status = "unknown".into();
+            state.detail.error = Some("codex_relay_unavailable".into());
+            state.seq = state.seq.saturating_add(1);
+            state.updated_at = now();
+            save(plan, state)?;
         }
     }
 }

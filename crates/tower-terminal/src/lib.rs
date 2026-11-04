@@ -19,51 +19,172 @@ use tower_sessions::{
 pub struct TerminalBackend {
     paths: Paths,
     inventory: std::sync::Mutex<tower_agents::inventory::Inventory>,
+    codex_inventory: std::sync::Mutex<
+        Option<(
+            std::path::PathBuf,
+            std::time::Instant,
+            tower_agents::inventory::InventoryResult,
+        )>,
+    >,
 }
 impl TerminalBackend {
     pub fn new(paths: Paths) -> Self {
         Self {
             paths,
             inventory: Default::default(),
+            codex_inventory: Default::default(),
         }
+    }
+    fn codex_history(&self, refresh: bool) -> Result<tower_agents::inventory::InventoryResult> {
+        let config = tower_agents::codex_service::Config::load(&self.paths)
+            .map_err(|_| error("invalid_config", "Invalid host Codex configuration"))?;
+        let mut cache = self
+            .codex_inventory
+            .lock()
+            .map_err(|_| error("internal_error", "Codex inventory unavailable"))?;
+        if let Some((endpoint, at, found)) = &*cache
+            && !refresh
+            && endpoint == &config.endpoint
+            && at.elapsed() < std::time::Duration::from_secs(2)
+        {
+            return Ok(found.clone());
+        }
+        let found = codex_block(async {
+            let host = tower_agents::codex_host::ensure(&self.paths).await?;
+            let mut client =
+                tower_agents::codex_service::Client::connect(&host.config.endpoint).await?;
+            let mut found = tower_agents::inventory::InventoryResult::default();
+            let mut cursor = serde_json::Value::Null;
+            let mut cursors = std::collections::BTreeSet::new();
+            let mut ids = std::collections::BTreeSet::new();
+            for _ in 0..50 {
+                let page=client.request("thread/list",serde_json::json!({"cursor":cursor,"limit":100,"modelProviders":[],"sortKey":"updated_at","sortDirection":"desc","archived":false})).await?;
+                let rows = page["data"]
+                    .as_array()
+                    .ok_or(tower_agents::codex_service::Error::Protocol)?;
+                if rows.len() > 100 {
+                    return Err(tower_agents::codex_service::Error::Limit);
+                }
+                for row in rows {
+                    if let Some(candidate) = codex_candidate(row, &host.config.endpoint) {
+                        if !ids.insert(candidate.native.id.clone()) {
+                            return Err(tower_agents::codex_service::Error::Protocol);
+                        }
+                        found.candidates.push(candidate);
+                        if found.candidates.len() >= 4096 {
+                            found.truncated = true;
+                            return Ok(found);
+                        }
+                    }
+                }
+                match page.get("nextCursor") {
+                    None | Some(serde_json::Value::Null) => return Ok(found),
+                    Some(serde_json::Value::String(next))
+                        if !next.is_empty()
+                            && next.len() <= 4096
+                            && cursors.insert(next.clone()) =>
+                    {
+                        cursor = serde_json::Value::String(next.clone())
+                    }
+                    _ => return Err(tower_agents::codex_service::Error::Protocol),
+                }
+            }
+            found.truncated = true;
+            Ok(found)
+        })?;
+        *cache = Some((config.endpoint, std::time::Instant::now(), found.clone()));
+        Ok(found)
+    }
+    fn codex_conversation(&self, id: &str) -> Result<tower_agents::inventory::Candidate> {
+        if !tower_agents::events::native_id(id) {
+            return Err(error("invalid_params", "Invalid native session identity"));
+        }
+        codex_block(async {
+            let host = tower_agents::codex_host::ensure(&self.paths).await?;
+            let mut client =
+                tower_agents::codex_service::Client::connect(&host.config.endpoint).await?;
+            let response = client
+                .request(
+                    "thread/read",
+                    serde_json::json!({"threadId":id,"includeTurns":false}),
+                )
+                .await?;
+            codex_candidate(&response["thread"], &host.config.endpoint)
+                .filter(|candidate| candidate.native.id == id)
+                .ok_or(tower_agents::codex_service::Error::Protocol)
+        })
     }
     fn codex_mode(&self, request: &SessionOpenParams) -> Result<String> {
-        if let Some(mode) = &request.mode {
-            return Ok(mode.clone());
+        if request
+            .mode
+            .as_deref()
+            .is_some_and(|mode| mode != "app-server")
+        {
+            return Err(error("invalid_params", "Codex requires app-server mode"));
         }
-        let config = tower_pal::read_config(&self.paths.config_home.join("tower/config.toml"))
-            .map_err(|_| error("invalid_config", "Cannot read Tower configuration"))?;
-        let config: toml::Table = config
-            .map(|s| s.parse())
-            .transpose()
-            .map_err(|_| error("invalid_config", "Invalid Tower configuration"))?
-            .unwrap_or_default();
-        let codex = config.get("codex");
-        let default = codex
-            .and_then(|c| c.get("default_mode"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("app-server");
-        let overrides = codex
-            .and_then(|c| c.get("override"))
-            .and_then(|v| v.as_array());
-        let selected = overrides
-            .into_iter()
-            .flatten()
-            .filter_map(|entry| {
-                let prefix = self
-                    .paths
-                    .absolute_cwd(entry.get("cwd_prefix")?.as_str()?)
-                    .ok()?;
-                let prefix = prefix.to_string_lossy();
-                tower_pal::path_prefix(&request.cwd, &prefix)
-                    .then(|| (prefix.len(), entry.get("mode").and_then(|v| v.as_str())))
-            })
-            .max_by_key(|(len, _)| *len)
-            .and_then(|(_, mode)| mode)
-            .unwrap_or(default);
-        Ok(selected.into())
+        tower_agents::codex_service::Config::load(&self.paths).map_err(|_| {
+            error(
+                "invalid_config",
+                "Invalid host Codex endpoint configuration",
+            )
+        })?;
+        Ok("app-server".into())
     }
 }
+fn codex_block<T>(
+    operation: impl std::future::Future<Output = tower_agents::codex_service::Result<T>>,
+) -> Result<T> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| error("backend_unavailable", "Cannot start Codex inventory reader"))?
+        .block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(20), operation)
+                .await
+                .map_err(|_| error("conversation_unavailable", "Host Codex inventory timed out"))?
+                .map_err(|_| {
+                    error(
+                        "conversation_unavailable",
+                        "Host Codex inventory is unavailable",
+                    )
+                })
+        })
+}
+fn codex_candidate(
+    row: &serde_json::Value,
+    endpoint: &std::path::Path,
+) -> Option<tower_agents::inventory::Candidate> {
+    if row["ephemeral"] == true
+        || !row["parentThreadId"].is_null()
+        || row["threadSource"]
+            .as_str()
+            .is_some_and(|source| source != "user")
+    {
+        return None;
+    }
+    let id = row["id"]
+        .as_str()
+        .filter(|id| tower_agents::events::native_id(id))?;
+    let cwd = row["cwd"]
+        .as_str()
+        .filter(|cwd| cwd.len() <= 4096 && std::path::Path::new(cwd).is_absolute())?;
+    let updated_at = row["updatedAt"].as_u64()?.saturating_mul(1000);
+    Some(tower_agents::inventory::Candidate {
+        harness: tower_agents::Harness::Codex,
+        native: tower_agents::runtime::NativeSession {
+            id: id.into(),
+            resume_ref: None,
+        },
+        cwd: cwd.into(),
+        title: row["name"]
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .map(|name| name.chars().take(200).collect()),
+        updated_at,
+        namespace: Some(format!("codex-endpoint:{}", endpoint.display())),
+    })
+}
+
 fn error(code: &str, message: &str) -> RpcError {
     RpcError::application(code, message)
 }
@@ -127,6 +248,17 @@ struct Plan {
 fn binding(session: &ManagedSession) -> Result<Binding> {
     decode(&session.binding)
 }
+fn codex_cleanup_confirmed(plan: &tower_agents::runtime::LauncherPlan) -> bool {
+    launcher::read_state(&std::path::Path::new(&plan.state_dir).join("state.json")).is_ok_and(
+        |state| {
+            state.id == plan.id
+                && state.generation == plan.generation
+                && state.private.get("codex_cleanup_confirmed")
+                    == Some(&serde_json::Value::Bool(true))
+        },
+    )
+}
+
 fn launcher_alive(state: &tower_agents::runtime::RuntimeState) -> Result<bool> {
     if state.boot_id
         != tower_pal::boot_id()
@@ -137,17 +269,6 @@ fn launcher_alive(state: &tower_agents::runtime::RuntimeState) -> Result<bool> {
     for (pid, start) in [
         (Some(state.launcher_pid), Some(state.launcher_start_time)),
         (state.agent_pid, state.agent_start_time),
-        (
-            state
-                .private
-                .get("service_pid")
-                .and_then(|p| p.as_u64())
-                .and_then(|p| p.try_into().ok()),
-            state
-                .private
-                .get("service_start_time")
-                .and_then(|p| p.as_u64()),
-        ),
     ] {
         if let (Some(pid), Some(start)) = (pid, start) {
             match tower_pal::process_identity(pid) {
@@ -268,7 +389,19 @@ impl TerminalBackend {
                     result.caps.wake_when_idle = caps.wake_when_idle;
                     result.caps.reply_path = caps.reply_path;
                 }
+                if state.harness == tower_agents::Harness::Codex {
+                    result.pid = state
+                        .private
+                        .get("server_pid")
+                        .and_then(|v| v.as_u64())
+                        .and_then(|v| u32::try_from(v).ok());
+                    result.pid_start_time = state
+                        .private
+                        .get("server_start_time")
+                        .and_then(|v| v.as_u64());
+                }
                 result.metadata = tower_sessions::SessionMetadata {
+                    shared_process: Some(state.harness == tower_agents::Harness::Codex),
                     native_session_id: state.native.map(|n| n.id),
                     display_name: state.display_name,
                     cwd: self.paths.display_cwd(&state.cwd).ok(),
@@ -358,11 +491,38 @@ impl ManagedBackend for TerminalBackend {
                     .ok_or_else(|| error("unsupported", "Unknown harness"))
             })
             .transpose()?;
-        let found = self
-            .inventory
-            .lock()
-            .map_err(|_| error("internal_error", "Inventory unavailable"))?
-            .list(&tower_pal::environment(), harness, request.refresh);
+        let mut found = tower_agents::inventory::InventoryResult::default();
+        if harness.is_none_or(|h| h == tower_agents::Harness::Codex) {
+            match self.codex_history(request.refresh) {
+                Ok(codex) => found = codex,
+                Err(_) => found
+                    .errors
+                    .push("codex: host_inventory_unavailable".into()),
+            }
+        }
+        if harness != Some(tower_agents::Harness::Codex) {
+            let mut inventory = self
+                .inventory
+                .lock()
+                .map_err(|_| error("internal_error", "Inventory unavailable"))?;
+            let selected: Vec<_> = tower_agents::Harness::ALL
+                .into_iter()
+                .filter(|h| {
+                    *h != tower_agents::Harness::Codex
+                        && harness.is_none_or(|selected| selected == *h)
+                })
+                .collect();
+            let entries =
+                inventory.list_selected(&tower_pal::environment(), &selected, request.refresh);
+            found.candidates.extend(entries.candidates);
+            found.errors.extend(entries.errors);
+            found.truncated |= entries.truncated;
+        }
+        found.candidates.sort_by(|a, b| {
+            b.updated_at
+                .cmp(&a.updated_at)
+                .then_with(|| a.native.id.cmp(&b.native.id))
+        });
         let mut conversations = found
             .candidates
             .into_iter()
@@ -397,12 +557,23 @@ impl ManagedBackend for TerminalBackend {
             && let Ok(state) = launcher::read_state(
                 &std::path::Path::new(&binding.plan.state_dir).join("state.json"),
             )
-            && launcher_alive(&state)?
         {
-            return Err(error(
-                "session_running",
-                "Cannot remove a live session's resources",
-            ));
+            if launcher_alive(&state)? {
+                return Err(error(
+                    "session_running",
+                    "Cannot remove a live session's resources",
+                ));
+            }
+            if state.harness == tower_agents::Harness::Codex
+                && state.private.contains_key("server_pid")
+                && state.private.get("codex_cleanup_confirmed")
+                    != Some(&serde_json::Value::Bool(true))
+            {
+                return Err(error(
+                    "stop_unconfirmed",
+                    "Codex cleanup is unconfirmed; private environment files must be retained",
+                ));
+            }
         }
         self.paths
             .token_path(&session.id)
@@ -421,7 +592,7 @@ impl ManagedBackend for TerminalBackend {
                 executable: h.program().into(),
                 available: tower_pal::find_program(h.program(), &env).is_some(),
                 modes: if *h == tower_agents::Harness::Codex {
-                    vec!["app-server".into(), "native".into()]
+                    vec!["app-server".into()]
                 } else {
                     vec![]
                 },
@@ -434,7 +605,6 @@ impl ManagedBackend for TerminalBackend {
     }
     fn features(&self) -> &'static [&'static str] {
         &[
-            "sessions.codex-native.v1",
             "sessions.codex-app-server.v1",
             "sessions.agents.v1",
             "sessions.resume.v1",
@@ -449,6 +619,9 @@ impl ManagedBackend for TerminalBackend {
             .resume
             .as_ref()
             .map(|seed| {
+                if harness == tower_agents::Harness::Codex {
+                    return self.codex_conversation(&seed.native_session_id);
+                }
                 self.inventory
                     .lock()
                     .map_err(|_| error("internal_error", "Inventory unavailable"))?
@@ -466,7 +639,18 @@ impl ManagedBackend for TerminalBackend {
             request.mode.clone()
         };
         let spec = tower_agents::runtime::AgentSpec {
-            native_home: selected.as_ref().and_then(|c| c.namespace.clone()),
+            native_home: if harness == tower_agents::Harness::Codex {
+                Some(
+                    tower_agents::codex_host::namespace(&self.paths).map_err(|_| {
+                        error(
+                            "invalid_config",
+                            "Invalid host Codex endpoint configuration",
+                        )
+                    })?,
+                )
+            } else {
+                selected.as_ref().and_then(|c| c.namespace.clone())
+            },
             harness,
             cwd: selected
                 .as_ref()
@@ -612,12 +796,47 @@ impl ManagedBackend for TerminalBackend {
     }
     fn stop(&self, session: &ManagedSession) -> Result<Observation> {
         let name = name(session)?;
-        if let Ok(binding) = binding(session)
-            && let Ok(path) = self.paths.token_path(&session.id)
-            && let Ok(token) = tower_pal::read_private(&path)
-            && let Ok(token) = String::from_utf8(token)
-        {
-            let _ = launcher::stop(&binding.plan, &token);
+        let binding = binding(session)?;
+        let codex = binding.plan.spec.harness == tower_agents::Harness::Codex;
+        let reserved = if codex {
+            pool::list(&self.paths)
+                .map_err(|_| error("stop_unconfirmed", "Cannot read terminal session state"))?
+                .iter()
+                .any(|entry| entry.name == name && entry.state == "reserved")
+        } else {
+            false
+        };
+        // Holding the launcher lock makes reservation cancellation atomic with startup.
+        let _reservation_guard = if reserved {
+            Some(
+                tower_pal::SingletonLock::acquire(
+                    &std::path::Path::new(&binding.plan.state_dir).join("launcher.lock"),
+                )
+                .map_err(|_| {
+                    error(
+                        "stop_unconfirmed",
+                        "The Codex launcher is starting; retry the stop",
+                    )
+                })?,
+            )
+        } else {
+            None
+        };
+        let cleaned = codex && codex_cleanup_confirmed(&binding.plan);
+        if !reserved && !cleaned {
+            let stopped = self
+                .paths
+                .token_path(&session.id)
+                .ok()
+                .and_then(|path| tower_pal::read_private(&path).ok())
+                .and_then(|token| String::from_utf8(token).ok())
+                .is_some_and(|token| launcher::stop(&binding.plan, &token).is_ok());
+            if codex && !stopped && !codex_cleanup_confirmed(&binding.plan) {
+                return Err(error(
+                    "stop_unconfirmed",
+                    "Codex thread cleanup is unconfirmed; the shared server remains running",
+                ));
+            }
         }
         if !matches!(
             pool::request(&self.paths, &Request::Kill { name: name.clone() }),

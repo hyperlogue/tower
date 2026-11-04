@@ -30,7 +30,10 @@ impl Pool {
             .spawn()
             .unwrap();
         let p = Self { dir, child };
-        wait(|| p.socket().exists());
+        wait(|| {
+            tower_pal::connect_blocking(&p.socket())
+                .is_ok_and(|mut stream| wire::hello_sync(&mut stream).is_ok())
+        });
         p
     }
     fn socket(&self) -> PathBuf {

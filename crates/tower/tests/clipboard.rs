@@ -31,7 +31,16 @@ impl Fixture {
         );
         for name in ["codex", "claude"] {
             let bin = path.join("bin").join(name);
-            std::fs::write(&bin, &script).unwrap();
+            let source = if name == "codex" {
+                include_str!("fixtures/codex-host.mjs").replacen(
+                    "#!/usr/bin/env node",
+                    &format!("#!{}", node.display()),
+                    1,
+                )
+            } else {
+                script.clone()
+            };
+            std::fs::write(&bin, source).unwrap();
             tower_pal::make_executable(&bin).unwrap();
         }
         let env = [
@@ -165,7 +174,7 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        for args in [["__pool", "stop"], ["daemon", "stop"]] {
+        for args in [["__pool", "stop"], ["__codex", "stop"], ["daemon", "stop"]] {
             let _ = self
                 .command(&["--no-start"])
                 .args(args)
@@ -252,7 +261,7 @@ async fn clipboard_two_clients_paste_sources_shims_detach_and_restart() {
     let f = Fixture::new();
     let a_image = image(32);
     let b_image = image(224);
-    let codex = f.call(&["open", "codex", "--mode", "native", "--headless"])["id"]
+    let codex = f.call(&["open", "codex", "--headless"])["id"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -339,7 +348,7 @@ async fn clipboard_two_clients_paste_sources_shims_detach_and_restart() {
         );
         f.call(&["kill", &id]);
     }
-    let codex = f.call(&["open", "codex", "--mode", "native", "--headless"])["id"]
+    let codex = f.call(&["open", "codex", "--headless"])["id"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -606,7 +615,7 @@ trust_level="trusted"
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attach_binds_stdin_credentials_without_echo_and_rejects_agent_providers() {
     let f = Fixture::new();
-    let id = f.call(&["open", "codex", "--mode", "native", "--headless"])["id"]
+    let id = f.call(&["open", "codex", "--headless"])["id"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -686,7 +695,7 @@ async fn attach_binds_stdin_credentials_without_echo_and_rejects_agent_providers
 async fn stalled_provider_does_not_block_other_clients_and_revocation_discards_queued_submit() {
     use tokio::io::{AsyncBufReadExt, BufReader};
     let f = Fixture::new();
-    let id = f.call(&["open", "codex", "--mode", "native", "--headless"])["id"]
+    let id = f.call(&["open", "codex", "--headless"])["id"]
         .as_str()
         .unwrap()
         .to_owned();

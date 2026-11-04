@@ -8,7 +8,7 @@ fn spec(harness: Harness, root: &Path) -> AgentSpec {
         harness,
         cwd: root.to_string_lossy().into_owned(),
         args: vec![],
-        mode: (harness == Harness::Codex).then(|| "native".into()),
+        mode: (harness == Harness::Codex).then(|| "app-server".into()),
         resume: None,
         fork: false,
         native_home: None,
@@ -64,27 +64,8 @@ fn configurations_preserve_native_state_and_limit_owned_changes() {
                 );
             }
             Harness::Codex => {
-                let profile = root.join(".codex/tower.config.toml");
-                let text = std::fs::read_to_string(&profile).unwrap();
-                let mut cfg: toml::Table = text.parse().unwrap();
-                assert!(cfg["hooks"]["Stop"][0].get("matcher").is_none());
-                assert_eq!(cfg["hooks"]["PreToolUse"][0]["matcher"].as_str(), Some("*"));
-                cfg.insert("model".into(), "preferred".into());
-                let marker = text.lines().next().unwrap();
-                std::fs::write(
-                    &profile,
-                    format!("{marker}\n{}", toml::to_string(&cfg).unwrap()),
-                )
-                .unwrap();
-                config::prepare(
-                    &spec(h, root),
-                    &dir,
-                    Path::new("/opt/tower's bin/tower"),
-                    env.clone(),
-                )
-                .unwrap();
-                let after: toml::Table = std::fs::read_to_string(profile).unwrap().parse().unwrap();
-                assert_eq!(after["model"].as_str(), Some("preferred"));
+                assert_eq!(plan.argv, vec!["codex"]);
+                assert!(!root.join(".codex/tower.config.toml").exists());
             }
             Harness::Reasonix => {
                 let home = Path::new(&plan.env["REASONIX_HOME"]);
@@ -168,25 +149,30 @@ fn configurations_preserve_native_state_and_limit_owned_changes() {
     );
 }
 #[test]
-fn unmanaged_codex_profile_and_conflicting_arguments_are_rejected() {
+fn codex_rejects_native_mode_and_endpoint_overrides_without_editing_native_config() {
     let t = tempfile::tempdir().unwrap();
     let root = t.path();
     std::fs::create_dir(root.join(".codex")).unwrap();
-    std::fs::write(root.join(".codex/tower.config.toml"), "model='mine'").unwrap();
+    std::fs::write(root.join(".codex/config.toml"), "model='mine'").unwrap();
     let env = tower_pal::Environment::from([("HOME".into(), root.to_string_lossy().into_owned())]);
-    assert!(
-        config::prepare(
-            &spec(Harness::Codex, root),
-            &root.join("cfg"),
-            Path::new("/opt/tower"),
-            env
-        )
-        .is_err()
+    config::prepare(
+        &spec(Harness::Codex, root),
+        &root.join("cfg"),
+        Path::new("/opt/tower"),
+        env,
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join(".codex/config.toml")).unwrap(),
+        "model='mine'"
     );
+    let mut native = spec(Harness::Codex, root);
+    native.mode = Some("native".into());
+    assert!(config::validate(&native).is_err());
     for arg in ["--profile=other", "-pother", "--remote=unix:///tmp/other"] {
-        let mut s = spec(Harness::Codex, root);
-        s.args.push(arg.into());
-        assert!(config::validate(&s).is_err());
+        let mut selected = spec(Harness::Codex, root);
+        selected.args.push(arg.into());
+        assert!(config::validate(&selected).is_err());
     }
 }
 fn state() -> RuntimeState {

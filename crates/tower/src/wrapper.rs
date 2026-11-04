@@ -7,15 +7,14 @@ pub async fn run(
     paths: tower_pal::Paths,
     client: &mut Client,
     name: String,
-    mode: Option<String>,
     args: Vec<String>,
 ) -> Result<()> {
     client
         .call("daemon.service_access", &serde_json::json!({}))
         .await?;
     let harness = Harness::parse(&name).ok_or("Unknown harness")?;
-    if mode.as_deref().is_some_and(|m| m != "native") {
-        return Err("The foreground wrapper uses native mode; use tower open for managed app-server sessions".into());
+    if harness == Harness::Codex {
+        return Err("Codex requires a managed app-server session; use tower open codex".into());
     }
     let cwd = std::env::current_dir()?;
     let exe = tower_pal::executable()?;
@@ -45,7 +44,7 @@ pub async fn run(
         harness,
         cwd: cwd.to_string_lossy().into_owned(),
         args,
-        mode: (harness == Harness::Codex).then(|| "native".into()),
+        mode: None,
         resume: None,
         fork: false,
         native_home: None,

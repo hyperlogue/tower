@@ -179,6 +179,79 @@ pub async fn connect(path: &Path) -> io::Result<IpcStream> {
     }
     Ok(stream)
 }
+/// Call while holding the owning service's singleton lock.
+pub async fn prepare_socket_path(path: &Path) -> io::Result<()> {
+    require_private_dir(path.parent().ok_or_else(|| denied("invalid socket path"))?)?;
+    match fs::symlink_metadata(path) {
+        Ok(m) => {
+            if (!m.file_type().is_socket() && !m.file_type().is_symlink()) || m.uid() != uid() {
+                return Err(denied(
+                    "refusing to replace a foreign or invalid socket path",
+                ));
+            }
+            if m.file_type().is_symlink() {
+                match fs::metadata(path) {
+                    Ok(target) if target.file_type().is_socket() && target.uid() == uid() => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    _ => return Err(denied("refusing to replace an invalid socket alias")),
+                }
+            }
+            match tokio::time::timeout(Duration::from_millis(250), connect(path)).await {
+                Ok(Err(e))
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+                    ) =>
+                {
+                    fs::remove_file(path)?
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        "socket is active or could not be verified stale",
+                    ));
+                }
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    Ok(())
+}
+fn resolve_owned_socket(path: &Path) -> io::Result<(PathBuf, fs::Metadata)> {
+    let alias = fs::symlink_metadata(path)?;
+    if alias.uid() != uid() || (!alias.file_type().is_socket() && !alias.file_type().is_symlink()) {
+        return Err(denied("invalid socket alias owner or type"));
+    }
+    let resolved = fs::canonicalize(path)?;
+    let metadata = fs::symlink_metadata(&resolved)?;
+    if !metadata.file_type().is_socket() || metadata.uid() != uid() {
+        return Err(denied("invalid private socket owner or type"));
+    }
+    Ok((resolved, metadata))
+}
+pub fn require_private_socket(path: &Path) -> io::Result<PathBuf> {
+    let (resolved, metadata) = resolve_owned_socket(path)?;
+    if metadata.permissions().mode() & 0o077 == 0 {
+        return Ok(resolved);
+    }
+    let parent = resolved
+        .parent()
+        .ok_or_else(|| denied("invalid socket path"))?;
+    if parent
+        .ancestors()
+        .any(|directory| require_private_dir(directory).is_ok())
+    {
+        return Ok(resolved);
+    }
+    Err(denied(
+        "socket must be owner-only or inside a private directory",
+    ))
+}
+pub fn private_socket(path: &Path) -> io::Result<()> {
+    let (resolved, _) = resolve_owned_socket(path)?;
+    fs::set_permissions(resolved, fs::Permissions::from_mode(0o600))
+}
 pub struct IpcListener {
     listener: UnixListener,
     path: PathBuf,
@@ -187,32 +260,7 @@ pub struct IpcListener {
 impl IpcListener {
     /// Call only while holding the corresponding SingletonLock.
     pub async fn bind(path: &Path) -> io::Result<Self> {
-        require_private_dir(path.parent().ok_or_else(|| denied("invalid socket path"))?)?;
-        match fs::symlink_metadata(path) {
-            Ok(m) => {
-                if !m.file_type().is_socket() || m.uid() != uid() {
-                    return Err(denied("refusing to replace a non-socket or foreign socket"));
-                }
-                match tokio::time::timeout(Duration::from_millis(250), connect(path)).await {
-                    Ok(Err(e))
-                        if matches!(
-                            e.kind(),
-                            io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
-                        ) =>
-                    {
-                        fs::remove_file(path)?
-                    }
-                    _ => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::AddrInUse,
-                            "socket is active or could not be verified stale",
-                        ));
-                    }
-                }
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
+        prepare_socket_path(path).await?;
         let listener = UnixListener::bind(path)?;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
         Ok(Self {
@@ -250,6 +298,14 @@ pub fn ignore_hangup() -> io::Result<()> {
 /// Called before starting any runtime threads.
 pub fn detach(paths: &Paths) -> io::Result<()> {
     detach_log(paths, "towerd.log")
+}
+pub fn detach_codex_host(paths: &Paths) -> io::Result<()> {
+    detach_log(paths, "codex-host.log")
+}
+pub fn start_codex_host() -> io::Result<()> {
+    let mut command = Command::new(super::executable()?);
+    command.args(["__codex", "run", "--detach"]);
+    start_background(command)
 }
 pub fn detach_runtime(paths: &Paths) -> io::Result<()> {
     detach_log(paths, "runtime.log")
@@ -513,6 +569,39 @@ mod tests {
         drop(lock);
         assert!(!path.exists());
         assert!(SingletonLock::acquire(&lockpath).is_ok());
+    }
+    #[tokio::test]
+    async fn native_socket_alias_checks_target_and_preserves_live_service() {
+        let temp = tempfile::tempdir().unwrap();
+        private_dir(temp.path()).unwrap();
+        let path = temp.path().join("native.sock");
+        let listener = IpcListener::bind(&path).await.unwrap();
+        let alias = temp.path().join("configured.sock");
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        assert_eq!(
+            require_private_socket(&alias).unwrap(),
+            path.canonicalize().unwrap()
+        );
+        private_socket(&alias).unwrap();
+        assert_eq!(
+            prepare_socket_path(&alias).await.unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
+        assert!(
+            fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        drop(listener);
+        prepare_socket_path(&alias).await.unwrap();
+        assert!(fs::symlink_metadata(&alias).is_err());
+        fs::write(&path, b"ordinary file").unwrap();
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        assert!(require_private_socket(&alias).is_err());
+        assert!(private_socket(&alias).is_err());
+        assert!(prepare_socket_path(&alias).await.is_err());
+        assert_eq!(fs::read(path).unwrap(), b"ordinary file");
     }
     #[test]
     fn rejects_symlinks_and_identifies_current_process() {

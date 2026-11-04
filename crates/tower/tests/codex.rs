@@ -23,6 +23,7 @@ impl Fixture {
             .tempdir_in("/tmp")
             .unwrap();
         let path = root.path();
+        tower_pal::private_dir(path).unwrap();
         let env = [
             ("PATH".into(), std::env::var("PATH").unwrap()),
             ("HOME".into(), path.to_string_lossy().into_owned()),
@@ -119,6 +120,7 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
+        let _ = self.command(&["__codex", "stop"]).output();
         let _ = self.command(&["daemon", "stop"]).output();
         if let Ok(mut s) =
             tower_pal::connect_blocking(&self.root.path().join("state/tower/run/pool.sock"))
@@ -222,16 +224,8 @@ async fn gateway_mode(tool: bool) -> (u16, tokio::task::JoinHandle<()>) {
     (port, task)
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "requires an installed Codex CLI with --no-daemon; uses only a local fixture API"]
-async fn real_codex_shared_attach_restart_and_kitty_reattach() {
-    exercise_codex("native").await;
-}
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires installed Codex; uses only a local fixture API"]
-async fn real_codex_app_server_attach_and_mode_switch() {
-    exercise_codex("app-server").await;
-}
-async fn exercise_codex(mode: &str) {
+async fn real_codex_shared_host_attach_restart_and_kitty_reattach() {
     let f = Fixture::new();
     let (port, api) = gateway().await;
     let home = f.root.path().join("codex");
@@ -261,7 +255,7 @@ trust_level = "trusted"
         "open",
         "codex",
         "--mode",
-        mode,
+        "app-server",
         "--headless",
         "--cwd",
         f.root.path().to_str().unwrap(),
@@ -271,14 +265,7 @@ trust_level = "trusted"
     let id = opened["id"].as_str().unwrap();
     let first = f.response(id, 0).await;
     let delivery = f.call(&["send", id, "A Tower-delivered message: reply with ready."]);
-    assert_eq!(
-        delivery["method"],
-        if mode == "app-server" {
-            "native"
-        } else {
-            "queue"
-        }
-    );
+    assert_eq!(delivery["method"], "native");
     assert_eq!(delivery["acknowledgement"], "harness");
     let first = f.response(id, first).await;
     let mut a = f.attach(id);
@@ -315,7 +302,14 @@ trust_level = "trusted"
         row["native_session_id"].is_string(),
         "missing native session identity: {row}"
     );
-    f.call(&["restart", id, "--mode", "native"]);
+    assert!(
+        !f.command(&["restart", id, "--mode", "native"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    f.call(&["restart", id]);
     assert_eq!(
         f.response(id, third - 1).await,
         third,
@@ -331,6 +325,7 @@ trust_level = "trusted"
     f.response(id, third).await;
     let resumed = f.call(&["get", id]);
     assert_eq!(resumed["native_session_id"], row["native_session_id"]);
+    assert_eq!(resumed["pid"], row["pid"]);
     f.call(&["kill", id]);
     assert_eq!(f.call(&["get", id])["status"], "exited");
     api.abort();

@@ -19,7 +19,18 @@ impl Fixture {
             "claude", "codex", "reasonix", "kimi", "grok", "opencode", "pi", "agy", "omp",
         ] {
             let path = root.path().join("bin").join(bin);
-            std::fs::write(&path, FAKE).unwrap();
+            let script = if bin == "codex" {
+                let node = tower_pal::find_program("node", &tower_pal::environment())
+                    .expect("Node is required for Codex fixtures");
+                include_str!("fixtures/codex-host.mjs").replacen(
+                    "#!/usr/bin/env node",
+                    &format!("#!{}", node.display()),
+                    1,
+                )
+            } else {
+                FAKE.into()
+            };
+            std::fs::write(&path, script).unwrap();
             tower_pal::make_executable(&path).unwrap();
         }
         Self { root }
@@ -77,7 +88,7 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        for args in [["__pool", "stop"], ["daemon", "stop"]] {
+        for args in [["__pool", "stop"], ["__codex", "stop"], ["daemon", "stop"]] {
             let _ = self
                 .command(&["--no-start"])
                 .args(args)
@@ -118,10 +129,7 @@ fn all_nine_harnesses_report_state_survive_daemon_restart_and_resume() {
     for h in [
         "claude", "codex", "reasonix", "kimi", "grok", "opencode", "pi", "agy", "omp",
     ] {
-        let mut args = vec!["open", h, "--headless"];
-        if h == "codex" {
-            args.extend(["--mode", "native"]);
-        }
+        let args = vec!["open", h, "--headless"];
         let opened = f.call(&args);
         let id = opened["id"].as_str().unwrap().to_owned();
         let row = f.wait(&id, "idle");
@@ -153,7 +161,11 @@ fn all_nine_harnesses_report_state_survive_daemon_restart_and_resume() {
     for (id, pid, native) in &ids {
         f.call(&["restart", id]);
         let row = f.wait(id, "idle");
-        assert_ne!(&row["pid"], pid);
+        if row["harness"] == "codex" {
+            assert_eq!(&row["pid"], pid);
+        } else {
+            assert_ne!(&row["pid"], pid);
+        }
         assert_eq!(&row["native_session_id"], native);
         f.call(&["kill", id]);
         f.wait(id, "exited");
