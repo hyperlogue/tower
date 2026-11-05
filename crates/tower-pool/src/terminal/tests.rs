@@ -168,6 +168,64 @@ fn clipboard_queries_and_writes_are_blocked_before_the_client_stream() {
 }
 
 #[test]
+fn clipboard_sequence_variants_never_reach_the_client_stream() {
+    let long_csi = [b"\x1b[".as_slice(), &[b'1'; 600], b"\x1b]52;c;?\x07"].concat();
+    let long_osc = [b"\x1b]0;".as_slice(), &[b'x'; 600], b"\x1b]52;c;?\x07"].concat();
+    let long_number = [b"\x1b]".as_slice(), &[b'0'; 600], b"52;c;?\x07"].concat();
+    for seq in [
+        b"\x1b]052;c;?\x07".as_slice(),
+        b"\x1b]0000052;c;?\x1b\\",
+        b"\x1b]5522;type=read\x1b\\",
+        "\u{9d}52;c;?\x07".as_bytes(),
+        "\x1b]0;x\u{9c}\u{9d}52;c;?\x07".as_bytes(),
+        "\x1b[1\u{9d}52;c;?\x07".as_bytes(),
+        b"\x1bPtmux;\x1b\x1b]52;c;?\x07\x1b\\",
+        b"\x1bP\x1b]52;c;?\x07\x1b\\",
+        b"\x1b]0;title\x1b]52;c;?\x07",
+        b"\x1b\x1b]52;c;?\x07",
+        &long_csi,
+        &long_osc,
+        &long_number,
+    ] {
+        let mut whole = terminal();
+        let mut split = terminal();
+        let mut forwarded = whole.process(seq).bytes;
+        let mut pieces = Vec::new();
+        for byte in seq {
+            pieces.extend(split.process(&[*byte]).bytes);
+        }
+        forwarded.extend(whole.process(b"SAFE").bytes);
+        pieces.extend(split.process(b"SAFE").bytes);
+        for out in [&forwarded, &pieces] {
+            let text = String::from_utf8_lossy(out);
+            let clipboard = text.split("\x1b]").skip(1).any(|osc| {
+                let osc = osc.trim_start_matches('0');
+                osc.starts_with("52;") || osc.starts_with("5522;")
+            });
+            assert!(!clipboard, "{seq:?} forwarded {text:?}");
+            assert!(
+                !text.contains("\x1b\x1b")
+                    && !text.chars().any(|c| ('\u{80}'..='\u{9f}').contains(&c)),
+                "{seq:?} forwarded {text:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn ordinary_strings_and_text_still_reach_the_client_stream() {
+    let mut t = terminal();
+    let seq = "\x1b]0;tit✜le\x07\x1b]8;;https://x\x1b\\é\x1b]520;x\x07\x1bP$q m\x1b\\";
+    assert_eq!(t.process(seq.as_bytes()).bytes, seq.as_bytes());
+    let mut t = terminal();
+    let mut out = Vec::new();
+    for byte in seq.as_bytes() {
+        out.extend(t.process(&[*byte]).bytes);
+    }
+    assert_eq!(out, seq.as_bytes());
+}
+
+#[test]
 fn attach_during_split_string_terminator_keeps_live_stream_aligned() {
     let mut original = terminal();
     original.process(b"\x1bPq");
