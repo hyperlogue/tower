@@ -28,7 +28,7 @@ nix develop
 direnv allow
 
 cargo build --workspace --all-targets --locked
-cargo run --bin tower -- --help
+cargo run --bin tower-cli -- --help
 ```
 
 The .envrc follows captain-miao's parent-environment convention, using direnv's
@@ -57,8 +57,8 @@ terminal attachment or snapshot. Unknown protocols return `unsupported`.
 Unmanaged sessions can also carry protocol metadata:
 
 ```sh
-./target/debug/tower register --harness external-agent --protocol acp --cwd "$PWD"
-./target/debug/tower ls --protocol acp
+./target/debug/tower-cli register --harness external-agent --protocol acp --cwd "$PWD"
+./target/debug/tower-cli ls --protocol acp
 ```
 
 ## Session metadata and host metrics
@@ -66,10 +66,10 @@ Unmanaged sessions can also carry protocol metadata:
 Tags are shared session metadata. A `pinned` tag has no special lifecycle meaning:
 
 ```sh
-tower tags SESSION_ID --add pinned,review
-tower tags SESSION_ID --remove review
-tower attention clear SESSION_ID
-tower host metrics
+tower-cli tags SESSION_ID --add pinned,review
+tower-cli tags SESSION_ID --remove review
+tower-cli attention clear SESSION_ID
+tower-cli host metrics
 ```
 
 Tower sets `needs_attention` when observed work becomes idle, input or approval is
@@ -77,7 +77,7 @@ needed, or a session is lost or exits unexpectedly. Starting work and explicit
 acknowledgement clear it. Acknowledgement is an atomic update with no revision
 argument. Repeated observations and daemon restart do not re-arm an acknowledged
 transition. Tags and attention are available in `agent.get`, `agent.list`, local
-events, and `tower ls`. Metadata edits require local administrative authority.
+events, and `tower-cli ls`. Metadata edits require local administrative authority.
 These fields are not included in the existing Allgather status projection until
 an extension is negotiated.
 
@@ -100,10 +100,10 @@ Install Git on the Tower host and make it available on `PATH`.
 Register an existing working copy or bare repository, then use checkout IDs:
 
 ```sh
-tower checkout register "$PWD"
-tower checkout list
-tower vcs status CHECKOUT_ID
-tower open codex --checkout CHECKOUT_ID
+tower-cli checkout register "$PWD"
+tower-cli checkout list
+tower-cli vcs status CHECKOUT_ID
+tower-cli open codex --checkout CHECKOUT_ID
 ```
 
 Registration discovers linked worktrees too. Bare storage is not a checkout; it
@@ -114,30 +114,30 @@ need a filesystem checkout.
 
 If a local remote matches exactly one catalog repository or an approved alias,
 Tower associates it automatically. SSH usernames are part of remote identity.
-Use `tower checkout bind CHECKOUT_ID REPOSITORY_ID` to select a matching repository
-explicitly, or `tower checkout unbind CHECKOUT_ID` to keep it local. Repositories
+Use `tower-cli checkout bind CHECKOUT_ID REPOSITORY_ID` to select a matching repository
+explicitly, or `tower-cli checkout unbind CHECKOUT_ID` to keep it local. Repositories
 without a published upstream URL can be bound explicitly. Binding does not clone
-files or change Git configuration. `tower catalog` shows the cached catalog and
+files or change Git configuration. `tower-cli catalog` shows the cached catalog and
 whether it is current. An unavailable checkout can be removed from Tower metadata
-with `tower checkout forget CHECKOUT_ID`; this does not delete files.
+with `tower-cli checkout forget CHECKOUT_ID`; this does not delete files.
 
 VCS mutations use a reviewed plan followed by execution:
 
 ```sh
-tower vcs prepare CHECKOUT_ID checkout.create --options \
+tower-cli vcs prepare CHECKOUT_ID checkout.create --options \
   '{"name":"feature","target":{"kind":"new_branch","branch":"feature"}}'
-tower vcs execute PLAN_ID --wait
-tower vcs operation PLAN_ID
+tower-cli vcs execute PLAN_ID --wait
+tower-cli vcs operation PLAN_ID
 
 # Other operations use the same prepare/execute flow.
-tower vcs prepare CHECKOUT_ID checkout.move --options '{"name":"renamed"}'
-tower vcs prepare CHECKOUT_ID checkout.remove
-tower vcs prepare CHECKOUT_ID checkout.repair --options '{"name":"moved-externally"}'
-tower vcs prepare CHECKOUT_ID push
-tower vcs prepare CHECKOUT_ID pull
+tower-cli vcs prepare CHECKOUT_ID checkout.move --options '{"name":"renamed"}'
+tower-cli vcs prepare CHECKOUT_ID checkout.remove
+tower-cli vcs prepare CHECKOUT_ID checkout.repair --options '{"name":"moved-externally"}'
+tower-cli vcs prepare CHECKOUT_ID push
+tower-cli vcs prepare CHECKOUT_ID pull
 
 # Prepare a first working copy from bare storage.
-tower checkout register /path/to/repository.git --create \
+tower-cli checkout register /path/to/repository.git --create \
   '{"name":"first","target":{"kind":"detached","revision":"HEAD"}}'
 ```
 
@@ -167,7 +167,7 @@ checkout observations may still be catching up. Repeating execution of the same
 plan returns its retained receipt. Interrupted operations with uncertain effects
 stay `unknown` and are not retried. They reserve the repository until an
 administrator inspects Git state and any remaining processes, then runs
-`tower vcs release PLAN_ID --yes`. Release preserves the unknown outcome.
+`tower-cli vcs release PLAN_ID --yes`. Release preserves the unknown outcome.
 
 Allgather receives machine-scoped checkout observations, not Git contents or
 credentials. Catalog and checkout updates use acknowledged deltas when smaller,
@@ -178,23 +178,26 @@ Logout clears remote associations and preserves local checkout IDs and files.
 
 ## Managed terminal sessions
 
-Install or copy the single `tower` executable. It starts separate daemon and pool
-processes from the same executable. Install the desired agent CLIs on `PATH`:
+Install `tower`, `tower-cli`, and `tower-terminal-pool` together in one directory.
+`tower` runs the server, `tower-cli` runs client commands, and
+`tower-terminal-pool` hosts terminal sessions. Autostart resolves companions
+beside the running executable; it does not search an agent’s `PATH` for them.
+Install the desired agent CLIs on `PATH`:
 
 ```sh
-./target/debug/tower agents supported
-./target/debug/tower open claude --cwd "$PWD"
-./target/debug/tower open codex --cwd "$PWD"
-./target/debug/tower attach SESSION_ID
-./target/debug/tower snapshot SESSION_ID --json
-./target/debug/tower restart SESSION_ID
-./target/debug/tower kill SESSION_ID
-./target/debug/tower agents resumable
-./target/debug/tower agents conversations --harness claude
-./target/debug/tower open claude --resume NATIVE_SESSION_ID
-./target/debug/tower open codex --resume NATIVE_SESSION_ID --fork
-./target/debug/tower resume SESSION_ID
-./target/debug/tower events
+./target/debug/tower-cli agents supported
+./target/debug/tower-cli open claude --cwd "$PWD"
+./target/debug/tower-cli open codex --cwd "$PWD"
+./target/debug/tower-cli attach SESSION_ID
+./target/debug/tower-cli snapshot SESSION_ID --json
+./target/debug/tower-cli restart SESSION_ID
+./target/debug/tower-cli kill SESSION_ID
+./target/debug/tower-cli agents resumable
+./target/debug/tower-cli agents conversations --harness claude
+./target/debug/tower-cli open claude --resume NATIVE_SESSION_ID
+./target/debug/tower-cli open codex --resume NATIVE_SESSION_ID --fork
+./target/debug/tower-cli resume SESSION_ID
+./target/debug/tower-cli events
 ```
 
 Interactive `open` attaches immediately. Use `--headless` to start at 80 columns
@@ -205,10 +208,11 @@ until its first attach. Use `--` before arguments intended for the agent. Aliase
 Press Ctrl-Space, then Ctrl-Q to detach. Kitty keyboard encodings are supported.
 Several clients can attach and type; the PTY uses the smallest row and column
 counts. A slow reader is disconnected when its output queue fills. Detach and
-`tower daemon stop` leave the agent running. For manual cleanup, the internal
-`tower __pool stop` command stops the pool and its sessions. Service managers can
-run the pool separately with `tower __pool run`. These internal commands are
-hidden from normal help.
+`tower-cli daemon stop` leave the agent running. `tower-cli daemon start` starts the server explicitly; `tower run` runs it in
+the foreground. For manual cleanup, `tower-terminal-pool stop` stops the pool
+and its sessions. Service managers can run it with `tower-terminal-pool run`.
+The generated jobs are `tower` and `tower-terminal-pool` and have separate
+lifetimes.
 
 Snapshots contain reconstructed ANSI text, with a `truncated` flag for discarded
 history and a `limited` flag for unsupported terminal behavior. The current bounds
@@ -223,12 +227,12 @@ the computer that owns the clipboard. For example, with a local Wayland desktop:
 
 ```sh
 mkdir -p "$XDG_RUNTIME_DIR/tower-clipboard"
-tower clipboard provide --name desktop \
+tower-cli clipboard provide --name desktop \
   --credentials "$XDG_RUNTIME_DIR/tower-clipboard/client.json" \
   -- wl-paste --type image/png
 # In another terminal, while the provider is running:
-tower attach SESSION_ID --clipboard "$XDG_RUNTIME_DIR/tower-clipboard/client.json"
-tower clipboard status SESSION_ID
+tower-cli attach SESSION_ID --clipboard "$XDG_RUNTIME_DIR/tower-clipboard/client.json"
+tower-cli clipboard status SESSION_ID
 ```
 
 The reader command writes PNG bytes to stdout. `--format image/bmp` selects BMP;
@@ -248,7 +252,7 @@ Other backends reject clipboard attachment until they implement it.
 
 For an SSH frontend, `session.attach_info` accepts `client_id` and `client_token`
 and returns a one-use, 60-second ticket in `clipboard`. Pass that object to
-`tower attach SESSION_ID --clipboard-stdin`. On a PTY, wait for
+`tower-cli attach SESSION_ID --clipboard-stdin`. On a PTY, wait for
 `tower: ready for clipboard credential`, then write one JSON line. Tower disables
 echo before this marker. Credentials and tickets must not appear in command
 arguments. A provider credential object also works with this flag.
@@ -325,61 +329,61 @@ file in its native home; the hooks are inactive outside managed sessions.
 After `cargo build --workspace --locked`, run:
 
 ```sh
-./target/debug/tower daemon status
-./target/debug/tower register --harness demo --session-id demo --cwd "$PWD"
-./target/debug/tower ls
-./target/debug/tower rules ls
-./target/debug/tower daemon stop
+./target/debug/tower-cli daemon status
+./target/debug/tower-cli register --harness demo --session-id demo --cwd "$PWD"
+./target/debug/tower-cli ls
+./target/debug/tower-cli rules ls
+./target/debug/tower-cli daemon stop
 ```
 
 Registration prints a session ID and a private token. Set `TOWER_AGENT_ID` and
 `TOWER_AGENT_TOKEN` to those values in the reporting process. It can then run
-`tower status --state working --seq 1`, `tower heartbeat`, or `tower unregister`.
+`tower-cli status --state working --seq 1`, `tower-cli heartbeat`, or `tower-cli unregister`.
 Increase the sequence for each status update. Without a PID, send a heartbeat
 at least once per minute. The daemon marks the session lost after three minutes
 without a report. Registered sessions have weak trust; the token authenticates
-subsequent reports. `tower ls --all` also shows retained ended sessions.
+subsequent reports. `tower-cli ls --all` also shows retained ended sessions.
 Use `--shared-process` when several registered sessions share a process. Tower
 will not infer a sender from that PID or signal the shared process to kill one session.
 
 Commands start the daemon when needed. `--no-start` disables this behavior.
-`tower daemon run` runs in the foreground for a service manager. Automatic startup
+`tower run` runs in the foreground for a service manager. Automatic startup
 uses an existing tower systemd or launchd job when present; otherwise it detaches.
 Install independent daemon and pool jobs for persistent server operation:
 
 ```sh
-tower daemon install
+tower-cli daemon install
 # Linux: enable startup without an interactive login.
 loginctl enable-linger "$USER"
 ```
 
 Installation enables future user-session startup without stopping current agents.
 On macOS, launchd jobs start at login. Use `--write-only` to generate service files
-for manual setup. `tower daemon uninstall` removes future startup configuration;
+for manual setup. `tower-cli daemon uninstall` removes future startup configuration;
 it does not stop current sessions. Detached fallback processes can still belong
 to their caller's service-manager cgroup. Use the installed jobs on an SSH server.
 
-Use `--json` for structured output. `tower rpc METHOD JSON` calls an implemented
+Use `--json` for structured output. `tower-cli rpc METHOD JSON` calls an implemented
 method directly. Local runtime notes are in `workspace/docs/RUNTIME.md` when
 available in the checkout.
 
 ## Messages and external sessions
 
 ```sh
-tower send SESSION_ID 'Review the failing test.'
-printf '%s' 'Review the failing test.' | tower send SESSION_ID --stdin
-tower approve APPROVAL_ID
-tower approve APPROVAL_ID --once
-tower approve APPROVAL_ID --deny
-tower approval status APPROVAL_ID
-tower approval watch APPROVAL_ID --timeout-s 600
-tower rules add --from 'harness:codex' --to 'cwd:~/work/project' --action allow
-tower hooks install claude
-tower hooks install codex --scope project
-tower mcp install claude
-tower mcp install codex
-tower run claude -- --model sonnet
-tower kill REGISTERED_ID --yes
+tower-cli send SESSION_ID 'Review the failing test.'
+printf '%s' 'Review the failing test.' | tower-cli send SESSION_ID --stdin
+tower-cli approve APPROVAL_ID
+tower-cli approve APPROVAL_ID --once
+tower-cli approve APPROVAL_ID --deny
+tower-cli approval status APPROVAL_ID
+tower-cli approval watch APPROVAL_ID --timeout-s 600
+tower-cli rules add --from 'harness:codex' --to 'cwd:~/work/project' --action allow
+tower-cli hooks install claude
+tower-cli hooks install codex --scope project
+tower-cli mcp install claude
+tower-cli mcp install codex
+tower-cli run claude -- --model sonnet
+tower-cli kill REGISTERED_ID --yes
 ```
 
 Agents require approval for a new messaging relationship unless an allow rule
@@ -422,12 +426,12 @@ interval_s = 10
 The scanner skips managed-process ownership markers. Scan-only records cannot
 receive messages until registration establishes a delivery channel. Installed
 hooks report external Claude/Codex state. Codex requires native hook trust review.
-`tower run` uses the current terminal and registers the process without starting a
-pool. Codex requires `tower open codex`, which uses the shared app-server.
+`tower-cli run` uses the current terminal and registers the process without starting a
+pool. Codex requires `tower-cli open codex`, which uses the shared app-server.
 
-`tower mcp` serves the seven agent tools over stdio. Managed Claude/Codex sessions
+`tower-cli mcp` serves the seven agent tools over stdio. Managed Claude/Codex sessions
 receive its configuration automatically. External installations can be removed
-with `tower mcp uninstall HARNESS` and `tower hooks uninstall HARNESS`.
+with `tower-cli mcp uninstall HARNESS` and `tower-cli hooks uninstall HARNESS`.
 
 ## HTTP and event sinks
 
@@ -465,7 +469,7 @@ retry delivery. Webhooks require HTTPS except on loopback.
 Start enrollment from the machine that will run the agents:
 
 ```sh
-tower login https://allgather.example
+tower-cli login https://allgather.example
 ```
 
 Open the printed URL, authorize the machine, and optionally set its name. The CLI
@@ -474,12 +478,12 @@ the browser does not need to run on the agent machine. Use `--name NAME` to sugg
 a name or `--read-only` to request only the read scope.
 
 ```sh
-tower rpc allgather.status
-tower logout
+tower-cli rpc allgather.status
+tower-cli logout
 ```
 
 For automated provisioning, an Allgather owner can issue a machine key with
-`POST /api/tower/credentials`. Supply it with `tower login https://allgather.example
+`POST /api/tower/credentials`. Supply it with `tower-cli login https://allgather.example
 --key-stdin`. Browser-account and CLI OAuth tokens are separate credentials.
 
 Explicit configuration can restrict the scopes requested during enrollment:
@@ -507,7 +511,7 @@ Remote messages still require local approval or an allow rule. For example, an
 administrator can permit Allgather messages to Codex sessions with:
 
 ```sh
-tower rules add --from allgather --to 'harness:codex' --action allow
+tower-cli rules add --from allgather --to 'harness:codex' --action allow
 ```
 
 Session synchronization sends changed fields and removals when both peers support
@@ -568,8 +572,8 @@ With an adjacent Allgather checkout and its dependencies installed, use its pinn
 environment to run the real integration checks against the local Tower build:
 
 ```sh
-ALLGATHER_TEST_TOWER="$PWD/target/debug/tower" nix develop ../allgather --no-write-lock-file -c bun --no-env-file ../allgather/scripts/verify-tower.ts
-ALLGATHER_TEST_TOWER="$PWD/target/debug/tower" nix develop ../allgather --no-write-lock-file -c bun --no-env-file ../allgather/scripts/verify-tower-managed.ts
+ALLGATHER_TEST_TOWER="$PWD/target/debug/tower-cli" nix develop ../allgather --no-write-lock-file -c bun --no-env-file ../allgather/scripts/verify-tower.ts
+ALLGATHER_TEST_TOWER="$PWD/target/debug/tower-cli" nix develop ../allgather --no-write-lock-file -c bun --no-env-file ../allgather/scripts/verify-tower-managed.ts
 ```
 
 ## Checks
@@ -593,9 +597,9 @@ bash -n .envrc
 daemon build with terminal support disabled.
 The Linux CI lint job runs this check. The development shell places Cargo output
 in the repository's `target/` directory, including when entered from a subdirectory.
-`nix build` produces one executable, `tower`; installation checks enforce this.
-The towerd and tower-pool libraries run in separate processes through their
-respective entry points. When updating the compiler, keep flake.lock,
+`nix build` produces `tower`, `tower-cli`, and `tower-terminal-pool` in one
+package; installation checks enforce the complete bundle. Nix uses `tower-cli`
+as its default program. The server and pool run through their own entrypoints. When updating the compiler, keep flake.lock,
 rust-toolchain.toml, and the workspace rust-version aligned. CI checks that the
 Fenix and rustup pins agree.
 
@@ -628,7 +632,7 @@ status and daemon restart while the real agent waits for its next response.
 
 ```sh
 nix develop
-cargo build --bin tower --locked
+cargo build --workspace --bins --locked
 TRACETAPE_ROOT=../tracetape bash scripts/test-e2e.sh
 ```
 
@@ -645,14 +649,16 @@ CLIs or the unpublished Tracetape checkout.
 | `tower-protocol` | Public local API types; serde-only, published after the initial contract is ready |
 | `tower-pal` | Platform terminal, IPC, process, and lifecycle operations |
 | `tower-pool-proto` | Internal pool control and attach protocol |
-| `tower-pool` | Terminal pool library, hosted in an independent tower process |
+| `tower-pool` | Terminal pool library, hosted by tower-terminal-pool |
 | `tower-store` | Local persistence, backend bindings, policy snapshots, and synchronization state |
 | `tower-sessions` | Managed backend contract and optional capability interfaces |
 | `tower-terminal` | Terminal backend, launcher supervision, Codex relay, and attach client |
 | `tower-agents` | Launchers, hooks, and resume adapters for nine harnesses |
 | `tower-runtime` | Independent structured runtime owner, native adapters, receipts, and transcript journal |
 | `towerd` | Registry, managed backends, authorization, rules, and events |
-| `tower` | CLI, daemon/pool/supervisor entry points, and hooks |
+| `tower-clipboard` | Image provider, transfer broker, and native helper shims |
+| `tower-vcs` | Checked Git/worktree discovery and operations |
+| `tower` | Separate tower, tower-cli, and tower-terminal-pool executable entrypoints |
 
 Publication is disabled during bootstrap. The tower workspace package and binary
 name do not imply ownership of the existing crates.io name. Project code uses

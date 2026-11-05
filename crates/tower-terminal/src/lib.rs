@@ -731,7 +731,8 @@ impl ManagedBackend for TerminalBackend {
         let launch = Launch {
             name: binding.name.clone(),
             argv: vec![
-                tower_pal::executable()
+                tower_pal::Program::Cli
+                    .path()
                     .map_err(|_| error("internal_error", "Cannot find Tower executable"))?
                     .to_string_lossy()
                     .into_owned(),

@@ -5,6 +5,8 @@ use std::{
     path::{Path, PathBuf},
 };
 #[cfg(unix)]
+mod program;
+pub use program::Program;
 mod unix;
 #[cfg(unix)]
 pub use unix::*;

@@ -5,7 +5,21 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Command-line, MCP, and hook entry points for tower."
+description = "Server, CLI, and terminal pool entry points for Tower."
+autobins = false
+default-run = "tower-cli"
+
+[[bin]]
+name = "tower"
+path = "src/server.rs"
+
+[[bin]]
+name = "tower-cli"
+path = "src/main.rs"
+
+[[bin]]
+name = "tower-terminal-pool"
+path = "src/terminal_pool.rs"
 
 [lints]
 workspace = true

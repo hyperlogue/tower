@@ -16,7 +16,7 @@ impl Fixture {
         Self { root }
     }
     fn command(&self, args: &[&str]) -> Command {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_tower"));
+        let mut c = Command::new(env!("CARGO_BIN_EXE_tower-cli"));
         c.args(args)
             .env_clear()
             .env("HOME", self.root.path())

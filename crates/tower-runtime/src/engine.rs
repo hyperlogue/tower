@@ -458,7 +458,7 @@ async fn run_inner(
     authorize(paths, b, &launch).await?;
     let env = tower_agents::environment::project_environment(
         std::path::Path::new(&b.cwd),
-        &tower_pal::executable().map_err(internal)?,
+        &tower_pal::Program::Cli.path().map_err(internal)?,
         tower_pal::environment(),
     )
     .await
@@ -567,7 +567,8 @@ async fn run_inner(
         prepared
     } else {
         let argv = vec![
-            tower_pal::executable()
+            tower_pal::Program::Server
+                .path()
                 .map_err(internal)?
                 .to_string_lossy()
                 .into_owned(),
@@ -795,7 +796,7 @@ async fn prepare_codex(
     let mut config = json!({"thread_unload_delay_secs":0});
     tower_agents::codex_environment::prepare(
         &root,
-        &tower_pal::executable().map_err(internal)?,
+        &tower_pal::Program::Cli.path().map_err(internal)?,
         env,
         &base["config"],
         &mut config,

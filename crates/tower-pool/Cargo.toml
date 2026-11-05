@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Independent terminal pool runtime hosted by the tower executable."
+description = "Independent terminal pool runtime for tower-terminal-pool."
 autobins = false
 
 [lints]

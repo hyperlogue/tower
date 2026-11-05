@@ -16,7 +16,10 @@ struct Fixture {
 }
 impl Fixture {
     fn command(&self, args: &[&str]) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_tower"));
+        self.program(env!("CARGO_BIN_EXE_tower-cli"), args)
+    }
+    fn program(&self, binary: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> Command {
+        let mut command = Command::new(binary);
         command
             .args(args)
             .env_clear()
@@ -37,10 +40,12 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        for args in [["__pool", "stop"], ["daemon", "stop"]] {
+        for (binary, args) in [
+            (env!("CARGO_BIN_EXE_tower-terminal-pool"), &["stop"][..]),
+            (env!("CARGO_BIN_EXE_tower-cli"), &["daemon", "stop"][..]),
+        ] {
             let _ = self
-                .command(&["--no-start"])
-                .args(args)
+                .program(binary, args)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();

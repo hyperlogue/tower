@@ -222,7 +222,7 @@ async fn serve(
     if token.is_empty() {
         return Err(io::Error::other("empty credential"));
     }
-    let exe = tower_pal::executable()?;
+    let exe = tower_pal::Program::Cli.path()?;
     let mut env =
         project_environment(Path::new(&plan.spec.cwd), &exe, tower_pal::environment()).await?;
     let native_home = if plan.spec.harness == Harness::Codex {

@@ -68,7 +68,7 @@ impl Native {
             .collect()
         };
         if harness == "claude-code" {
-            argv.extend(["--mcp-config".into(),json!({"mcpServers":{"tower":{"command":tower_pal::executable().map_err(internal)?,"args":["mcp"]}}}).to_string()]);
+            argv.extend(["--mcp-config".into(),json!({"mcpServers":{"tower":{"command":tower_pal::Program::Cli.path().map_err(internal)?,"args":["mcp"]}}}).to_string()]);
             argv.extend([
                 if resume { "--resume" } else { "--session-id" }.into(),
                 native_id.into(),

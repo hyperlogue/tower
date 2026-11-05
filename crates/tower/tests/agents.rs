@@ -36,7 +36,10 @@ impl Fixture {
         Self { root }
     }
     fn command(&self, args: &[&str]) -> Command {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_tower"));
+        self.program(env!("CARGO_BIN_EXE_tower-cli"), args)
+    }
+    fn program(&self, binary: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> Command {
+        let mut c = Command::new(binary);
         c.args(args)
             .env_clear()
             .env("HOME", self.root.path())
@@ -51,7 +54,7 @@ impl Fixture {
                     std::env::var("PATH").unwrap()
                 ),
             )
-            .env("TOWER_TEST_BIN", env!("CARGO_BIN_EXE_tower"))
+            .env("TOWER_TEST_BIN", env!("CARGO_BIN_EXE_tower-cli"))
             .env("TOKIO_WORKER_THREADS", "2")
             .env("TERM", "xterm-256color")
             .current_dir(self.root.path());
@@ -88,10 +91,13 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        for args in [["__pool", "stop"], ["__codex", "stop"], ["daemon", "stop"]] {
+        for (binary, args) in [
+            (env!("CARGO_BIN_EXE_tower-terminal-pool"), &["stop"][..]),
+            (env!("CARGO_BIN_EXE_tower"), &["__codex", "stop"][..]),
+            (env!("CARGO_BIN_EXE_tower-cli"), &["daemon", "stop"][..]),
+        ] {
             let _ = self
-                .command(&["--no-start"])
-                .args(args)
+                .program(binary, args)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
@@ -300,7 +306,12 @@ fn pool_crash_recovers_native_conversations_but_never_reopens_killed_sessions() 
             .contains("--resume\nnative-claude-code")
     );
     f.call(&["kill", id]);
-    assert!(f.command(&["__pool", "stop"]).status().unwrap().success());
+    assert!(
+        f.program(env!("CARGO_BIN_EXE_tower-terminal-pool"), &["stop"])
+            .status()
+            .unwrap()
+            .success()
+    );
     f.call(&["daemon", "stop"]);
     assert_eq!(f.call(&["get", id])["status"], "exited");
     assert_eq!(

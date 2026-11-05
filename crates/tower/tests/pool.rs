@@ -18,8 +18,8 @@ impl Pool {
             .prefix("tp-")
             .tempdir_in("/tmp")
             .unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_tower"))
-            .args(["__pool", "run"])
+        let child = Command::new(env!("CARGO_BIN_EXE_tower-terminal-pool"))
+            .args(["run"])
             .env("HOME", dir.path())
             .env("XDG_STATE_HOME", dir.path())
             .env("TOKIO_WORKER_THREADS", "2")
@@ -402,11 +402,11 @@ fn a_child_that_does_not_read_input_cannot_block_kill_or_other_clients() {
 }
 
 #[test]
-fn internal_pool_commands_run_and_stop_without_a_daemon() {
+fn pool_binary_runs_and_stops_without_a_daemon() {
     let mut p = Pool::new();
     assert!(!p.dir.path().join("tower/run/towerd.sock").exists());
-    let duplicate = Command::new(env!("CARGO_BIN_EXE_tower"))
-        .args(["__pool", "run"])
+    let duplicate = Command::new(env!("CARGO_BIN_EXE_tower-terminal-pool"))
+        .args(["run"])
         .env("HOME", p.dir.path())
         .env("XDG_STATE_HOME", p.dir.path())
         .env("TOKIO_WORKER_THREADS", "2")
@@ -415,8 +415,8 @@ fn internal_pool_commands_run_and_stop_without_a_daemon() {
         .unwrap();
     assert!(!duplicate.status.success());
     assert!(p.list().is_empty());
-    let stop = Command::new(env!("CARGO_BIN_EXE_tower"))
-        .args(["__pool", "stop"])
+    let stop = Command::new(env!("CARGO_BIN_EXE_tower-terminal-pool"))
+        .args(["stop"])
         .env("HOME", p.dir.path())
         .env("XDG_STATE_HOME", p.dir.path())
         .env_remove("TOWER_SOCKET")

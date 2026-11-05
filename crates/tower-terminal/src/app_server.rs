@@ -164,7 +164,7 @@ pub async fn start(
         cwd: PathBuf::from(&plan.spec.cwd),
         env: invocation.env.clone(),
         generation: plan.generation.clone(),
-        executable: tower_pal::executable()?,
+        executable: tower_pal::Program::Cli.path()?,
     });
     let (messages, mut submissions) = mpsc::channel::<Submission>(16);
     let relay_shared = shared.clone();

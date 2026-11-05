@@ -56,10 +56,12 @@
         tower = craneLib.buildPackage (commonArgs
           // {
             inherit cargoArtifacts;
-            meta.mainProgram = "tower";
+            meta.mainProgram = "tower-cli";
             postInstall = ''
-              test -x "$out/bin/tower"
-              test "$(ls -A "$out/bin")" = tower
+              for program in tower tower-cli tower-terminal-pool; do
+                test -x "$out/bin/$program"
+              done
+              test "$(ls -A "$out/bin" | wc -l)" -eq 3
               install -Dm644 LICENSE-MIT "$out/share/licenses/tower/LICENSE-MIT"
               install -Dm644 LICENSE-APACHE "$out/share/licenses/tower/LICENSE-APACHE"
               install -Dm644 LICENSE-CAPTAIN-MIAO "$out/share/licenses/tower/LICENSE-CAPTAIN-MIAO"

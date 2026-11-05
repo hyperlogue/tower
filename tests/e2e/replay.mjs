@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { mkdtemp, mkdir, readFile, writeFile, rm, symlink } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { networkInterfaces } from "node:os";
 import { pathToFileURL } from "node:url";
 
@@ -12,6 +12,8 @@ const root = await mkdtemp("/tmp/tower-replay-");
 const tapeRoot = resolve(process.env.TRACETAPE_ROOT);
 const { startRecorder, startReplay, loadCassette, defaultNormalization } = await import(pathToFileURL(join(tapeRoot, "src/index.ts")));
 const tower = resolve(process.env.TOWER_TEST_BIN);
+const server = join(dirname(tower), "tower");
+const pool = join(dirname(tower), "tower-terminal-pool");
 const prompt = "Copy input.txt to artifact.txt, then report done.";
 const command = "cat input.txt > artifact.txt; cat artifact.txt";
 const models = { claude: "claude-sonnet-4-6", codex: "gpt-5.3-codex" };
@@ -76,7 +78,7 @@ async function fixture(agent, name, content = "fixture-value\n") {
   return {
     dir, home, work, env, bindings, rpc,
     async close() {
-      for (const args of [["__pool", "stop"], ["daemon", "stop"]]) await subprocess(tower, ["--no-start", ...args], env, work).catch(() => {});
+      for (const [binary, args] of [[pool, ["stop"]], [server, ["__codex", "stop"]], [tower, ["--no-start", "daemon", "stop"]]]) await subprocess(binary, args, env, work).catch(() => {});
     },
     async launch(url) {
       if (agent === "codex") await writeFile(join(home, ".codex/config.toml"), [

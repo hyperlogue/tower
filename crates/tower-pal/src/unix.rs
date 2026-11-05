@@ -312,13 +312,13 @@ pub fn ignore_hangup() -> io::Result<()> {
 }
 /// Called before starting any runtime threads.
 pub fn detach(paths: &Paths) -> io::Result<()> {
-    detach_log(paths, "towerd.log")
+    detach_log(paths, "tower.log")
 }
 pub fn detach_codex_host(paths: &Paths) -> io::Result<()> {
     detach_log(paths, "codex-host.log")
 }
 pub fn start_codex_host() -> io::Result<()> {
-    let mut command = Command::new(super::executable()?);
+    let mut command = Command::new(super::Program::Server.path()?);
     command.args(["__codex", "run", "--detach"]);
     start_background(command)
 }
@@ -326,7 +326,7 @@ pub fn detach_runtime(paths: &Paths) -> io::Result<()> {
     detach_log(paths, "runtime.log")
 }
 pub fn start_runtime() -> io::Result<()> {
-    let mut command = Command::new(super::executable()?);
+    let mut command = Command::new(super::Program::Server.path()?);
     command.args(["__runtime", "run", "--detach"]);
     start_background(command)
 }
@@ -367,7 +367,7 @@ pub fn connect_blocking(path: &Path) -> io::Result<BlockingIpcStream> {
 
 #[cfg(feature = "terminal")]
 pub fn start_pool() -> io::Result<()> {
-    start_service(&Paths::discover()?, "tower-pool", "__pool")
+    start_service(&Paths::discover()?, super::Program::TerminalPool)
 }
 pub async fn shutdown_signal() -> io::Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
@@ -379,9 +379,10 @@ pub async fn shutdown_signal() -> io::Result<()> {
 
 /// Prefer installed jobs. A fallback is detached from the terminal, not its cgroup.
 pub fn start_daemon(paths: &Paths) -> io::Result<()> {
-    start_service(paths, "towerd", "daemon")
+    start_service(paths, super::Program::Server)
 }
-fn start_service(paths: &Paths, name: &str, entry: &str) -> io::Result<()> {
+fn start_service(paths: &Paths, program: super::Program) -> io::Result<()> {
+    let name = program.name();
     let unit = format!("{name}.service");
     let job = format!("io.tower.{name}");
     let command = if cfg!(target_os = "linux")
@@ -401,13 +402,16 @@ fn start_service(paths: &Paths, name: &str, entry: &str) -> io::Result<()> {
         command.args(["kickstart", &format!("gui/{}/{job}", uid())]);
         command
     } else {
-        let mut command = Command::new(super::executable()?);
-        command.args([entry, "run", "--detach"]);
+        let mut command = Command::new(program.path()?);
+        command.args(["run", "--detach"]);
         command
     };
     start_background(command)
 }
 fn start_background(mut command: Command) -> io::Result<()> {
+    let program = std::path::Path::new(command.get_program())
+        .file_name()
+        .map(|s| s.to_owned());
     let status = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -418,7 +422,15 @@ fn start_background(mut command: Command) -> io::Result<()> {
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("CODEX_THREAD_ID")
         .env_remove("CODEX_SESSION_ID")
-        .status()?;
+        .status()
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound && program.as_ref().is_some_and(|name| {
+                [super::Program::Server, super::Program::Cli, super::Program::TerminalPool]
+                    .iter().any(|p| name == p.name())
+            }) {
+                io::Error::new(error.kind(), "Missing Tower companion. Install tower, tower-cli, and tower-terminal-pool together in one directory.")
+            } else { error }
+        })?;
     if status.success() {
         Ok(())
     } else {

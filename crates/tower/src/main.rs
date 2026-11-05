@@ -1,4 +1,4 @@
-//! Human and program entry points, including separate daemon and pool processes.
+//! CLI, MCP, hook, and per-session launcher entry points.
 use clap::{Args, Parser, Subcommand};
 use std::process::ExitCode;
 use tower_pal::Paths;
@@ -24,23 +24,9 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
-    #[command(name = "__runtime", hide = true)]
-    Runtime {
-        #[command(subcommand)]
-        command: PoolCommand,
-    },
-    #[command(name = "__codex", hide = true)]
-    CodexHost {
-        #[command(subcommand)]
-        command: PoolCommand,
-    },
     #[command(name = "__session-mcp", hide = true)]
     SessionMcp {
         context: std::path::PathBuf,
-    },
-    #[command(name = "__acp", hide = true)]
-    Acp {
-        harness: String,
     },
     #[command(name = "__agent", hide = true)]
     Agent {
@@ -51,11 +37,6 @@ enum Command {
     Hook {
         harness: String,
         event: String,
-    },
-    #[command(name = "__pool", hide = true)]
-    Pool {
-        #[command(subcommand)]
-        command: PoolCommand,
     },
     Run {
         harness: String,
@@ -288,14 +269,6 @@ enum HostCommand {
     Metrics,
 }
 #[derive(Subcommand)]
-enum PoolCommand {
-    Run {
-        #[arg(long)]
-        detach: bool,
-    },
-    Stop,
-}
-#[derive(Subcommand)]
 enum AgentCommand {
     Run { plan: std::path::PathBuf },
     Env,
@@ -313,11 +286,8 @@ enum DaemonCommand {
         )]
         write_only: bool,
     },
-    /// Run the daemon in the foreground (for a service manager), or detach.
-    Run {
-        #[arg(long)]
-        detach: bool,
-    },
+    /// Start the server if needed and report its status.
+    Start,
     Status,
     Stop,
 }
@@ -492,7 +462,7 @@ fn main() -> ExitCode {
                 if json {
                     println!("{}", serde_json::json!({"error":error}));
                 } else {
-                    eprintln!("tower: {error}");
+                    eprintln!("tower-cli: {error}");
                     if let Some(Value::Array(ids)) = error.data.details.get("candidates") {
                         for id in ids {
                             if let Value::String(id) = id {
@@ -502,7 +472,7 @@ fn main() -> ExitCode {
                     }
                 }
             } else {
-                eprintln!("tower: {e}");
+                eprintln!("tower-cli: {e}");
             }
             ExitCode::FAILURE
         }
@@ -567,99 +537,6 @@ fn execute(cli: Cli) -> Result<()> {
             .enable_all()
             .build()?
             .block_on(mcp::serve(paths, credentials.caller_context(), true))?;
-        return Ok(());
-    }
-    if let Command::CodexHost { command } = &cli.command {
-        if matches!(command, PoolCommand::Run { detach: true }) {
-            tower_pal::detach_codex_host(&paths)?;
-        }
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()?;
-        match command {
-            PoolCommand::Run { .. } => runtime.block_on(tower_agents::codex_host::run(paths))?,
-            PoolCommand::Stop => runtime.block_on(tower_agents::codex_host::stop(&paths))?,
-        }
-        return Ok(());
-    }
-    if let Command::Acp { harness } = &cli.command {
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()?
-            .block_on(tower_runtime::bridge::run(harness))?;
-        return Ok(());
-    }
-    if let Command::Runtime { command } = &cli.command {
-        match command {
-            PoolCommand::Run { detach } => {
-                if *detach {
-                    tower_pal::detach_runtime(&paths)?;
-                }
-                tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()?
-                    .block_on(tower_runtime::run(paths))?;
-            }
-            PoolCommand::Stop => tower_runtime::Client::new(paths).shutdown()?,
-        }
-        return Ok(());
-    }
-    if let Command::Pool { command } = &cli.command {
-        match command {
-            PoolCommand::Run { detach } => {
-                if *detach {
-                    tower_pal::detach_pool(&paths)?;
-                }
-                tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()?
-                    .block_on(tower_pool::run(paths))?;
-            }
-            PoolCommand::Stop => {
-                let mut stream = tower_pal::connect_blocking(&paths.pool_socket())?;
-                tower_pool_proto::hello_sync(&mut stream)?;
-                tower_pool_proto::write_sync(&mut stream, &tower_pool_proto::Request::Shutdown)?;
-                tower_pool_proto::read_sync(&mut stream)?
-                    .json::<tower_pool_proto::Reply>()?
-                    .checked()?;
-            }
-        }
-        return Ok(());
-    }
-    if let Command::Daemon {
-        command: DaemonCommand::Run { detach },
-    } = &cli.command
-    {
-        if *detach {
-            tower_pal::detach(&paths)?;
-        }
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()?;
-        let execution = std::sync::Arc::new(tower_runtime::Client::new(paths.clone()));
-        let backends = tower_sessions::Backends::new(
-            "terminal",
-            vec![
-                std::sync::Arc::new(tower_terminal::TerminalBackend::new(paths.clone())),
-                std::sync::Arc::new(tower_runtime::Backend::new(
-                    execution.clone(),
-                    "codex-app-server",
-                )),
-                std::sync::Arc::new(tower_runtime::Backend::new(execution.clone(), "acp")),
-            ],
-        )?
-        .with_execution(execution);
-        let backends =
-            backends.with_delivery(std::sync::Arc::new(tower_agents::delivery::NativeDelivery));
-        runtime.block_on(towerd::run(
-            paths,
-            if *detach {
-                "detached; caller cgroup may apply"
-            } else {
-                "foreground"
-            },
-            backends,
-        ))?;
         return Ok(());
     }
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -965,22 +842,22 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
                 use std::io::Write;
                 std::io::stdout().write_all(s.buffer.as_bytes())?;
                 if s.truncated {
-                    eprintln!("tower: oldest terminal history was discarded");
+                    eprintln!("tower-cli: oldest terminal history was discarded");
                 }
                 if s.limited {
-                    eprintln!("tower: snapshot contains unsupported terminal sequences");
+                    eprintln!("tower-cli: snapshot contains unsupported terminal sequences");
                 }
             }
         }
         Command::Daemon {
-            command: DaemonCommand::Status,
+            command: DaemonCommand::Status | DaemonCommand::Start,
         } => {
             let r = client.call("daemon.info", &serde_json::json!({})).await?;
             if cli.json {
                 print_json(&r)?;
             } else {
                 let info: DaemonInfo = serde_json::from_value(serde_json::to_value(r)?)?;
-                println!("towerd {} · pid {} · {}", info.version, info.pid, info.mode);
+                println!("tower {} · pid {} · {}", info.version, info.pid, info.mode);
                 println!("node: {}", info.node_name);
                 println!("startup: {}", info.startup);
                 println!(
@@ -1043,16 +920,7 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
             .map_err(|_| "daemon shutdown could not be confirmed")??;
             print_json(&result)?;
         }
-        Command::Agent { .. }
-        | Command::CodexHost { .. }
-        | Command::SessionMcp { .. }
-        | Command::Acp { .. }
-        | Command::Runtime { .. }
-        | Command::Hook { .. }
-        | Command::Pool { .. }
-        | Command::Daemon {
-            command: DaemonCommand::Run { .. },
-        } => unreachable!(),
+        Command::Agent { .. } | Command::SessionMcp { .. } | Command::Hook { .. } => unreachable!(),
         Command::Ls(args)
         | Command::Agents {
             command: AgentsCommand::Ls(args),

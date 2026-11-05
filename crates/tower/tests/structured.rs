@@ -41,7 +41,10 @@ impl Fixture {
         Self { root }
     }
     fn command(&self, args: &[&str]) -> Command {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_tower"));
+        self.program(env!("CARGO_BIN_EXE_tower-cli"), args)
+    }
+    fn program(&self, binary: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> Command {
+        let mut c = Command::new(binary);
         c.args(args)
             .env_clear()
             .env("HOME", self.root.path())
@@ -79,13 +82,13 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        for args in [
-            ["__runtime", "stop"],
-            ["__codex", "stop"],
-            ["daemon", "stop"],
+        for (binary, args) in [
+            (env!("CARGO_BIN_EXE_tower"), &["__runtime", "stop"][..]),
+            (env!("CARGO_BIN_EXE_tower"), &["__codex", "stop"][..]),
+            (env!("CARGO_BIN_EXE_tower-cli"), &["daemon", "stop"][..]),
         ] {
             let _ = self
-                .command(&args)
+                .program(binary, args)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();

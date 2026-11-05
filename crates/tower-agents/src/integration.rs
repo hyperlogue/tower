@@ -86,7 +86,7 @@ pub fn hooks(name: &str, project: bool, install: bool) -> io::Result<PathBuf> {
         groups.retain(|g| g["hooks"].as_array().is_none_or(|a| !a.is_empty()));
     }
     if install {
-        let exe = tower_pal::executable()?;
+        let exe = tower_pal::Program::Cli.path()?;
         let events = if h == Harness::ClaudeCode {
             vec![
                 "SessionStart",
@@ -145,7 +145,7 @@ pub fn mcp(name: &str, project: bool, install: bool) -> io::Result<PathBuf> {
         .or_insert(json!({}))
         .as_object_mut()
         .ok_or_else(|| invalid("MCP servers must be an object"))?;
-    let exe = tower_pal::executable()?;
+    let exe = tower_pal::Program::Cli.path()?;
     if let Some(existing) = servers.get("tower")
         && (existing["args"] != json!(["mcp"]) || existing["command"] != json!(exe))
     {

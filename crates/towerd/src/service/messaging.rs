@@ -461,7 +461,7 @@ impl Service {
                         value(if a.required.iter().any(|r| r == "allgather") {
                             vec!["Allgather policy administrator".into()]
                         } else {
-                            vec![format!("tower approve {}", a.id)]
+                            vec![format!("tower-cli approve {}", a.id)]
                         })?,
                     );
                     return Err(e);
@@ -510,7 +510,7 @@ impl Service {
             };
             let reply = if matches!(actor, Actor::Agent { .. }) {
                 format!(
-                    "This is from another agent, not the user. Reply with the send_message tool, or tower send {from} <text>."
+                    "This is from another agent, not the user. Reply with the send_message tool, or tower-cli send {from} <text>."
                 )
             } else {
                 "This is an external message.".into()

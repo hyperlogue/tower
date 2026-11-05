@@ -50,7 +50,10 @@ impl Fixture {
         Self { root, env }
     }
     fn command(&self, args: &[&str]) -> Command {
-        let mut c = Command::new(env!("CARGO_BIN_EXE_tower"));
+        self.program(env!("CARGO_BIN_EXE_tower-cli"), args)
+    }
+    fn program(&self, binary: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> Command {
+        let mut c = Command::new(binary);
         c.args(args)
             .env_clear()
             .envs(&self.env)
@@ -63,7 +66,7 @@ impl Fixture {
             r.status.success(),
             "CLI {args:?}: {}\ndaemon: {}\npool: {}",
             String::from_utf8_lossy(&r.stderr),
-            std::fs::read_to_string(self.root.path().join("state/tower/logs/towerd.log"))
+            std::fs::read_to_string(self.root.path().join("state/tower/logs/tower.log"))
                 .unwrap_or_default(),
             std::fs::read_to_string(self.root.path().join("state/tower/logs/pool.log"))
                 .unwrap_or_default()
@@ -73,7 +76,7 @@ impl Fixture {
     fn attach(&self, id: &str) -> PtyProcess {
         PtyProcess::spawn(
             &[
-                env!("CARGO_BIN_EXE_tower").into(),
+                env!("CARGO_BIN_EXE_tower-cli").into(),
                 "attach".into(),
                 id.into(),
             ],
@@ -120,7 +123,9 @@ impl Fixture {
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        let _ = self.command(&["__codex", "stop"]).output();
+        let _ = self
+            .program(env!("CARGO_BIN_EXE_tower"), &["__codex", "stop"])
+            .output();
         let _ = self.command(&["daemon", "stop"]).output();
         if let Ok(mut s) =
             tower_pal::connect_blocking(&self.root.path().join("state/tower/run/pool.sock"))
@@ -470,10 +475,13 @@ trust_level="trusted"
         }
     });
     assert!(
-        f.command(&["__pool", "run", "--detach"])
-            .status()
-            .unwrap()
-            .success()
+        f.program(
+            env!("CARGO_BIN_EXE_tower-terminal-pool"),
+            &["run", "--detach"]
+        )
+        .status()
+        .unwrap()
+        .success()
     );
     let pool_path = f.root.path().join("state/tower/run/pool.sock");
     tokio::time::timeout(Duration::from_secs(5), async {

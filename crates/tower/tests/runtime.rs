@@ -22,25 +22,37 @@ impl Fixture {
                 .tempdir_in("/tmp")
                 .unwrap(),
             child: None,
-            binary: env!("CARGO_BIN_EXE_tower").into(),
+            binary: env!("CARGO_BIN_EXE_tower-cli").into(),
         }
     }
     fn standalone() -> Self {
         let mut f = Self::new();
         let install = f.dir.path().join("install");
         std::fs::create_dir(&install).unwrap();
-        let binary = install.join("tower");
-        std::fs::copy(&f.binary, &binary).unwrap();
-        tower_pal::make_executable(&binary).unwrap();
-        f.binary = binary;
-        assert_eq!(std::fs::read_dir(install).unwrap().count(), 1);
+        for (name, source) in [
+            ("tower-cli", env!("CARGO_BIN_EXE_tower-cli")),
+            ("tower", env!("CARGO_BIN_EXE_tower")),
+            (
+                "tower-terminal-pool",
+                env!("CARGO_BIN_EXE_tower-terminal-pool"),
+            ),
+        ] {
+            let target = install.join(name);
+            std::fs::copy(source, &target).unwrap();
+            tower_pal::make_executable(&target).unwrap();
+        }
+        f.binary = install.join("tower-cli");
+        assert_eq!(std::fs::read_dir(install).unwrap().count(), 3);
         f
     }
     fn socket(&self) -> PathBuf {
         self.dir.path().join("state/tower/run/towerd.sock")
     }
     fn command(&self, args: &[&str]) -> Command {
-        let mut c = Command::new(&self.binary);
+        self.program(&self.binary, args)
+    }
+    fn program(&self, binary: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> Command {
+        let mut c = Command::new(binary);
         c.args(args)
             .env_clear()
             .env("PATH", std::env::var("PATH").unwrap())
@@ -79,7 +91,7 @@ impl Fixture {
     }
     fn foreground(&mut self) {
         self.child = Some(
-            self.command(&["daemon", "run"])
+            self.program(self.binary.with_file_name("tower"), &["run"])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
@@ -239,7 +251,10 @@ fn crash_leaves_a_stale_socket_that_autostart_reclaims() {
     f.foreground();
     let first = f.run(&["daemon", "status"]);
     // A second daemon must fail without removing the live daemon's socket.
-    let duplicate = f.command(&["daemon", "run"]).output().unwrap();
+    let duplicate = f
+        .program(f.binary.with_file_name("tower"), &["run"])
+        .output()
+        .unwrap();
     assert!(!duplicate.status.success());
     assert_eq!(f.run(&["daemon", "status"])["pid"], first["pid"]);
     let child = f.child.as_mut().unwrap();
@@ -339,7 +354,7 @@ async fn storage_waits_do_not_block_unrelated_socket_responses() {
 }
 
 #[test]
-fn standalone_executable_preserves_owned_session_and_both_attach_streams_on_restart() {
+fn relocated_bundle_preserves_owned_session_and_attach_streams_on_restart() {
     use std::io::Write;
     use tower_pool_proto::{self as pool, Frame, Reply, Request, Size};
     let f = Fixture::standalone();
@@ -368,6 +383,13 @@ fn standalone_executable_preserves_owned_session_and_both_attach_streams_on_rest
             .env("PATH", path)
             .output()
             .unwrap(),
+    );
+    let server = f.run(&["daemon", "status"]);
+    let pid = u32::try_from(server["pid"].as_u64().unwrap()).unwrap();
+    let process = tower_pal::inspect_process(pid).unwrap();
+    assert_eq!(
+        PathBuf::from(&process.argv[0]),
+        f.binary.with_file_name("tower")
     );
     let opened = f.run(&["open", "claude", "--cwd", f.dir.path().to_str().unwrap()]);
     let id = opened["id"].as_str().unwrap();
@@ -1024,4 +1046,43 @@ fn session_metadata_and_host_metrics_use_the_normal_cli_without_a_pool() {
         "invalid_params",
     );
     assert!(!f.dir.path().join("state/tower/run/pool.sock").exists());
+}
+
+#[test]
+fn missing_server_companion_does_not_fall_back_to_path() {
+    let f = Fixture::standalone();
+    std::fs::remove_file(f.binary.with_file_name("tower")).unwrap();
+    let trap = f.dir.path().join("path-bin");
+    std::fs::create_dir(&trap).unwrap();
+    let shell = Command::new("sh")
+        .args(["-c", "command -v sh"])
+        .output()
+        .unwrap();
+    assert!(shell.status.success());
+    let marker = f.dir.path().join("unexpected-server");
+    std::fs::write(
+        trap.join("tower"),
+        format!(
+            "#!{}\nprintf wrong > '{}'\n",
+            String::from_utf8(shell.stdout).unwrap().trim(),
+            marker.display()
+        ),
+    )
+    .unwrap();
+    tower_pal::make_executable(&trap.join("tower")).unwrap();
+    let result = f
+        .command(&["daemon", "start"])
+        .env(
+            "PATH",
+            format!("{}:{}", trap.display(), std::env::var("PATH").unwrap()),
+        )
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(
+        String::from_utf8_lossy(&result.stderr)
+            .contains("Install tower, tower-cli, and tower-terminal-pool together")
+    );
+    assert!(!marker.exists());
+    assert!(!f.socket().exists());
 }
