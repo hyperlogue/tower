@@ -33,8 +33,15 @@ fn value(v: impl Serialize) -> Result<Value> {
     serde_json::to_value(v).map_err(internal)
 }
 impl Host {
+    /// Owners whose task has ended are dropped, so callers see the runtime
+    /// as unowned instead of as a full queue.
+    fn owners(&self) -> Result<std::sync::MutexGuard<'_, BTreeMap<String, Arc<engine::Handle>>>> {
+        let mut owners = self.owners.lock().map_err(internal)?;
+        owners.retain(|_, h| !h.normal.is_closed());
+        Ok(owners)
+    }
     fn request_shutdown(&self) -> Result<()> {
-        let owners = self.owners.lock().map_err(internal)?;
+        let owners = self.owners()?;
         for h in owners.values() {
             let _ = h
                 .control
@@ -85,7 +92,7 @@ impl Host {
                 ));
             }
         }
-        let mut owners = self.owners.lock().map_err(internal)?;
+        let mut owners = self.owners()?;
         let handle = if let Some(h) = owners.get(&key(&b)) {
             h.clone()
         } else {
@@ -196,10 +203,6 @@ impl Host {
                 )?,
             ),
             "list" => {
-                self.owners
-                    .lock()
-                    .map_err(internal)?
-                    .retain(|_, h| !h.normal.is_closed());
                 let namespace = p["namespace"].as_str();
                 let after = p["after"].as_u64().unwrap_or(0);
                 let mut views = Vec::new();
@@ -240,7 +243,7 @@ impl Host {
                         + serde_json::to_vec(&losses).map_err(internal)?.len()
                         + 4096,
                 );
-                let owners = self.owners.lock().map_err(internal)?;
+                let owners = self.owners()?;
                 for binding in self.journal.bindings(Some(namespace))? {
                     if let Some(h) = owners.get(&key(&binding)) {
                         let committed = self.journal.cursor(&binding)?.cursor;
@@ -257,14 +260,7 @@ impl Host {
             "reannounce" => {
                 let b: Binding = parse(p)?;
                 let (state, fenced, _) = self.journal.state(&b)?;
-                if !fenced
-                    && self
-                        .owners
-                        .lock()
-                        .map_err(internal)?
-                        .get(&key(&b))
-                        .is_some_and(|h| !h.normal.is_closed())
-                {
+                if !fenced && self.owners()?.contains_key(&key(&b)) {
                     let m = self.journal.metadata(&b)?;
                     if b.protocol == "terminal" {
                         if m.pointer("/observation/terminal/running") == Some(&Value::Bool(true)) {
@@ -312,7 +308,7 @@ impl Host {
                     Some("request") => {
                         let id = v["source_request_id"].as_str().unwrap_or("");
                         let rev = v["request_revision"].as_u64().unwrap_or(0);
-                        let owners = self.owners.lock().map_err(internal)?;
+                        let owners = self.owners()?;
                         for binding in self.journal.bindings(Some(ns))? {
                             if let Some(h) = owners.get(&key(&binding)) {
                                 h.requests.acknowledge(
@@ -389,7 +385,7 @@ impl Host {
                 if method == "fence" {
                     self.journal.fence(&b, reason, "unknown")?;
                 }
-                let owners = self.owners.lock().map_err(internal)?;
+                let owners = self.owners()?;
                 if let Some(h) = owners.get(&key(&b)) {
                     h.control
                         .try_send(engine::Control::Stop(reason.into()))
@@ -657,11 +653,8 @@ pub async fn run(
 mod tests {
     use super::*;
 
-    #[test]
-    fn receipt_ack_keeps_unsent_evidence_and_fences_unrecoverable_history() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path();
-        let host = Host {
+    fn host(path: &std::path::Path) -> Host {
+        Host {
             paths: tower_pal::Paths {
                 state: path.into(),
                 run: path.join("run"),
@@ -676,8 +669,10 @@ mod tests {
             owners: Mutex::new(BTreeMap::new()),
             shutdown: tokio::sync::Notify::new(),
             terminal: None,
-        };
-        let b = Binding {
+        }
+    }
+    fn binding() -> Binding {
+        Binding {
             origin: "https://allgather.example".into(),
             machine_id: "machine".into(),
             session_id: "session".into(),
@@ -689,8 +684,10 @@ mod tests {
             harness: "codex".into(),
             cwd: "/work/project".into(),
             resume_session_id: None,
-        };
-        let c = ExecutionCommand {
+        }
+    }
+    fn launch(b: &Binding) -> ExecutionCommand {
+        ExecutionCommand {
             command_id: "command".into(),
             session_id: b.session_id.clone(),
             runtime_id: b.runtime_id.clone(),
@@ -698,7 +695,35 @@ mod tests {
             kind: "launch".into(),
             payload: parse(json!({})).unwrap(),
             expires_at: "2099-01-01T00:00:00Z".into(),
-        };
+        }
+    }
+
+    #[test]
+    fn stop_after_the_owner_ended_settles_instead_of_failing() {
+        let root = tempfile::tempdir().unwrap();
+        let host = host(root.path());
+        let b = binding();
+        host.journal.admit(&b, &launch(&b)).unwrap();
+        let (handle, normal, control) = engine::channels();
+        host.owners.lock().unwrap().insert(key(&b), handle);
+        drop((normal, control));
+        host.journal
+            .fence(&b, "native_exited", "confirmed")
+            .unwrap();
+        host.dispatch("stop", json!({"binding":b})).unwrap();
+        let mut prompt = launch(&b);
+        prompt.command_id = "prompt".into();
+        prompt.kind = "prompt".into();
+        let error = host.execute(b.clone(), prompt).unwrap_err();
+        assert_eq!(error.data.code, "runtime_lost");
+    }
+
+    #[test]
+    fn receipt_ack_keeps_unsent_evidence_and_fences_unrecoverable_history() {
+        let root = tempfile::tempdir().unwrap();
+        let host = host(root.path());
+        let b = binding();
+        let c = launch(&b);
         let first = host.journal.admit(&b, &c).unwrap();
         host.journal.begin_dispatch(&b, &c.command_id).unwrap();
         let latest = host
