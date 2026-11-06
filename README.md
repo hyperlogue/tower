@@ -555,9 +555,11 @@ are not part of the status projection.
 
 Managed commands have durable receipts and generation-bound execution owners.
 Reconnection reads their status and does not repeat uncertain commands.
-The Tower daemon owns structured agent processes. Stopping it interrupts each
-running turn and stops the process. Local sessions resume when the daemon starts
-again; Allgather resumes the sessions it launched. Transcript
+Structured sessions keep their identity across a Tower daemon restart, local or
+launched from Allgather. Codex turns keep running in the Codex daemon. An ACP
+agent is stopped and reloads its conversation when Tower starts again; a turn
+it was running, or a Codex turn waiting for approval, is told to continue.
+Pending approvals are withdrawn and asked again. Transcript
 events use a separate bounded journal and are released after acknowledgment.
 Private permission requests, form requests, URL interactions, and replies remain
 in memory. Explicit resume keeps the Tower session ID and creates a fresh execution

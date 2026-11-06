@@ -20,10 +20,20 @@ use tower_sessions::{
 pub(crate) struct Authority(Arc<OnceLock<Authorize>>);
 impl Authority {
     pub(crate) async fn check(&self, b: &Binding, c: &ExecutionCommand) -> Result<()> {
-        let authorize = self
-            .0
-            .get()
-            .ok_or_else(|| error("authority_unavailable", "Tower authorization is not ready"))?;
+        // Continued runtimes start before the server binds its policy.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let authorize = loop {
+            if let Some(authorize) = self.0.get() {
+                break authorize;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(error(
+                    "authority_unavailable",
+                    "Tower authorization is not ready",
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
         authorize(Authorization {
             binding: b.clone(),
             command_id: c.command_id.clone(),
@@ -43,12 +53,7 @@ pub struct Runtime {
     terminal: Arc<dyn ManagedBackend>,
     authority: Authority,
     tasks: tokio::runtime::Handle,
-    /// Resumed generations that should continue an interrupted turn.
-    continuations: Mutex<std::collections::BTreeSet<String>>,
 }
-/// Sent to a session whose turn a server restart interrupted.
-pub(crate) const CONTINUE: &str =
-    "Tower restarted and interrupted your previous turn. Continue where you left off.";
 fn key(b: &Binding) -> String {
     serde_json::to_string(&(b.namespace(), &b.runtime_id, &b.generation)).expect("string tuple")
 }
@@ -87,7 +92,7 @@ impl Runtime {
             &paths.state.join("runtime/runtime.db"),
             limits,
         )?);
-        let terminal_recovery = recover(&paths, &journal).await?;
+        let live = recover(&paths, &journal).await?;
         journal.compact()?;
         let runtime = Arc::new(Self {
             paths,
@@ -96,19 +101,11 @@ impl Runtime {
             terminal,
             authority: Authority::default(),
             tasks: tokio::runtime::Handle::current(),
-            continuations: Mutex::default(),
         });
-        for binding in terminal_recovery {
+        for binding in live {
             let (handle, normal, control) = engine::channels();
-            runtime.owners()?.insert(key(&binding), handle);
-            runtime.tasks.spawn(crate::terminal::run(
-                runtime.context(),
-                binding,
-                runtime.terminal.clone(),
-                normal,
-                control,
-                true,
-            ));
+            runtime.owners()?.insert(key(&binding), handle.clone());
+            runtime.spawn(binding, handle, normal, control, engine::Start::Continue);
         }
         let weak = Arc::downgrade(&runtime);
         runtime.tasks.spawn(async move {
@@ -133,20 +130,6 @@ impl Runtime {
     }
     pub(crate) fn paths(&self) -> &tower_pal::Paths {
         &self.paths
-    }
-    pub(crate) fn continue_after_resume(&self, runtime_id: &str) -> Result<()> {
-        self.continuations
-            .lock()
-            .map_err(internal)?
-            .insert(runtime_id.into());
-        Ok(())
-    }
-    pub(crate) fn take_continuation(&self, runtime_id: &str) -> Result<bool> {
-        Ok(self
-            .continuations
-            .lock()
-            .map_err(internal)?
-            .remove(runtime_id))
     }
     /// Owners whose task has ended are dropped, so callers see the runtime
     /// as unowned instead of as a full queue.
@@ -186,6 +169,17 @@ impl Runtime {
             .try_send(c)
             .map_err(|_| error("runtime_capacity", "Runtime queue is full"))?;
         owners.insert(key(&b), handle.clone());
+        self.spawn(b, handle, normal, control, engine::Start::Launch);
+        Ok(receipt)
+    }
+    fn spawn(
+        &self,
+        b: Binding,
+        handle: Arc<engine::Handle>,
+        normal: tokio::sync::mpsc::Receiver<ExecutionCommand>,
+        control: tokio::sync::mpsc::Receiver<engine::Control>,
+        start: engine::Start,
+    ) {
         let failed = (b.clone(), self.journal.clone());
         let task = if b.protocol == "terminal" {
             self.tasks.spawn(crate::terminal::run(
@@ -194,11 +188,17 @@ impl Runtime {
                 self.terminal.clone(),
                 normal,
                 control,
-                false,
+                start == engine::Start::Continue,
             ))
         } else {
-            self.tasks
-                .spawn(engine::run(self.context(), b, handle, normal, control))
+            self.tasks.spawn(engine::run(
+                self.context(),
+                b,
+                handle,
+                normal,
+                control,
+                start,
+            ))
         };
         self.tasks.spawn(async move {
             if task.await.is_err() {
@@ -206,15 +206,14 @@ impl Runtime {
                 let _ = journal.fence(&binding, "owner_task_failed", "unknown");
             }
         });
-        Ok(receipt)
     }
 }
 impl ExecutionHost for Runtime {
     fn bind(&self, authorize: Authorize) {
         let _ = self.authority.0.set(authorize);
     }
-    /// Stops structured sessions, which the server process owns. Terminal
-    /// sessions live in the pool and are recovered by the next server.
+    /// Suspends structured sessions so that the next server continues them.
+    /// Terminal sessions live in the pool and need nothing.
     fn shutdown(&self) -> tower_sessions::execution::Future<()> {
         let owners: Vec<_> = (|| -> Result<Vec<_>> {
             let owners = self.owners()?;
@@ -229,9 +228,7 @@ impl ExecutionHost for Runtime {
         .unwrap_or_default();
         Box::pin(async move {
             for h in &owners {
-                let _ = h
-                    .control
-                    .try_send(engine::Control::Stop("server_restart".into()));
+                let _ = h.control.try_send(engine::Control::Suspend);
             }
             let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
             while owners.iter().any(|h| !h.normal.is_closed())
@@ -527,17 +524,19 @@ impl ExecutionHost for Runtime {
     }
 }
 
-/// Settles generations left by a previous server. Returns terminal
-/// generations whose pool sessions may still be running.
+/// Settles generations left by a previous server and returns the live ones
+/// to continue: terminal generations whose pool sessions may still run, and
+/// structured generations whose native session can be reopened.
 async fn recover(paths: &tower_pal::Paths, journal: &Journal) -> Result<Vec<Binding>> {
     let boot = tower_pal::boot_id().map_err(internal)?;
+    let mut live = Vec::new();
     let mut processes = Vec::new();
-    let mut terminals = Vec::new();
-    let mut shared = tokio::task::JoinSet::new();
     for binding in journal.bindings(None)? {
         let (_, fenced, termination) = journal.state(&binding)?;
-        if fenced && termination == "confirmed" {
-            engine::cleanup_environment(paths, &binding);
+        if fenced {
+            if termination == "confirmed" {
+                engine::cleanup_environment(paths, &binding);
+            }
             continue;
         }
         let m = journal.metadata(&binding)?;
@@ -546,102 +545,41 @@ async fn recover(paths: &tower_pal::Paths, journal: &Journal) -> Result<Vec<Bind
             if rebooted {
                 journal.fence(&binding, "terminal_owner_lost", "confirmed")?;
             } else {
-                terminals.push(binding);
+                live.push(binding);
             }
             continue;
         }
-        if rebooted {
-            journal.fence(&binding, "owner_restarted", "confirmed")?;
-            engine::cleanup_environment(paths, &binding);
-            continue;
-        }
-        if binding.protocol == "codex-app-server" {
-            journal.fence(&binding, "owner_restarted", "unknown")?;
-            if shared.len() >= 4
-                && let Some(Ok((previous, true))) = shared.join_next().await
-            {
-                journal.fence(&previous, "owner_restarted", "confirmed")?;
-                engine::cleanup_environment(paths, &previous);
-            }
-            let paths = paths.clone();
-            shared.spawn(async move {
-                let confirmed = recover_shared_codex(&paths, &m).await;
-                (binding, confirmed)
-            });
-            continue;
-        }
-        if let (Some(pid), Some(start)) = (
-            m["pid"].as_u64().and_then(|v| u32::try_from(v).ok()),
-            m["pid_start_time"].as_u64(),
-        ) {
-            let identity = tower_pal::ProcessIdentity {
-                pid,
-                parent: 0,
-                start_time: start,
-            };
+        // A previous server that crashed can leave its ACP agent running.
+        let process = (binding.protocol == "acp" && !rebooted)
+            .then(|| {
+                Some(tower_pal::ProcessIdentity {
+                    pid: m["pid"].as_u64().and_then(|v| u32::try_from(v).ok())?,
+                    parent: 0,
+                    start_time: m["pid_start_time"].as_u64()?,
+                })
+            })
+            .flatten();
+        if let Some(identity) = process {
             let _ = tower_pal::kill_protocol_group(identity);
-            processes.push((binding, identity));
-        } else {
-            journal.fence(&binding, "owner_restarted", "unknown")?;
         }
+        processes.push((binding, process));
     }
     for _ in 0..40 {
-        if processes
-            .iter()
-            .all(|(_, i)| tower_pal::protocol_group_terminated(*i).unwrap_or(false))
-        {
+        if processes.iter().all(|(_, process)| {
+            process.is_none_or(|i| tower_pal::protocol_group_terminated(i).unwrap_or(false))
+        }) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    for (binding, identity) in processes {
-        let terminated = tower_pal::protocol_group_terminated(identity).unwrap_or(false);
-        journal.fence(
-            &binding,
-            "owner_restarted",
-            if terminated { "confirmed" } else { "unknown" },
-        )?;
-    }
-    while let Some(result) = shared.join_next().await {
-        if let Ok((binding, true)) = result {
-            journal.fence(&binding, "owner_restarted", "confirmed")?;
-            engine::cleanup_environment(paths, &binding);
+    for (binding, process) in processes {
+        if process.is_some_and(|i| !tower_pal::protocol_group_terminated(i).unwrap_or(false)) {
+            journal.fence(&binding, "owner_restarted", "unknown")?;
+        } else {
+            live.push(binding);
         }
     }
-    Ok(terminals)
-}
-async fn recover_shared_codex(paths: &tower_pal::Paths, metadata: &Value) -> bool {
-    let (Some(pid), Some(start)) = (
-        metadata["pid"].as_u64().and_then(|v| u32::try_from(v).ok()),
-        metadata["pid_start_time"].as_u64(),
-    ) else {
-        return false;
-    };
-    let Some(thread) = metadata["native_session_id"].as_str() else {
-        return false;
-    };
-    let Ok(namespace) = tower_agents::codex_host::namespace(paths) else {
-        return false;
-    };
-    if metadata["native_home"] != namespace {
-        return false;
-    }
-    let cleanup = async {
-        let config = tower_agents::codex_service::Config::load(paths)?;
-        let mut client = tower_agents::codex_service::Client::connect(&config.endpoint).await?;
-        if !client
-            .process()
-            .is_some_and(|current| current.pid == pid && current.start_time == start)
-        {
-            return Err(tower_agents::codex_service::Error::Unconfirmed);
-        }
-        client.stop_thread(thread, None).await?;
-        client.wait_unloaded(thread, Duration::from_secs(5)).await
-    };
-    matches!(
-        tokio::time::timeout(Duration::from_secs(25), cleanup).await,
-        Ok(Ok(()))
-    )
+    Ok(live)
 }
 
 #[cfg(test)]
@@ -691,7 +629,6 @@ mod tests {
             terminal: Arc::new(NoTerminal),
             authority: Authority::default(),
             tasks: tokio::runtime::Handle::current(),
-            continuations: Mutex::default(),
         }
     }
     fn binding() -> Binding {

@@ -12,6 +12,8 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
+const CONTINUE: &str =
+    "Tower restarted and interrupted your previous turn. Continue where you left off.";
 struct Fixture {
     root: tempfile::TempDir,
 }
@@ -261,7 +263,7 @@ async fn complete(s: &Server, id: &str) {
     .await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn managed_adapters_preserve_receipts_permissions_and_resume_after_restart() {
+async fn managed_adapters_preserve_receipts_permissions_and_continue_across_restart() {
     let f = Fixture::new();
     let s = Server::start(&f).await;
     for (harness, protocol) in [
@@ -369,14 +371,99 @@ async fn managed_adapters_preserve_receipts_permissions_and_resume_after_restart
                 .is_some_and(|id| !id.is_empty())
         );
         assert_eq!(before["cwd"], "~");
-        // A server restart stops the server-owned process; Allgather resumes.
+        // A server restart keeps the runtime and its running turn.
+        let text = if harness == "codex" { "hold" } else { "wait" };
+        let held = command(
+            &format!("held-{harness}"),
+            runtime,
+            "prompt",
+            json!({"content":[{"type":"text","text":text}]}),
+        );
+        assert_eq!(
+            s.call("command.execute", held).await["result"]["state"],
+            "accepted"
+        );
+        let dispatches = f.root.path().join("dispatches");
+        let delivered = |text: &str| {
+            std::fs::read_to_string(&dispatches)
+                .unwrap_or_default()
+                .lines()
+                .filter(|line| line.ends_with(&format!(":{text}")))
+                .count()
+        };
+        let before_held = delivered(text);
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while delivered(text) == before_held
+            || f.rpc("agent.get", json!({"id":id}))["status"] != "working"
+        {
+            assert!(
+                std::time::Instant::now() < until,
+                "held prompt was not delivered"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let nudges = delivered(CONTINUE);
         f.cli(&["daemon", "stop"]);
+        if harness == "codex" {
+            // The Codex turn finishes while Tower is down.
+            std::fs::write(f.root.path().join("release-turn"), b"").unwrap();
+        }
         f.cli(&["daemon", "status"]);
+        complete(&s, &format!("held-{harness}")).await;
+        if harness == "codex" {
+            std::fs::remove_file(f.root.path().join("release-turn")).unwrap();
+            assert_eq!(
+                delivered(CONTINUE),
+                nudges,
+                "a running Codex turn is not interrupted"
+            );
+        } else {
+            assert_eq!(
+                delivered(CONTINUE),
+                nudges + 1,
+                "the interrupted agent is nudged once"
+            );
+        }
+        let receipt = s
+            .frames
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|v| {
+                v["method"] == "command.receipt"
+                    && v["params"]["command_id"] == format!("held-{harness}")
+            })
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            receipt["params"]["result"]["outcome"], "completed",
+            "{receipt}"
+        );
+        assert!(
+            !s.frames
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|v| { v["method"] == "runtime.lost" && v["params"]["runtime_id"] == runtime })
+        );
+        let after = command(
+            &format!("after-{harness}"),
+            runtime,
+            "prompt",
+            json!({"content":[{"type":"text","text":"after restart"}]}),
+        );
+        assert_eq!(
+            s.call("command.execute", after).await["result"]["state"],
+            "accepted"
+        );
+        complete(&s, &format!("after-{harness}")).await;
+        // Stopping the runtime lets Allgather resume it as a new generation.
+        f.cli(&["kill", &id]);
         s.until(|v| {
             v["method"] == "runtime.lost"
                 && v["params"]["runtime_id"] == runtime
                 && v["params"]["termination"] == "confirmed"
-                && v["params"]["reason"] == "server_restart"
         })
         .await;
         let resumed_runtime = format!("resumed-{runtime}");
@@ -444,7 +531,7 @@ async fn managed_adapters_preserve_receipts_permissions_and_resume_after_restart
     let dispatches = std::fs::read_to_string(f.root.path().join("dispatches")).unwrap();
     assert_eq!(
         dispatches.lines().count(),
-        6,
+        14,
         "Duplicates must not reach native input"
     );
     for file in std::fs::read_dir(f.root.path().join("state/tower/runtime")).unwrap() {
@@ -542,7 +629,7 @@ async fn cancellation_uses_the_independent_control_path_and_preserves_native_lim
     }
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn owner_crash_fences_uncertain_dispatch_without_replaying_the_prompt() {
+async fn server_crash_continues_the_running_turn_without_replaying_it() {
     let f = Fixture::new();
     let s = Server::start(&f).await;
     let launch = command(
@@ -562,19 +649,18 @@ async fn owner_crash_fences_uncertain_dispatch_without_replaying_the_prompt() {
         "prompt",
         "crash",
         "prompt",
-        json!({"content":[{"type":"text","text":"wait"}]}),
+        json!({"content":[{"type":"text","text":"hold"}]}),
     );
     assert_eq!(
         s.call("command.execute", prompt.clone()).await["result"]["state"],
         "accepted"
     );
-    s.until(|v| {
-        v["method"] == "session.events"
-            && v["params"]["events"]
-                .as_array()
-                .is_some_and(|a| a.iter().any(|e| e["kind"] == "user_message"))
-    })
-    .await;
+    let dispatches = f.root.path().join("dispatches");
+    while !dispatches.exists() {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    // Lets Tower record the native turn before it crashes.
+    tokio::time::sleep(Duration::from_millis(500)).await;
     let terminal = f.rpc(
         "session.open",
         json!({"harness":"codex","protocol":"terminal","cwd":f.root.path(),"headless":true}),
@@ -599,8 +685,15 @@ async fn owner_crash_fences_uncertain_dispatch_without_replaying_the_prompt() {
     drop(socket);
     tower_pal::force_terminate_process(server.pid, server.start_time).unwrap();
     f.cli(&["daemon", "start"]);
-    s.until(|v| v["method"] == "runtime.lost" && v["params"]["runtime_id"] == "crash")
-        .await;
+    std::fs::write(f.root.path().join("release-turn"), b"").unwrap();
+    complete(&s, "prompt").await;
+    assert!(
+        !s.frames
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|v| v["method"] == "runtime.lost")
+    );
     let terminal_after = f.rpc("agent.get", json!({"id":terminal_id}));
     assert_eq!(terminal_after["status"], "idle");
     assert_eq!(terminal_after["pid"], terminal_pid);
@@ -611,11 +704,10 @@ async fn owner_crash_fences_uncertain_dispatch_without_replaying_the_prompt() {
             json!({"command_id":"prompt","runtime_id":"crash","generation":"generation-crash"}),
         )
         .await;
-    assert_eq!(receipt["result"]["state"], "accepted");
-    assert_eq!(receipt["result"]["dispatch"]["state"], "unknown");
-    assert_eq!(receipt["result"]["error"]["may_have_effect"], true);
+    assert_eq!(receipt["result"]["dispatch"]["state"], "finished");
+    assert_eq!(receipt["result"]["result"]["outcome"], "completed");
     let duplicate = s.call("command.execute", prompt).await;
-    assert_eq!(duplicate["result"]["dispatch"]["state"], "unknown");
+    assert_eq!(duplicate["result"]["dispatch"]["state"], "finished");
     assert_eq!(
         std::fs::read_to_string(f.root.path().join("dispatches"))
             .unwrap()
@@ -623,6 +715,80 @@ async fn owner_crash_fences_uncertain_dispatch_without_replaying_the_prompt() {
             .count(),
         1
     );
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_codex_turn_waiting_for_approval_is_interrupted_and_continued_after_restart() {
+    let f = Fixture::new();
+    let s = Server::start(&f).await;
+    let launch = command(
+        "launch",
+        "approval",
+        "launch",
+        json!({"harness":"codex","protocol":"codex-app-server","generation":"generation-approval","cwd":f.root.path()}),
+    );
+    assert!(
+        s.call("command.execute", launch)
+            .await
+            .get("error")
+            .is_none()
+    );
+    complete(&s, "launch").await;
+    let prompt = command(
+        "prompt",
+        "approval",
+        "prompt",
+        json!({"content":[{"type":"text","text":"approve"}]}),
+    );
+    assert_eq!(
+        s.call("command.execute", prompt).await["result"]["state"],
+        "accepted"
+    );
+    s.until(|v| v["method"] == "session.request" && v["params"]["state"] == "pending")
+        .await;
+    f.cli(&["daemon", "stop"]);
+    f.cli(&["daemon", "status"]);
+    complete(&s, "prompt").await;
+    let dispatches = std::fs::read_to_string(f.root.path().join("dispatches")).unwrap();
+    assert_eq!(
+        dispatches.lines().collect::<Vec<_>>(),
+        ["codex:approve", &format!("codex:{CONTINUE}")]
+    );
+    assert!(
+        !s.frames
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|v| v["method"] == "runtime.lost")
+    );
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_structured_session_keeps_its_identity_across_restart() {
+    let f = Fixture::new();
+    let opened = f.rpc(
+        "session.open",
+        json!({"harness":"claude-code","protocol":"acp","cwd":f.root.path()}),
+    );
+    let id = opened["id"].as_str().unwrap();
+    let wait = |status: &str| {
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let record = f.rpc("agent.get", json!({"id":id}));
+            if record["status"] == status && record["native_session_id"].is_string() {
+                return record;
+            }
+            assert!(std::time::Instant::now() < until, "{record}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    let before = wait("idle");
+    f.cli(&["daemon", "stop"]);
+    f.cli(&["daemon", "status"]);
+    let after = wait("idle");
+    assert_ne!(after["pid"], before["pid"]);
+    assert_eq!(after["native_session_id"], before["native_session_id"]);
+    assert_eq!(after["protocol"], "acp");
+    f.cli(&["kill", id]);
+    assert_eq!(wait("exited")["id"], id);
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn native_questions_and_private_url_consent_are_validated_without_disk_payloads() {

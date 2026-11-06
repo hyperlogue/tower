@@ -244,16 +244,22 @@ export async function serve(endpoint) {
     const turn = thread.active;
     if (!turn) return;
     retireRequests(thread);
-    if (!interrupted) notify(thread, 'item/agentMessage/delta', {turnId: turn.id, itemId: `message-${turn.id}`, delta: 'Fixture answer'});
+    if (!interrupted) {
+      notify(thread, 'item/agentMessage/delta', {turnId: turn.id, itemId: `message-${turn.id}`, delta: 'Fixture answer'});
+      turn.items = [...(turn.items ?? []), {type: 'agentMessage', id: `message-${turn.id}`, text: 'Fixture answer'}];
+    }
     turn.status = interrupted ? 'interrupted' : 'completed';
     thread.active = null; thread.flags = []; thread.updatedAt = Math.floor(Date.now() / 1000);
-    notify(thread, 'turn/completed', {turn: clone(turn)}); statusChanged(thread); persist();
+    notify(thread, 'turn/completed', {turn: clone(turn)}); statusChanged(thread);
+    // Like Codex, a thread without subscribers unloads once it is idle.
+    if (!thread.subscribers.size) thread.loaded = false;
+    persist();
   }
   function unsubscribe(peer, thread) {
     const had = peer.subscriptions.delete(thread.id); thread.subscribers.delete(peer);
     for (const [id, request] of peer.requests) if (request.thread === thread) peer.requests.delete(id);
-    if (!thread.subscribers.size && thread.loaded) {
-      complete(thread, true); thread.loaded = false; statusChanged(thread); persist();
+    if (!thread.subscribers.size && thread.loaded && !thread.active) {
+      thread.loaded = false; statusChanged(thread); persist();
     }
     return had;
   }
@@ -314,6 +320,11 @@ export async function serve(endpoint) {
     }
     if (['approve', 'approve-backlog', 'question', 'url'].includes(text)) requestInput(thread, peer, text === 'approve-backlog' ? 'approve' : text);
     else if (text === 'background') { thread.terminals.set(`background-${turn.id}`, {processId: `background-${turn.id}`}); complete(thread); }
+    else if (text === 'hold') {
+      // Completes once the test creates the release file, even unsubscribed.
+      const release = path.join(home, 'release-turn');
+      const poll = setInterval(() => { if (thread.active === turn && fs.existsSync(release)) { clearInterval(poll); complete(thread); } else if (thread.active !== turn) clearInterval(poll); }, 50);
+    }
     else if (text !== 'wait') complete(thread);
   }
   function page(values, params) {
@@ -364,7 +375,7 @@ export async function serve(endpoint) {
         case 'thread/start': case 'thread/resume': case 'thread/fork': {
           const original = value.method === 'thread/start' ? null : lookup(params.threadId);
           const thread = startThread(peer, params, original, value.method === 'thread/fork');
-          result = {thread: view(thread), model: thread.model, modelProvider: 'fixture', reasoningEffort: 'medium', cwd: thread.cwd, approvalPolicy: params.approvalPolicy ?? 'on-request', sandbox: {type: 'workspaceWrite'}};
+          result = {thread: view(thread, value.method === 'thread/resume'), model: thread.model, modelProvider: 'fixture', reasoningEffort: 'medium', cwd: thread.cwd, approvalPolicy: params.approvalPolicy ?? 'on-request', sandbox: {type: 'workspaceWrite'}};
           peer.reply(id, result);
           for (const other of peers) if (other !== peer) other.send({jsonrpc: '2.0', method: 'thread/started', params: {thread: view(thread)}});
           peer.send({jsonrpc: '2.0', method: 'thread/status/changed', params: {threadId: 'unrelated-native-thread', status: {type: 'active', activeFlags: ['waitingOnApproval']}}});

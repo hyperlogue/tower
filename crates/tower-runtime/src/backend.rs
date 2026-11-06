@@ -35,11 +35,8 @@ pub(crate) fn observation(v: &RuntimeView) -> Result<Observation> {
         .as_str()
         .filter(|v| !v.is_empty())
         .map(str::to_owned);
-    // A local session the server stopped for its restart is reported lost,
-    // which makes the server recover it with a resumed generation.
-    let restarted = v.binding.origin == "local" && m.get("server_restart").is_some();
     let status = if v.fenced {
-        if v.termination == "confirmed" && !restarted {
+        if v.termination == "confirmed" {
             "exited"
         } else {
             "lost"
@@ -164,14 +161,6 @@ impl ManagedBackend for Backend {
             serde_json::json!({"harness":b.harness,"cwd":b.cwd,"protocol":b.protocol,"generation":b.generation,"resume_session_id":b.resume_session_id}),
         )?;
         self.runtime.execute(&b, &c)?;
-        if self.runtime.take_continuation(&b.runtime_id)? {
-            let prompt = crate::command(
-                &b,
-                "prompt",
-                serde_json::json!({"content":[{"type":"text","text":crate::runtime::CONTINUE}]}),
-            )?;
-            self.runtime.execute(&b, &prompt)?;
-        }
         Ok(Observation {
             id: s.id.clone(),
             binding: None,
@@ -243,28 +232,6 @@ impl ManagedBackend for Backend {
         b.owner_id = random_id("owner_")?;
         b.resume_session_id = Some(native.into());
         self.prepared(b)
-    }
-    /// Resumes a local session that a server restart interrupted.
-    fn recover(&self, s: &ManagedSession) -> Result<Option<PreparedSession>> {
-        let old: Binding = decode(&s.binding)?;
-        let view = self.view(&old)?;
-        let m: serde_json::Value = decode(&view.metadata)?;
-        let Some(restart) = m.get("server_restart") else {
-            return Ok(None);
-        };
-        if old.origin != "local" || !view.fenced || view.termination != "confirmed" {
-            return Ok(None);
-        }
-        let prepared = match self.prepare_resume(s, None, None) {
-            Ok(prepared) => prepared,
-            Err(e) if e.data.code == "resume_unavailable" => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        if restart["interrupted_turn"] == true {
-            let next: Binding = decode(&prepared.binding)?;
-            self.runtime.continue_after_resume(&next.runtime_id)?;
-        }
-        Ok(Some(prepared))
     }
 }
 impl Backend {

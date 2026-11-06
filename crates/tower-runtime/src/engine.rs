@@ -17,6 +17,28 @@ use tower_protocol::{ExecutionCommand, ExecutionError, ExecutionResult, RuntimeR
 pub(crate) enum Control {
     Command(ExecutionCommand),
     Stop(String),
+    /// Leaves the native session resumable for the next server: the
+    /// runtime stays live and its running turn continues after the restart.
+    Suspend,
+}
+/// How an engine task begins.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Start {
+    /// The first normal command launches or resumes the native session.
+    Launch,
+    /// Reopens the native session of a suspended or orphaned live runtime.
+    Continue,
+}
+/// Sent to an agent whose turn a restart interrupted.
+pub(crate) const CONTINUE: &str =
+    "Tower restarted and interrupted your previous turn. Continue where you left off.";
+/// What a continued engine restores from the previous server.
+struct Continuation {
+    active: Option<String>,
+    turn: Option<String>,
+    waiting: bool,
+    /// Codex items already reported; absent after a crash.
+    completed: Option<std::collections::HashSet<String>>,
 }
 pub(crate) struct Handle {
     pub normal: mpsc::Sender<ExecutionCommand>,
@@ -88,8 +110,9 @@ pub(crate) async fn run(
     handle: Arc<Handle>,
     mut normal: mpsc::Receiver<ExecutionCommand>,
     mut control: mpsc::Receiver<Control>,
+    start: Start,
 ) {
-    let result = run_inner(&ctx, &binding, &handle, &mut normal, &mut control).await;
+    let result = run_inner(&ctx, &binding, &handle, &mut normal, &mut control, start).await;
     let (paths, journal) = (&ctx.paths, &ctx.journal);
     if let Err(e) = result {
         let known_before_spawn = journal
@@ -193,6 +216,8 @@ struct State<'a> {
     binding: &'a Binding,
     handle: &'a Handle,
     native: String,
+    /// The native session to load instead of creating one.
+    open: Option<String>,
     resume_native: Option<String>,
     acp: String,
     metadata: Value,
@@ -200,9 +225,16 @@ struct State<'a> {
     active: Option<String>,
     stop_command: Option<String>,
     stop_reason: Option<String>,
-    streamed: std::collections::HashSet<String>,
+    suspending: bool,
+    continuation: Option<Continuation>,
+    /// Starts a continue turn once the interrupted Codex turn completes.
+    nudge: bool,
+    /// Bytes of each Codex agent message already streamed.
+    streamed: BTreeMap<String, usize>,
+    /// Codex items of the active turn already reported.
+    completed: std::collections::HashSet<String>,
     turn: Option<String>,
-    pending: BTreeMap<String, (String, ResponseKind)>,
+    pending: BTreeMap<String, (Option<String>, ResponseKind)>,
     counter: u64,
     queue: VecDeque<ExecutionCommand>,
     dropped: u64,
@@ -371,12 +403,13 @@ impl State<'_> {
         input: &mut NativeInput,
         method: &str,
         params: Value,
-        command: &str,
+        command: Option<&str>,
         kind: ResponseKind,
     ) -> Result<()> {
         self.counter += 1;
         let id = format!("tower-{}", self.counter);
-        self.pending.insert(id.clone(), (command.into(), kind));
+        self.pending
+            .insert(id.clone(), (command.map(str::to_owned), kind));
         wire::json_line(
             input,
             &json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
@@ -408,9 +441,72 @@ impl State<'_> {
                 },
             )?;
             self.turn = None;
+            self.completed.clear();
+            self.metadata["active_command"] = Value::Null;
+            self.metadata["turn"] = Value::Null;
             self.state("idle")?;
         }
         Ok(())
+    }
+    /// Records the delivered turn so that the next server can continue it.
+    fn persist_turn(&mut self) -> Result<()> {
+        self.metadata["active_command"] = json!(self.active);
+        self.metadata["turn"] = json!(self.turn);
+        let (state, _, _) = self.journal.state(self.binding)?;
+        self.journal
+            .update_metadata(self.binding, &state, &self.metadata)
+    }
+    fn turn_params(&self, content: Vec<Value>) -> Result<Value> {
+        let mut params = json!({"threadId":self.native,"input":content});
+        if let Some(config) = self.metadata.get("config").and_then(Value::as_object) {
+            for (k, v) in config {
+                if k != "mode" {
+                    params[k] = v.clone();
+                }
+            }
+            if let Some(mode) = config.get("mode") {
+                let model = config
+                    .get("model")
+                    .or_else(|| self.metadata.get("model"))
+                    .filter(|v| v.is_string())
+                    .ok_or_else(|| {
+                        error(
+                            "unsupported_config",
+                            "Native model identity is required for mode changes",
+                        )
+                    })?;
+                params["collaborationMode"] = json!({"mode":mode,"settings":{"model":model,"reasoning_effort":config.get("effort").or_else(||self.metadata.get("effort")),"developer_instructions":null}});
+            }
+        }
+        Ok(params)
+    }
+    async fn continue_turn(&mut self, input: &mut NativeInput) -> Result<()> {
+        let command = self.active.clone();
+        let text = json!({"type":"text","text":CONTINUE});
+        if self.binding.protocol == "codex-app-server" {
+            self.turn = None;
+            let mut text = text;
+            text["text_elements"] = json!([]);
+            let params = self.turn_params(vec![text])?;
+            self.rpc(
+                input,
+                "turn/start",
+                params,
+                command.as_deref(),
+                ResponseKind::PromptStart,
+            )
+            .await
+        } else {
+            self.rpc(
+                input,
+                "session/prompt",
+                json!({"sessionId":self.acp,"prompt":[text]}),
+                command.as_deref(),
+                ResponseKind::PromptEnd,
+            )
+            .await?;
+            self.persist_turn()
+        }
     }
 }
 
@@ -420,13 +516,21 @@ async fn run_inner(
     handle: &Handle,
     normal: &mut mpsc::Receiver<ExecutionCommand>,
     control: &mut mpsc::Receiver<Control>,
+    start: Start,
 ) -> Result<()> {
-    let launch = normal
-        .recv()
-        .await
-        .ok_or_else(|| error("runtime_lost", "Launch was not supplied"))?;
     let (paths, journal) = (&ctx.paths, &*ctx.journal);
-    ctx.authority.check(b, &launch).await?;
+    let launch = match start {
+        Start::Launch => {
+            let launch = normal
+                .recv()
+                .await
+                .ok_or_else(|| error("runtime_lost", "Launch was not supplied"))?;
+            ctx.authority.check(b, &launch).await?;
+            Some(launch)
+        }
+        Start::Continue => None,
+    };
+    let previous = journal.metadata(b)?;
     let env = tower_agents::environment::project_environment(
         std::path::Path::new(&b.cwd),
         &tower_pal::Program::Cli.path().map_err(internal)?,
@@ -449,7 +553,29 @@ async fn run_inner(
         tower_agents::Harness::parse(&b.harness)
             .and_then(|h| tower_agents::inventory::namespace(h, &env))
     };
-    let resume_native = if b.resume_session_id.is_some() {
+    let recorded = |key: &str| {
+        previous[key]
+            .as_str()
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| error("resume_unavailable", "Native session identity unavailable"))
+    };
+    let (open, resume_native) = if launch.is_none() {
+        if previous["native_home"].as_str() != native_home.as_deref() {
+            return Err(error(
+                "native_home_changed",
+                "Native history location changed since the previous execution",
+            ));
+        }
+        if b.protocol == "acp" {
+            (
+                Some(recorded("acp_session_id")?),
+                Some(recorded("native_session_id")?),
+            )
+        } else {
+            (Some(recorded("native_session_id")?), None)
+        }
+    } else if b.resume_session_id.is_some() {
         let previous = journal
             .bindings(Some(&b.namespace()))?
             .into_iter()
@@ -480,9 +606,12 @@ async fn run_inner(
                 "Native history location changed since the previous execution",
             ));
         }
-        metadata["native_session_id"].as_str().map(str::to_owned)
+        (
+            b.resume_session_id.clone(),
+            metadata["native_session_id"].as_str().map(str::to_owned),
+        )
     } else {
-        None
+        (None, None)
     };
     for key in [
         "TOWER_AGENT_TOKEN",
@@ -512,19 +641,23 @@ async fn run_inner(
         String::from_utf8(token).map_err(internal)?,
     );
     let prepared_codex = if b.protocol == "codex-app-server" {
-        Some(prepare_codex(paths, b, &env).await?)
+        // A continued thread may still be loaded and running its turn.
+        let unloaded = launch.as_ref().and(b.resume_session_id.as_deref());
+        Some(prepare_codex(paths, b, &env, unloaded).await?)
     } else {
         None
     };
-    ctx.authority.check(b, &launch).await?;
-    if control.try_recv().is_ok() {
-        return Err(error(
-            "runtime_cancelled",
-            "Launch was cancelled before native dispatch",
-        ));
-    }
-    if !journal.begin_dispatch(b, &launch.command_id)? {
-        return Err(error("runtime_lost", "Launch dispatch is already fenced"));
+    if let Some(launch) = &launch {
+        ctx.authority.check(b, launch).await?;
+        if control.try_recv().is_ok() {
+            return Err(error(
+                "runtime_cancelled",
+                "Launch was cancelled before native dispatch",
+            ));
+        }
+        if !journal.begin_dispatch(b, &launch.command_id)? {
+            return Err(error("runtime_lost", "Launch dispatch is already fenced"));
+        }
     }
     let NativeSetup {
         mut input,
@@ -597,19 +730,61 @@ async fn run_inner(
         connection,
         codex,
     };
+    let (state, _, _) = journal.state(b)?;
+    let continuation = launch.is_none().then(|| Continuation {
+        active: previous["active_command"].as_str().map(str::to_owned),
+        turn: previous["turn"].as_str().map(str::to_owned),
+        waiting: state.starts_with("waiting_"),
+        completed: previous["completed"].as_array().map(|ids| {
+            ids.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        }),
+    });
+    let streamed = serde_json::from_value(previous["streamed"].clone()).unwrap_or_default();
+    let mut metadata = if launch.is_some() {
+        json!({})
+    } else {
+        let mut metadata = previous;
+        if let Some(fields) = metadata.as_object_mut() {
+            for key in ["completed", "streamed"] {
+                fields.remove(key);
+            }
+        }
+        metadata
+    };
+    for (key, value) in [
+        ("pid", json!(identity.pid)),
+        ("pid_start_time", json!(identity.start_time)),
+        ("shared_process", json!(b.protocol == "codex-app-server")),
+        ("boot_id", json!(tower_pal::boot_id().map_err(internal)?)),
+        ("native_home", json!(native_home)),
+    ] {
+        metadata[key] = value;
+    }
     let mut s = State {
         journal,
         binding: b,
         handle,
-        native: String::new(),
+        native: if b.protocol == "acp" {
+            resume_native.clone().unwrap_or_default()
+        } else {
+            String::new()
+        },
+        open,
         resume_native,
         acp: String::new(),
-        metadata: json!({"pid":identity.pid,"pid_start_time":identity.start_time,"shared_process":b.protocol=="codex-app-server","boot_id":tower_pal::boot_id().map_err(internal)?,"native_home":native_home}),
+        metadata,
         native_config,
         active: None,
         stop_command: None,
         stop_reason: None,
-        streamed: Default::default(),
+        suspending: false,
+        continuation,
+        nudge: false,
+        streamed,
+        completed: Default::default(),
         turn: None,
         pending: BTreeMap::new(),
         counter: 0,
@@ -619,7 +794,11 @@ async fn run_inner(
         dropped_to: None,
         text: None,
     };
-    journal.update_metadata(b, "starting", &s.metadata)?;
+    journal.update_metadata(
+        b,
+        if launch.is_some() { "starting" } else { &state },
+        &s.metadata,
+    )?;
     let init = if b.protocol == "codex-app-server" {
         json!({"clientInfo":{"name":"tower","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}})
     } else {
@@ -629,7 +808,7 @@ async fn run_inner(
         &mut input,
         "initialize",
         init,
-        &launch.command_id,
+        launch.as_ref().map(|l| l.command_id.as_str()),
         ResponseKind::Initialize,
     )
     .await?;
@@ -643,6 +822,17 @@ async fn run_inner(
                         Some(Control::Stop(reason)) => {
                             s.handle.requests.retire_all()?;
                             s.stop_reason = Some(reason);
+                            return Ok(());
+                        }
+                        // Before the native session exists there is nothing
+                        // to continue, so the restart stops it instead.
+                        Some(Control::Suspend) if !s.ready() || s.continuation.is_some() => {
+                            s.handle.requests.retire_all()?;
+                            s.stop_reason = Some("server_restart".into());
+                            return Ok(());
+                        }
+                        Some(Control::Suspend) => {
+                            s.suspending = true;
                             return Ok(());
                         }
                         Some(Control::Command(c)) => dispatch(ctx, &mut s, &mut input, c).await?,
@@ -685,6 +875,9 @@ async fn run_inner(
     }
     .await;
     s.handle.requests.retire_all()?;
+    if s.suspending && result.is_ok() {
+        return suspend(process, &mut s, &mut input, &mut incoming).await;
+    }
     let terminated = stop_process(&mut process, &mut s, &mut input, &mut incoming).await;
     if let Some(reason) = s.stop_reason.take() {
         if reason == "server_restart" {
@@ -733,6 +926,7 @@ async fn prepare_codex(
     paths: &tower_pal::Paths,
     b: &Binding,
     env: &tower_pal::Environment,
+    unloaded: Option<&str>,
 ) -> Result<NativeSetup> {
     let host = tower_agents::codex_host::ensure(paths)
         .await
@@ -751,7 +945,7 @@ async fn prepare_codex(
             "Codex app-server changed during launch",
         ));
     }
-    if let Some(native) = &b.resume_session_id {
+    if let Some(native) = unloaded {
         maintenance
             .wait_unloaded(native, Duration::from_secs(5))
             .await
@@ -811,6 +1005,75 @@ async fn prepare_codex(
     })
 }
 
+/// Releases the native session for the next server without ending it. An
+/// ACP agent process is stopped and later reloads its history; a Codex
+/// thread keeps running in the shared app-server.
+async fn suspend(
+    mut process: Process,
+    s: &mut State<'_>,
+    input: &mut NativeInput,
+    incoming: &mut mpsc::Receiver<Result<Value>>,
+) -> Result<()> {
+    s.flush_text()?;
+    if process.codex.is_some() {
+        let starting = |s: &State| {
+            s.pending
+                .values()
+                .any(|(_, kind)| *kind == ResponseKind::PromptStart)
+        };
+        let _ = tokio::time::timeout(Duration::from_secs(3), async {
+            while starting(s) {
+                match incoming.recv().await {
+                    Some(Ok(v)) if v.get("method").is_none() => native(s, input, v).await?,
+                    Some(Ok(_)) => {}
+                    _ => break,
+                }
+            }
+            Ok::<_, tower_protocol::RpcError>(())
+        })
+        .await;
+        if s.turn.is_none()
+            && let Some(command) = s.active.take()
+        {
+            s.journal.finish_dispatch(
+                s.binding,
+                &command,
+                true,
+                None,
+                Some(failure("dispatch_unknown", "execution", true)),
+            )?;
+        }
+        if let Some(task) = process.connection.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    } else if let Some(child) = &mut process.child {
+        let _ = input.shutdown().await;
+        let _ = tower_pal::kill_protocol_group(process.identity);
+        let reaped = tokio::time::timeout(Duration::from_secs(5), child.wait())
+            .await
+            .is_ok_and(|v| v.is_ok());
+        if !(reaped && group_terminated(process.identity).await) {
+            return Err(error(
+                "stop_unconfirmed",
+                "Native agent did not stop for the restart",
+            ));
+        }
+        process.child = None;
+    }
+    // Commands written to the native session have taken effect; the
+    // running prompt continues after the restart.
+    for (_, receipt) in s.journal.unsettled(s.binding)? {
+        if receipt.dispatch.state == "in_flight"
+            && s.active.as_deref() != Some(receipt.command_id.as_str())
+        {
+            s.done(&receipt.command_id, None, None)?;
+        }
+    }
+    s.metadata["completed"] = json!(s.completed);
+    s.metadata["streamed"] = json!(s.streamed);
+    s.persist_turn()
+}
 async fn stop_process(
     process: &mut Process,
     s: &mut State<'_>,
@@ -957,38 +1220,19 @@ async fn dispatch(
                         .iter()
                         .map(|b| json!({"type":"text","text":b["text"],"text_elements":[]}))
                         .collect();
-                    let mut params = json!({"threadId":s.native,"input":content});
-                    if let Some(config) = s.metadata.get("config").and_then(Value::as_object) {
-                        for (k, v) in config {
-                            if k != "mode" {
-                                params[k] = v.clone();
-                            }
-                        }
-                        if let Some(mode) = config.get("mode") {
-                            let model = config
-                                .get("model")
-                                .or_else(|| s.metadata.get("model"))
-                                .filter(|v| v.is_string())
-                                .ok_or_else(|| {
-                                    error(
-                                        "unsupported_config",
-                                        "Native model identity is required for mode changes",
-                                    )
-                                })?;
-                            params["collaborationMode"] = json!({"mode":mode,"settings":{"model":model,"reasoning_effort":config.get("effort").or_else(||s.metadata.get("effort")),"developer_instructions":null}});
-                        }
-                    }
-                    s.rpc(input, "turn/start", params, &c.command_id, ResponseKind::PromptStart)
+                    let params = s.turn_params(content)?;
+                    s.rpc(input, "turn/start", params, Some(&c.command_id), ResponseKind::PromptStart)
                         .await?;
                 } else {
                     s.rpc(
                         input,
                         "session/prompt",
                         json!({"sessionId":s.acp,"prompt":blocks}),
-                        &c.command_id,
+                        Some(&c.command_id),
                         ResponseKind::PromptEnd,
                     )
                     .await?;
+                    s.persist_turn()?;
                 }
             }
             "cancel" => {
@@ -1005,7 +1249,7 @@ async fn dispatch(
                             input,
                             "turn/interrupt",
                             json!({"threadId":s.native,"turnId":turn}),
-                            &c.command_id,
+                            Some(&c.command_id),
                             ResponseKind::Cancel,
                         )
                         .await?;
@@ -1233,6 +1477,11 @@ async fn native(s: &mut State<'_>, input: &mut NativeInput, v: Value) -> Result<
                 "turn/completed" => {
                     if s.active.is_some()
                         && p.pointer("/turn/id").and_then(Value::as_str) == s.turn.as_deref()
+                        && std::mem::take(&mut s.nudge)
+                    {
+                        s.continue_turn(input).await?;
+                    } else if s.active.is_some()
+                        && p.pointer("/turn/id").and_then(Value::as_str) == s.turn.as_deref()
                     {
                         let status = p
                             .pointer("/turn/status")
@@ -1250,7 +1499,7 @@ async fn native(s: &mut State<'_>, input: &mut NativeInput, v: Value) -> Result<
                         && let Some(text) = p["delta"].as_str()
                     {
                         if let Some(id) = p["itemId"].as_str() {
-                            s.streamed.insert(id.into());
+                            *s.streamed.entry(id.into()).or_default() += text.len();
                         }
                         s.append(
                             "agent_message_chunk",
@@ -1262,36 +1511,10 @@ async fn native(s: &mut State<'_>, input: &mut NativeInput, v: Value) -> Result<
                 }
                 "item/started" | "item/completed" => {
                     let item = &p["item"];
-                    if method == "item/completed"
-                        && item["type"] == "agentMessage"
-                        && s.active.is_some()
-                    {
-                        let id = item["id"].as_str().unwrap_or("");
-                        if !s.streamed.remove(id)
-                            && let Some(text) = item["text"].as_str()
-                        {
-                            s.append(
-                                "agent_message_chunk",
-                                json!({"content":{"type":"text","text":text},"item_id":id}),
-                                s.active.clone(),
-                                false,
-                            )?;
-                        }
-                    }
-                    if matches!(
-                        item["type"].as_str(),
-                        Some("commandExecution" | "fileChange" | "mcpToolCall" | "dynamicToolCall")
-                    ) {
-                        s.append(
-                            if method == "item/started" {
-                                "tool_call"
-                            } else {
-                                "tool_call_update"
-                            },
-                            item.clone(),
-                            s.active.clone(),
-                            false,
-                        )?;
+                    if method == "item/completed" {
+                        completed_item(s, item)?;
+                    } else if is_tool(item) && s.active.is_some() {
+                        s.append("tool_call", item.clone(), s.active.clone(), false)?;
                     }
                 }
                 "serverRequest/resolved" => {
@@ -1362,19 +1585,28 @@ async fn native(s: &mut State<'_>, input: &mut NativeInput, v: Value) -> Result<
         return Ok(());
     };
     if v.get("error").is_some() {
-        s.done(
-            &command,
-            None,
-            Some(failure(
-                "native_rejected",
-                "execution",
-                kind == ResponseKind::PromptEnd,
-            )),
-        )?;
         if matches!(kind, ResponseKind::Initialize | ResponseKind::Session) {
+            if let Some(command) = &command {
+                s.done(
+                    command,
+                    None,
+                    Some(failure("native_rejected", "execution", false)),
+                )?;
+            }
             return Err(error("native_initialize", "Native session setup failed"));
         }
-        if s.active.as_deref() == Some(&command) {
+        if let Some(command) = &command {
+            s.done(
+                command,
+                None,
+                Some(failure(
+                    "native_rejected",
+                    "execution",
+                    kind == ResponseKind::PromptEnd,
+                )),
+            )?;
+        }
+        if s.active.is_some() && s.active == command {
             s.end_turn("error")?;
         }
         return Ok(());
@@ -1385,14 +1617,20 @@ async fn native(s: &mut State<'_>, input: &mut NativeInput, v: Value) -> Result<
             if codex {
                 wire::json_line(input, &json!({"jsonrpc":"2.0","method":"initialized"})).await?;
                 let mut params = json!({"cwd":s.binding.cwd,"config":s.native_config});
-                let method = if let Some(id) = &s.binding.resume_session_id {
+                let method = if let Some(id) = &s.open {
                     params["threadId"] = json!(id);
                     "thread/resume"
                 } else {
                     "thread/start"
                 };
-                s.rpc(input, method, params, &command, ResponseKind::Session)
-                    .await?;
+                s.rpc(
+                    input,
+                    method,
+                    params,
+                    command.as_deref(),
+                    ResponseKind::Session,
+                )
+                .await?;
             } else {
                 if result["protocolVersion"] != 1 {
                     return Err(error(
@@ -1401,7 +1639,7 @@ async fn native(s: &mut State<'_>, input: &mut NativeInput, v: Value) -> Result<
                     ));
                 }
                 let mut params = json!({"cwd":s.binding.cwd,"mcpServers":[]});
-                let method = if let Some(id) = &s.binding.resume_session_id {
+                let method = if let Some(id) = &s.open {
                     params["sessionId"] = json!(id);
                     params["_meta"] = json!({"tower.nativeSessionId":s.resume_native});
                     s.acp = id.clone();
@@ -1409,8 +1647,14 @@ async fn native(s: &mut State<'_>, input: &mut NativeInput, v: Value) -> Result<
                 } else {
                     "session/new"
                 };
-                s.rpc(input, method, params, &command, ResponseKind::Session)
-                    .await?;
+                s.rpc(
+                    input,
+                    method,
+                    params,
+                    command.as_deref(),
+                    ResponseKind::Session,
+                )
+                .await?;
             }
         }
         ResponseKind::Session => {
@@ -1420,7 +1664,7 @@ async fn native(s: &mut State<'_>, input: &mut NativeInput, v: Value) -> Result<
                     s.metadata["effort"] = result["reasoningEffort"].clone();
                 }
                 s.metadata["native_resumable"] = json!(
-                    s.binding.resume_session_id.is_some()
+                    s.open.is_some()
                         && result.pointer("/thread/ephemeral") != Some(&Value::Bool(true))
                 );
                 s.native = result
@@ -1438,26 +1682,34 @@ async fn native(s: &mut State<'_>, input: &mut NativeInput, v: Value) -> Result<
                         .into();
                 }
                 if let Some(id) = result.pointer("/_meta/tower.nativeSessionId") {
-                    s.native = id
+                    let id = id
                         .as_str()
                         .filter(|v| crate::identifier(v))
-                        .ok_or_else(|| error("native_protocol", "Invalid native conversation"))?
-                        .into();
+                        .ok_or_else(|| error("native_protocol", "Invalid native conversation"))?;
+                    if !s.native.is_empty() && s.native != id {
+                        return Err(error(
+                            "native_identity_changed",
+                            "Native resume changed conversation identity",
+                        ));
+                    }
+                    s.native = id.into();
                 }
             }
-            if codex
-                && s.binding
-                    .resume_session_id
-                    .as_ref()
-                    .is_some_and(|id| id != &s.native)
-            {
+            if codex && s.open.as_ref().is_some_and(|id| id != &s.native) {
                 return Err(error(
                     "native_identity_changed",
                     "Native resume changed conversation identity",
                 ));
             }
-            s.state("idle")?;
-            s.done(&command, None, None)?;
+            match (s.continuation.take(), command) {
+                (Some(continuation), _) => restore(s, input, continuation, result).await?,
+                (None, command) => {
+                    s.state("idle")?;
+                    if let Some(command) = command {
+                        s.done(&command, None, None)?;
+                    }
+                }
+            }
         }
         ResponseKind::PromptStart => {
             s.metadata["native_resumable"] = json!(true);
@@ -1471,15 +1723,123 @@ async fn native(s: &mut State<'_>, input: &mut NativeInput, v: Value) -> Result<
             if s.turn.is_none() {
                 return Err(error("native_protocol", "Missing native turn"));
             }
+            s.persist_turn()?;
         }
         ResponseKind::PromptEnd => s.end_turn(if result["stopReason"] == "cancelled" {
             "cancelled"
         } else {
             "end_turn"
         })?,
-        ResponseKind::Cancel => s.done(&command, None, None)?,
+        ResponseKind::Cancel => {
+            if let Some(command) = command {
+                s.done(&command, None, None)?;
+            }
+        }
     }
     Ok(())
+}
+fn is_tool(item: &Value) -> bool {
+    matches!(
+        item["type"].as_str(),
+        Some("commandExecution" | "fileChange" | "mcpToolCall" | "dynamicToolCall")
+    )
+}
+/// Reports a completed Codex item once, including the unstreamed rest of
+/// an agent message.
+fn completed_item(s: &mut State<'_>, item: &Value) -> Result<()> {
+    let Some(id) = item["id"].as_str() else {
+        return Ok(());
+    };
+    if s.active.is_none() || !s.completed.insert(id.into()) {
+        return Ok(());
+    }
+    if item["type"] == "agentMessage" {
+        let streamed = s.streamed.remove(id).unwrap_or(0);
+        if let Some(rest) = item["text"]
+            .as_str()
+            .and_then(|text| text.get(streamed..))
+            .filter(|rest| !rest.is_empty())
+        {
+            s.append(
+                "agent_message_chunk",
+                json!({"content":{"type":"text","text":rest},"item_id":id}),
+                s.active.clone(),
+                false,
+            )?;
+        }
+    } else if is_tool(item) {
+        s.append("tool_call_update", item.clone(), s.active.clone(), false)?;
+    }
+    Ok(())
+}
+/// Re-establishes the turn the previous server left running, reporting
+/// output the native session produced in between.
+async fn restore(
+    s: &mut State<'_>,
+    input: &mut NativeInput,
+    c: Continuation,
+    opened: &Value,
+) -> Result<()> {
+    for (_, receipt) in s.journal.unsettled(s.binding)? {
+        if receipt.dispatch.state == "in_flight"
+            && c.active.as_deref() != Some(receipt.command_id.as_str())
+        {
+            // Only a crash leaves these: delivery cannot be confirmed.
+            s.journal.finish_dispatch(
+                s.binding,
+                &receipt.command_id,
+                true,
+                None,
+                Some(failure("dispatch_unknown", "execution", true)),
+            )?;
+        }
+    }
+    s.queue.extend(s.journal.pending_commands(s.binding)?);
+    let Some(command) = c.active else {
+        return s.state("idle");
+    };
+    s.active = Some(command);
+    if s.binding.protocol != "codex-app-server" {
+        s.state("working")?;
+        return s.continue_turn(input).await;
+    }
+    let turn = c.turn.as_deref().and_then(|id| {
+        opened
+            .pointer("/thread/turns")
+            .and_then(Value::as_array)?
+            .iter()
+            .find(|t| t["id"] == id)
+    });
+    let Some(turn) = turn else {
+        s.state("working")?;
+        return s.continue_turn(input).await;
+    };
+    s.turn = c.turn;
+    match c.completed {
+        Some(completed) => {
+            s.completed = completed;
+            for item in turn["items"].as_array().into_iter().flatten() {
+                completed_item(s, item)?;
+            }
+        }
+        None => s.dropped(),
+    }
+    match turn["status"].as_str() {
+        Some("inProgress") => {
+            s.state("working")?;
+            if c.waiting {
+                // Its approval request went to the previous connection.
+                s.nudge = true;
+                let params = json!({"threadId":s.native,"turnId":s.turn});
+                s.rpc(input, "turn/interrupt", params, None, ResponseKind::Cancel)
+                    .await?;
+            }
+            Ok(())
+        }
+        Some("completed") => s.end_turn("end_turn"),
+        Some("interrupted") => s.end_turn("cancelled"),
+        _ => s.end_turn("error"),
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -1505,6 +1865,7 @@ mod tests {
             binding,
             handle,
             native: "native".into(),
+            open: None,
             resume_native: None,
             acp: String::new(),
             metadata: json!({}),
@@ -1512,7 +1873,11 @@ mod tests {
             active: Some("prompt".into()),
             stop_command: None,
             stop_reason: None,
+            suspending: false,
+            continuation: None,
+            nudge: false,
             streamed: Default::default(),
+            completed: Default::default(),
             turn: Some("turn".into()),
             pending: Default::default(),
             counter: 0,

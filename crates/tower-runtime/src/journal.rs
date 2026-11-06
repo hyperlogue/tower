@@ -494,6 +494,39 @@ impl Journal {
         })
         .collect()
     }
+    /// Admitted commands that never reached the native session, oldest first.
+    pub fn pending_commands(&self, binding: &Binding) -> Result<Vec<ExecutionCommand>> {
+        let conn = self.lock()?;
+        let mut q = conn.prepare("SELECT command_id,kind,payload,expires_at FROM commands WHERE namespace=?1 AND runtime_id=?2 AND generation=?3 AND json_extract(receipt,'$.dispatch.state')='not_started' ORDER BY created_at,rowid").map_err(internal)?;
+        q.query_map(
+            params![binding.namespace(), binding.runtime_id, binding.generation],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .map_err(internal)?
+        .map(|r| {
+            let (command_id, kind, payload, expires) = r.map_err(internal)?;
+            Ok(ExecutionCommand {
+                command_id,
+                session_id: binding.session_id.clone(),
+                runtime_id: binding.runtime_id.clone(),
+                generation: binding.generation.clone(),
+                kind,
+                payload: match payload {
+                    Some(body) => serde_json::from_str(&body).map_err(internal)?,
+                    None => serde_json::from_value(serde_json::Value::Null).map_err(internal)?,
+                },
+                expires_at: crate::format_time(expires as u64),
+            })
+        })
+        .collect()
+    }
     pub fn metadata(&self, binding: &Binding) -> Result<serde_json::Value> {
         let json:String=self.lock()?.query_row("SELECT metadata FROM runtimes WHERE namespace=?1 AND runtime_id=?2 AND generation=?3",params![binding.namespace(),binding.runtime_id,binding.generation],|r|r.get(0)).map_err(internal)?;
         serde_json::from_str(&json).map_err(internal)
