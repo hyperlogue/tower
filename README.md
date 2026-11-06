@@ -526,7 +526,9 @@ Terminal launch requires both local configuration and browser consent; `admin`,
 `send`, and `acp:control` do not grant it. `[allgather] managed = false` disables
 both remote launch modes. Terminal lifecycle events contain no PTY output or
 transcript. A surviving pool session retains its identity across daemon restart;
-a lost execution is fenced and is not automatically relaunched.
+after pool loss or upgrade, resumable terminal sessions recover their native
+conversations under the same runtime identity. Recovery requires confirmed
+termination and resumable history. Uncertain executions remain fenced.
 
 Credentials are saved with mode 0600. Tower owns session state and local rules.
 Allgather owns its policy table. Disconnecting or revoking the server-side key
@@ -562,7 +564,8 @@ Structured sessions keep their identity across a Tower daemon restart, local or
 launched from Allgather. Codex turns keep running in the Codex daemon. An ACP
 agent is stopped and reloads its conversation when Tower starts again; a turn
 it was running, or a Codex turn waiting for approval, is told to continue.
-Pending approvals are withdrawn and asked again. Transcript
+Pending approvals are withdrawn. If the continued turn needs approval, it
+creates a new request. Transcript
 events use a separate bounded journal and are released after acknowledgment.
 Private permission requests, form requests, URL interactions, and replies remain
 in memory. Explicit resume keeps the Tower session ID and creates a fresh execution
@@ -572,8 +575,8 @@ executions before resuming. This requires `session-force-resume.v1` on both
 sides. If ownership or termination cannot be confirmed, cleanup fails and no
 replacement starts. Force resume preserves native history and never kills the
 shared Codex host. Codex must have confirmed resumable history; ephemeral
-threads are refused before cleanup. Terminal mode does not support resume. The former uncertain
-overlap override is no longer accepted.
+threads are refused before cleanup. Terminal mode does not support explicit
+remote resume.
 
 Both sides must advertise `policy-sync.v1` and `session-status.v1`. Policy snapshots
 atomically replace only the remote table; stale/conflicting revisions are rejected.

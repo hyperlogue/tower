@@ -557,15 +557,7 @@ trust_level="trusted"
         std::fs::write(home.join(".claude.json"),serde_json::to_vec(&json!({"hasCompletedOnboarding":true,"theme":"dark","customApiKeyResponses":{"approved":["fixture-key"]},"projects":{path.to_str().unwrap():{"hasTrustDialogAccepted":true,"hasCompletedProjectOnboarding":true}}})).unwrap()).unwrap();
     }
     let args = if harness == "codex" {
-        vec![
-            "open",
-            "codex",
-            "--mode",
-            "app-server",
-            "--headless",
-            "--",
-            "Reply with ready.",
-        ]
+        vec!["open", "codex", "--headless", "--", "Reply with ready."]
     } else {
         vec![
             "open",

@@ -51,8 +51,6 @@ enum Command {
         protocol: Option<String>,
         #[arg(long)]
         cwd: Option<String>,
-        #[arg(long, hide = true, value_parser = ["app-server"])]
-        mode: Option<String>,
         #[arg(long)]
         headless: bool,
         #[arg(long)]
@@ -88,8 +86,6 @@ enum Command {
     },
     Restart {
         id: String,
-        #[arg(long, hide = true, value_parser = ["app-server"])]
-        mode: Option<String>,
         #[arg(last = true)]
         args: Option<Vec<String>>,
         #[arg(
@@ -754,7 +750,6 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
             checkout,
             protocol,
             cwd,
-            mode,
             headless,
             resume,
             fork,
@@ -764,7 +759,7 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
                 checkout_id: checkout.clone(),
                 harness,
                 protocol,
-                mode,
+                mode: None,
                 headless,
                 args,
                 resume: resume.map(|native_session_id| ConversationSeed {
@@ -782,23 +777,7 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
             if cli.json {
                 print_json(&r)?;
             } else if !headless && tower_pal::is_terminal() {
-                let caps = match opened.caps {
-                    Some(caps) => caps,
-                    None => {
-                        let value = client
-                            .call(
-                                "agent.get",
-                                &IdParams {
-                                    id: opened.id.clone(),
-                                },
-                            )
-                            .await?;
-                        let record: AgentRecord =
-                            serde_json::from_value(serde_json::to_value(value)?)?;
-                        record.caps
-                    }
-                };
-                if caps.attach {
+                if opened.caps.is_some_and(|caps| caps.attach) {
                     attach::run(&mut client, &opened.id).await?;
                 } else {
                     println!("{}", opened.id);
@@ -820,7 +799,6 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
         )?,
         Command::Restart {
             id,
-            mode,
             args,
             clear_args,
         } => print_json(
@@ -829,7 +807,7 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
                     "session.restart",
                     &SessionRestartParams {
                         id,
-                        mode,
+                        mode: None,
                         args: if clear_args { Some(vec![]) } else { args },
                     },
                 )

@@ -791,7 +791,20 @@ impl ManagedBackend for TerminalBackend {
                 .iter()
                 .any(|r| r.name == binding.name && r.state == "exited")
         }) {
-            pool::request(&self.paths,&Request::Remove{name:binding.name.clone()}).map_err(|_|error("pool_incompatible","Pool cannot replace an exited session; restart the pool after stopping its sessions"))?;
+            match pool::request(
+                &self.paths,
+                &Request::Remove {
+                    name: binding.name.clone(),
+                },
+            ) {
+                Ok(Reply::Ok) => {}
+                _ => {
+                    return Err(error(
+                        "backend_unavailable",
+                        "Cannot remove the stopped terminal session",
+                    ));
+                }
+            }
         }
         match pool::request(&self.paths, &Request::Create { launch }) {
             Ok(Reply::Created { session: created }) if created.name == binding.name => {

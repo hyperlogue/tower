@@ -259,8 +259,6 @@ trust_level = "trusted"
     let opened = f.call(&[
         "open",
         "codex",
-        "--mode",
-        "app-server",
         "--headless",
         "--cwd",
         f.root.path().to_str().unwrap(),
