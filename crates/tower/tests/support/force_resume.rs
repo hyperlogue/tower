@@ -157,7 +157,17 @@ async fn force_resume_stops_exact_owners_and_preserves_native_history_and_other_
         let stopped_resume = format!("stopped-{harness}");
         let mut empty = resume(&f, harness, protocol, &old, &stopped_resume, native);
         empty["payload"]["cleanup"] = json!([]);
-        let receipt = s.call("command.execute", empty.clone()).await;
+        assert_eq!(
+            s.call("command.execute", empty.clone()).await["error"]["data"]["code"],
+            "invalid_params"
+        );
+        let mut ordinary = empty;
+        ordinary["payload"].as_object_mut().unwrap().remove("force");
+        ordinary["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("cleanup");
+        let receipt = s.call("command.execute", ordinary.clone()).await;
         assert_eq!(
             receipt["result"]["acceptance"]["level"], "adapter",
             "{receipt}"
@@ -168,7 +178,7 @@ async fn force_resume_stops_exact_owners_and_preserves_native_history_and_other_
         assert_eq!(restarted["native_session_id"], first["native_session_id"]);
         assert_ne!(restarted["owner_id"], next["owner_id"]);
         assert_eq!(
-            s.call("command.execute", empty).await["result"]["dispatch"]["state"],
+            s.call("command.execute", ordinary).await["result"]["dispatch"]["state"],
             "finished"
         );
         f.cli(&["kill", restarted["tower_session_id"].as_str().unwrap()]);
