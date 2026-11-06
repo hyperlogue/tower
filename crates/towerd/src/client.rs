@@ -3,15 +3,13 @@ use std::{io, time::Duration};
 use tokio::io::BufReader;
 use tower_pal::{Paths, SingletonLock};
 use tower_protocol::{
-    CallerContext, HelloParams, HelloResult, PROTOCOL_VERSION, Request, RequestId, Response,
-    ResponseBody, Value,
+    CallerContext, HelloParams, PROTOCOL_VERSION, Request, RequestId, Response, ResponseBody, Value,
 };
 
 pub struct Client {
     reader: BufReader<tower_pal::IpcStream>,
     context: CallerContext,
     next: u64,
-    features: Vec<String>,
     events: std::collections::VecDeque<tower_protocol::EventNotification>,
     failed: bool,
 }
@@ -89,11 +87,10 @@ impl Client {
             reader: BufReader::new(stream),
             context,
             next: 0,
-            features: Vec::new(),
             events: Default::default(),
             failed: false,
         };
-        let hello = client
+        client
             .call(
                 "hello",
                 &HelloParams {
@@ -101,8 +98,6 @@ impl Client {
                 },
             )
             .await?;
-        let hello: HelloResult = serde_json::from_value(serde_json::to_value(hello)?)?;
-        client.features = hello.capabilities;
         Ok(client)
     }
     pub async fn call<T: serde::Serialize>(&mut self, method: &str, params: &T) -> Result<Value> {
@@ -130,30 +125,6 @@ impl Client {
             params: serde_json::from_value(serde_json::to_value(params)?)?,
             context: self.context.clone(),
         };
-        if method == "session.open"
-            && matches!(&request.params, Value::Object(p) if p.get("protocol").is_some_and(|v| !matches!(v, Value::Null)))
-            && !self.features.iter().any(|f| f == "sessions.managed.v1")
-        {
-            return Err(tower_protocol::RpcError::application("unsupported", "The running daemon does not support session protocol selection; restart it after upgrading").into());
-        }
-        if method == "session.open"
-            && matches!(&request.params,Value::Object(p) if p.get("resume").is_some_and(|v|!matches!(v,Value::Null)))
-            && !self
-                .features
-                .iter()
-                .any(|f| f == "sessions.conversations.v1")
-        {
-            return Err(tower_protocol::RpcError::application("unsupported","The running daemon does not support explicit conversation selection; restart it after upgrading").into());
-        }
-        if matches!(method, "session.restart" | "session.resume")
-            && matches!(&request.params,Value::Object(p) if p.get("args").is_some_and(|v|!matches!(v,Value::Null)))
-            && !self
-                .features
-                .iter()
-                .any(|f| f == "sessions.restart-options.v1")
-        {
-            return Err(tower_protocol::RpcError::application("unsupported","The running daemon does not support replacement arguments; restart it after upgrading").into());
-        }
         wire::write_frame(self.reader.get_mut(), &request).await?;
         let timeout = if method == "approval.watch" {
             610

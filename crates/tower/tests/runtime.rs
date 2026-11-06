@@ -498,43 +498,6 @@ fn registry_and_unmanaged_sessions_work_without_starting_a_terminal_pool() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn explicit_protocol_selection_does_not_fall_back_on_an_old_daemon() {
-    let f = Fixture::new();
-    tower_pal::private_dir(f.socket().parent().unwrap()).unwrap();
-    let listener = tower_pal::IpcListener::bind(&f.socket()).await.unwrap();
-    let peer = tokio::spawn(async move {
-        let (socket, _) = listener.accept().await.unwrap();
-        let mut reader = BufReader::new(socket);
-        let mut line = String::new();
-        reader.read_line(&mut line).await.unwrap();
-        let hello: Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(hello["method"], "hello");
-        let response = json!({"jsonrpc":"2.0","id":hello["id"],"result":{"protocol_version":{"major":1,"minor":0},"capabilities":["sessions.codex-native.v1"]}});
-        reader
-            .get_mut()
-            .write_all(format!("{response}\n").as_bytes())
-            .await
-            .unwrap();
-        line.clear();
-        assert_eq!(
-            tokio::time::timeout(Duration::from_secs(3), reader.read_line(&mut line))
-                .await
-                .unwrap()
-                .unwrap(),
-            0,
-            "no open request may reach a daemon that ignores protocol selection"
-        );
-    });
-    failure(
-        f.command(&["--json", "--no-start", "open", "codex", "--protocol", "acp"])
-            .output()
-            .unwrap(),
-        "unsupported",
-    );
-    peer.await.unwrap();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn subscriptions_preserve_fragmented_requests_and_enforce_revocation() {
     let f = Fixture::new();
     f.run(&["daemon", "status"]);
