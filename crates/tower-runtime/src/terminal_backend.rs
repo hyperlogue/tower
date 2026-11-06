@@ -180,4 +180,7 @@ impl TerminalAccess for TerminalBackend {
             |t| t.pool_info(),
         )
     }
+    fn restart_pool(&self) -> Result<()> {
+        self.access()?.restart_pool()
+    }
 }

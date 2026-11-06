@@ -36,6 +36,7 @@ pub async fn run(paths: Paths) -> io::Result<()> {
     };
     clients.abort_all();
     while clients.join_next().await.is_some() {}
+    drop(listener);
     let handles: Vec<_> = sessions.lock().unwrap().values().cloned().collect();
     for h in handles {
         let (tx, rx) = oneshot::channel();
@@ -43,7 +44,6 @@ pub async fn run(paths: Paths) -> io::Result<()> {
             let _ = rx.await;
         }
     }
-    drop(listener);
     result
 }
 fn find(sessions: &Sessions, name: &str) -> Option<Handle> {
@@ -85,18 +85,16 @@ async fn connection(
     let first = tokio::time::timeout(Duration::from_secs(5), wire::read(&mut stream))
         .await
         .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
-    if !matches!(
-        first.json::<Request>()?,
-        Request::Hello {
-            version: wire::VERSION
-        }
-    ) {
+    // Frozen core: answer Hello from every client version, then serve only
+    // List and Shutdown when versions differ (see tower_pool_proto).
+    let Request::Hello { version } = first.json::<Request>()? else {
         return reply(
             &mut stream,
-            &Reply::error("protocol_incompatible", "pool major version differs"),
+            &Reply::error("invalid_request", "expected hello"),
         )
         .await;
-    }
+    };
+    let core_only = version != wire::VERSION;
     reply(
         &mut stream,
         &Reply::Hello {
@@ -115,6 +113,13 @@ async fn connection(
         .await
         .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??
         .json::<Request>()?;
+    if core_only && !matches!(request, Request::List | Request::Shutdown) {
+        return reply(
+            &mut stream,
+            &Reply::error("protocol_incompatible", "pool version differs"),
+        )
+        .await;
+    }
     match request {
         Request::Inject { name, proof, text } => {
             let Some(handle) = find(&sessions, &name) else {

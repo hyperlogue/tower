@@ -995,6 +995,11 @@ impl Service {
                     self.managed_kill(&p.id)
                 }
             }
+            "pool.upgrade" => {
+                require(&actor, "admin")?;
+                let p: PoolUpgradeParams = params(&request.params)?;
+                self.upgrade_pool(p.require_idle)
+            }
             "session.snapshot" => {
                 require(&actor, "read")?;
                 let p: IdParams = params(&request.params)?;

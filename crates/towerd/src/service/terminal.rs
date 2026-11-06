@@ -42,6 +42,37 @@ impl Service {
         }
         value(terminal.snapshot(&session)?)
     }
+    /// Replaces the terminal pool and resumes its sessions. With
+    /// `require_idle`, refuses while any terminal session is mid-turn.
+    pub(super) fn upgrade_pool(&self, require_idle: bool) -> std::result::Result<Value, RpcError> {
+        let terminal = self
+            .backends
+            .iter()
+            .find_map(|b| b.terminal())
+            .ok_or_else(|| app("unsupported", "No terminal pool is configured"))?;
+        if require_idle {
+            for session in self.store.managed_sessions().map_err(storage)? {
+                if session.protocol != "terminal" {
+                    continue;
+                }
+                let status = self
+                    .store
+                    .agent(&session.id)
+                    .map_err(storage)?
+                    .record
+                    .status;
+                if matches!(
+                    status.as_str(),
+                    "starting" | "working" | "waiting_input" | "waiting_approval"
+                ) {
+                    return Err(app("sessions_busy", "A terminal session is not idle"));
+                }
+            }
+        }
+        terminal.restart_pool()?;
+        self.sync_managed().map_err(storage)?;
+        value(self.terminal_pool_info())
+    }
     pub(super) fn terminal_pool_info(&self) -> PoolInfo {
         self.backends.iter().find_map(|b| b.terminal()).map_or(
             PoolInfo {

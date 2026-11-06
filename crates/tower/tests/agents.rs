@@ -324,6 +324,34 @@ fn pool_crash_recovers_native_conversations_but_never_reopens_killed_sessions() 
 }
 
 #[test]
+fn pool_upgrade_replaces_the_pool_and_resumes_its_sessions() {
+    let f = Fixture::new();
+    let opened = f.call(&["open", "claude", "--headless"]);
+    let id = opened["id"].as_str().unwrap();
+    let before = f.wait(id, "idle");
+    let launcher = |row: &Value| {
+        tower_pal::process_identity(row["pid"].as_u64().unwrap() as u32)
+            .unwrap()
+            .parent
+    };
+    let old_pool = tower_pal::process_identity(launcher(&before))
+        .unwrap()
+        .parent;
+    let info = f.call(&["pool", "upgrade", "--wait-idle"]);
+    assert_eq!(info["running"], true);
+    let recovered = f.wait(id, "idle");
+    assert_ne!(recovered["pid"], before["pid"]);
+    assert_eq!(recovered["native_session_id"], before["native_session_id"]);
+    assert!(tower_pal::process_identity(old_pool).is_err());
+    assert!(
+        std::fs::read_to_string(f.root.path().join("claude.args"))
+            .unwrap()
+            .contains("--resume\nnative-claude-code")
+    );
+    f.call(&["kill", id]);
+}
+
+#[test]
 fn missing_native_identity_fails_recovery_without_creating_a_new_conversation() {
     let f = Fixture::new();
     let program = f.root.path().join("bin/claude");

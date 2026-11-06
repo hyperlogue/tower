@@ -185,6 +185,11 @@ pub struct PoolInfo {
     pub running: bool,
     pub proto_version: Option<ProtocolVersion>,
 }
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PoolUpgradeParams {
+    #[serde(default)]
+    pub require_idle: bool,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AllgatherInfo {
     pub connected: bool,

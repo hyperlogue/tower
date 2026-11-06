@@ -1025,13 +1025,14 @@ impl TerminalAccess for TerminalBackend {
         Ok(snapshot)
     }
     fn pool_info(&self) -> PoolInfo {
-        let running = pool::list(&self.paths).is_ok();
+        let version = pool::version(&self.paths).ok().flatten();
         PoolInfo {
-            running,
-            proto_version: running.then_some(ProtocolVersion {
-                major: tower_pool_proto::VERSION,
-                minor: 0,
-            }),
+            running: version.is_some(),
+            proto_version: version.map(|major| ProtocolVersion { major, minor: 0 }),
         }
+    }
+    fn restart_pool(&self) -> Result<()> {
+        pool::restart(&self.paths)
+            .map_err(|_| error("pool_unavailable", "Cannot restart terminal pool"))
     }
 }

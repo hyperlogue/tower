@@ -113,6 +113,11 @@ enum Command {
     Snapshot {
         id: String,
     },
+    /// Manage the terminal pool.
+    Pool {
+        #[command(subcommand)]
+        command: PoolCommand,
+    },
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
@@ -290,6 +295,16 @@ enum DaemonCommand {
     Start,
     Status,
     Stop,
+}
+#[derive(Subcommand)]
+enum PoolCommand {
+    /// Replace the pool with the installed version. Its sessions restart and
+    /// resume their conversations.
+    Upgrade {
+        /// Wait until no terminal session is mid-turn.
+        #[arg(long)]
+        wait_idle: bool,
+    },
 }
 #[derive(Args, Default)]
 struct ListArgs {
@@ -851,6 +866,26 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
                     eprintln!("tower-cli: snapshot contains unsupported terminal sequences");
                 }
             }
+        }
+        Command::Pool {
+            command: PoolCommand::Upgrade { wait_idle },
+        } => {
+            let params = PoolUpgradeParams {
+                require_idle: wait_idle,
+            };
+            let mut waiting = false;
+            let r = loop {
+                match client.call("pool.upgrade", &params).await {
+                    Err(towerd::Error::Rpc(e)) if wait_idle && e.data.code == "sessions_busy" => {
+                        if !std::mem::replace(&mut waiting, true) {
+                            eprintln!("tower-cli: waiting for terminal sessions to become idle");
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                    result => break result?,
+                }
+            };
+            print_json(&r)?;
         }
         Command::Daemon {
             command: DaemonCommand::Status | DaemonCommand::Start,

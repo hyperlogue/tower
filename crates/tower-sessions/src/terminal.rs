@@ -8,6 +8,8 @@ pub trait TerminalAccess: Send + Sync {
     fn attach_info(&self, session: &ManagedSession) -> Result<AttachInfo>;
     fn snapshot(&self, session: &ManagedSession) -> Result<SnapshotResult>;
     fn pool_info(&self) -> PoolInfo;
+    /// Replaces the pool process. Its sessions end and resume as lost sessions.
+    fn restart_pool(&self) -> Result<()>;
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]

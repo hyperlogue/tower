@@ -1,3 +1,12 @@
+//! Pool control protocol.
+//!
+//! Frozen core: the frame format (big-endian `u32` length, kind byte, body),
+//! `Request::Hello` and `Reply::Hello`, `Request::List` with `Reply::Sessions`
+//! (the `name`, `state`, `pid`, and `pid_start_time` fields of [`Session`]),
+//! `Request::Shutdown` with `Reply::Ok`, and `Reply::Error` must keep their
+//! shape in every pool version. A pool answers them even when `VERSION`
+//! differs, so any server can list a running pool's sessions and replace the
+//! pool. Everything else may change with `VERSION`.
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -104,14 +113,18 @@ pub struct InputProof {
     pub idle_since: u64,
     pub checked_at: u64,
 }
+/// The first four fields are frozen core; the others default when absent.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
     pub name: String,
     pub state: String,
     pub pid: Option<u32>,
     pub pid_start_time: Option<u64>,
+    #[serde(default)]
     pub attach_count: u32,
+    #[serde(default)]
     pub size: Size,
+    #[serde(default)]
     pub exit_code: Option<i32>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -271,10 +284,18 @@ pub async fn hello_capabilities(
     }
 }
 pub fn hello_sync(stream: &mut (impl Read + Write)) -> io::Result<()> {
+    match core_hello_sync(stream)? {
+        VERSION => Ok(()),
+        _ => Err(io::Error::other("incompatible pool protocol")),
+    }
+}
+/// Greets a pool of any version and returns its version. Only frozen core
+/// requests may follow when it differs from [`VERSION`].
+pub fn core_hello_sync(stream: &mut (impl Read + Write)) -> io::Result<u16> {
     write_sync(stream, &Request::Hello { version: VERSION })?;
     match read_sync(stream)?.json::<Reply>()?.checked()? {
-        Reply::Hello { version, .. } if version == VERSION => Ok(()),
-        _ => Err(io::Error::other("incompatible pool protocol")),
+        Reply::Hello { version, .. } => Ok(version),
+        _ => Err(io::Error::other("invalid pool greeting")),
     }
 }
 

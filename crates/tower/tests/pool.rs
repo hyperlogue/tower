@@ -303,23 +303,33 @@ fn kill_reaps_child_and_terminates_its_process_group() {
     wait(|| !tower_pal::process_identity(pid).is_ok_and(|i| i == identity));
 }
 #[test]
-fn malformed_frames_and_incompatible_peers_do_not_stop_pool() {
+fn malformed_frames_and_other_versions_do_not_stop_pool() {
     let p = Pool::new();
-    let mut s = tower_pal::connect_blocking(&p.socket()).unwrap();
-    wire::write_sync(&mut s, &Request::Hello { version: 999 }).unwrap();
-    assert!(
-        wire::read_sync(&mut s)
-            .unwrap()
-            .json::<Reply>()
-            .unwrap()
-            .checked()
-            .is_err()
-    );
+    p.launch("core", "sleep 30", true);
+    let other = |request: Request| {
+        let mut s = tower_pal::connect_blocking(&p.socket()).unwrap();
+        wire::write_sync(&mut s, &Request::Hello { version: 999 }).unwrap();
+        let Reply::Hello { version, .. } = wire::read_sync(&mut s).unwrap().json().unwrap() else {
+            panic!("pool must greet every version");
+        };
+        assert_eq!(version, wire::VERSION);
+        wire::write_sync(&mut s, &request).unwrap();
+        wire::read_sync(&mut s).unwrap().json::<Reply>().unwrap()
+    };
+    let Reply::Sessions { sessions } = other(Request::List) else {
+        panic!("list is frozen core");
+    };
+    assert_eq!(sessions[0].name, "core");
+    assert!(matches!(
+        other(Request::Kill { name: "core".into() }),
+        Reply::Error { code, .. } if code == "protocol_incompatible"
+    ));
+    assert_eq!(p.list()[0].state, "running");
     let mut s = p.connect();
     s.write_all(&[255, 255, 255, 255]).unwrap();
     let mut b = [0];
     assert!(!s.read(&mut b).is_ok_and(|n| n != 0));
-    assert!(p.list().is_empty());
+    assert_eq!(p.list().len(), 1);
 }
 
 #[test]

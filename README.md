@@ -214,6 +214,11 @@ and its sessions. Service managers can run it with `tower-terminal-pool run`.
 The generated jobs are `tower` and `tower-terminal-pool` and have separate
 lifetimes.
 
+A running pool keeps its version when binaries are updated. Run
+`tower-cli pool upgrade` to replace it; its sessions restart and resume their
+conversations. `--wait-idle` first waits until no terminal session is mid-turn.
+The server replaces a pool with a different protocol version automatically.
+
 Snapshots contain reconstructed ANSI text, with a `truncated` flag for discarded
 history and a `limited` flag for unsupported terminal behavior. The current bounds
 are 10,000 history lines and 16 MiB of retained cells per session. The pool accepts
@@ -305,8 +310,6 @@ Bash or Zsh `SHELL`; when Tower starts the daemon it supplies Bash if needed. Ap
 credentials are stored in private per-session files; they are not placed in
 native configuration values or applied to the shared server environment.
 Per-launch model and permission options remain available through `open -- …`.
-Codex native mode and directory-specific mode overrides are not supported.
-
 Restart and resume keep the Tower ID. They require a native conversation ID.
 Recovery after pool or host loss resumes previously active conversations; it
 reports failure instead of starting a different conversation when the native ID

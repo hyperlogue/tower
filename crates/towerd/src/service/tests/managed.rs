@@ -1,5 +1,5 @@
 use super::*;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tower_sessions::{Backends, ManagedBackend, ManagedSession, Observation, PreparedSession};
 
 struct StructuredBackend {
@@ -9,6 +9,7 @@ struct StructuredBackend {
     unavailable: AtomicBool,
     allow_stop: AtomicBool,
     injected_id: Mutex<Option<String>>,
+    pool_restarts: AtomicUsize,
 }
 impl StructuredBackend {
     fn new(protocol: &str, store: Arc<Store>) -> Self {
@@ -19,6 +20,7 @@ impl StructuredBackend {
             unavailable: AtomicBool::new(false),
             allow_stop: AtomicBool::new(true),
             injected_id: Mutex::new(None),
+            pool_restarts: AtomicUsize::new(0),
         }
     }
     fn observation(&self, id: &str, status: &str) -> Observation {
@@ -106,6 +108,27 @@ impl ManagedBackend for StructuredBackend {
             .unwrap()
             .insert(s.id.clone(), "exited".into());
         Ok(self.observation(&s.id, "exited"))
+    }
+    fn terminal(&self) -> Option<&dyn tower_sessions::terminal::TerminalAccess> {
+        (self.protocol == "terminal").then_some(self)
+    }
+}
+impl tower_sessions::terminal::TerminalAccess for StructuredBackend {
+    fn attach_info(&self, _: &ManagedSession) -> tower_sessions::Result<AttachInfo> {
+        Err(app("unsupported", "test backend"))
+    }
+    fn snapshot(&self, _: &ManagedSession) -> tower_sessions::Result<SnapshotResult> {
+        Err(app("unsupported", "test backend"))
+    }
+    fn pool_info(&self) -> PoolInfo {
+        PoolInfo {
+            running: true,
+            proto_version: None,
+        }
+    }
+    fn restart_pool(&self) -> tower_sessions::Result<()> {
+        self.pool_restarts.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 }
 fn install(service: &mut Service, default: &str, drivers: Vec<Arc<dyn ManagedBackend>>) {
@@ -293,4 +316,34 @@ fn management_does_not_override_a_backends_stop_capability() {
     );
     assert_eq!(store.agent(&id).unwrap().record.status, "idle");
     assert!(store.managed_session(&id).unwrap().launch.is_some());
+}
+#[test]
+fn pool_upgrade_can_require_idle_terminal_sessions() {
+    let (_dir, store, mut s) = setup();
+    let terminal = Arc::new(StructuredBackend::new("terminal", store.clone()));
+    install(&mut s, "terminal", vec![terminal.clone()]);
+    let id = open(&s, None);
+    let set = |state: &str| {
+        terminal
+            .states
+            .lock()
+            .unwrap()
+            .insert(id.clone(), state.into());
+        s.sync_managed().unwrap();
+    };
+    let upgrade = |require_idle: bool| {
+        call(
+            &s,
+            "pool.upgrade",
+            serde_json::json!({"require_idle":require_idle}),
+            human(),
+        )
+    };
+    set("working");
+    assert_eq!(upgrade(true).unwrap_err().data.code, "sessions_busy");
+    assert_eq!(terminal.pool_restarts.load(Ordering::Relaxed), 0);
+    upgrade(false).unwrap();
+    set("idle");
+    upgrade(true).unwrap();
+    assert_eq!(terminal.pool_restarts.load(Ordering::Relaxed), 2);
 }
