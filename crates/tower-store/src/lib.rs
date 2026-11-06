@@ -63,20 +63,7 @@ pub struct StoredToken {
 pub struct Store {
     conn: Mutex<Connection>,
 }
-const MIGRATIONS: &[&str] = &[
-    include_str!("schema.sql"),
-    "CREATE INDEX agent_token_hash ON agents(token_hash); CREATE INDEX named_token_hash ON tokens(hash);",
-    "CREATE TABLE owned_launches(id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,data TEXT NOT NULL);",
-    include_str!("managed.sql"),
-    "ALTER TABLE managed_sessions ADD COLUMN auto_resume INTEGER NOT NULL DEFAULT 1; UPDATE managed_sessions SET auto_resume=0 WHERE launch IS NULL;",
-    "CREATE TABLE delivery(id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,data TEXT NOT NULL); CREATE TABLE approvals(id TEXT PRIMARY KEY,data TEXT NOT NULL,body_hash BLOB NOT NULL,consumed INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL); CREATE INDEX approvals_created ON approvals(created_at); CREATE INDEX approvals_expiry ON approvals(json_extract(data,'$.expires_at')) WHERE json_extract(data,'$.state')='pending';",
-    "CREATE INDEX IF NOT EXISTS approvals_expiry ON approvals(json_extract(data,'$.expires_at')) WHERE json_extract(data,'$.state')='pending'; CREATE INDEX approvals_body_hash ON approvals(body_hash);",
-    "DROP INDEX process_identity; CREATE UNIQUE INDEX process_identity ON agents(pid,pid_start) WHERE pid IS NOT NULL AND pid_start IS NOT NULL AND ownership='registered' AND coalesce(json_extract(public_json,'$.shared_process'),0)=0; CREATE INDEX process_observation ON agents(pid,pid_start);",
-    "ALTER TABLE policy_snapshot ADD COLUMN delta_hash BLOB;",
-    "ALTER TABLE agents ADD COLUMN observed_status TEXT; ALTER TABLE agents ADD COLUMN stop_requested INTEGER NOT NULL DEFAULT 0; UPDATE agents SET observed_status=json_extract(public_json,'$.status');",
-    include_str!("vcs.sql"),
-    "DROP TABLE session_checkouts; ALTER TABLE vcs_operations DROP COLUMN checkout_id;",
-];
+const SCHEMA: &str = include_str!("schema.sql");
 
 fn observe_status(tx: &Transaction<'_>, record: &mut AgentRecord, status: &str) -> Result<()> {
     let (previous, stopping): (Option<String>, bool) = tx.query_row(
@@ -125,14 +112,15 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
         let version: u32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if version as usize > MIGRATIONS.len() {
-            return Err(Error::Schema);
-        }
-        for (index, sql) in MIGRATIONS.iter().enumerate().skip(version as usize) {
-            let tx = conn.transaction()?;
-            tx.execute_batch(sql)?;
-            tx.pragma_update(None, "user_version", (index + 1) as u32)?;
-            tx.commit()?;
+        match version {
+            0 => {
+                let tx = conn.transaction()?;
+                tx.execute_batch(SCHEMA)?;
+                tx.pragma_update(None, "user_version", 1)?;
+                tx.commit()?;
+            }
+            1 => {}
+            _ => return Err(Error::Schema),
         }
         Ok(Self {
             conn: Mutex::new(conn),

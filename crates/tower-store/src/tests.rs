@@ -233,111 +233,12 @@ fn registration_guard_rejects_a_different_resolved_identity_without_mutation() {
     assert_eq!(store.agents(&AgentFilter::default()).unwrap().len(), 2);
 }
 
-#[test]
-fn version_one_database_migrates_with_credentials_and_identity_intact() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("db");
-    let conn = Connection::open(&path).unwrap();
-    conn.execute_batch(include_str!("schema.sql")).unwrap();
-    conn.pragma_update(None, "user_version", 1).unwrap();
-    let agent = record("existing", Some("native"), None);
-    conn.execute("INSERT INTO agents(id,harness,native_id,ownership,public_json,token_hash) VALUES(?1,?2,?3,?4,?5,?6)", params![agent.id,agent.harness,agent.native_session_id,agent.ownership,serde_json::to_string(&agent).unwrap(), b"credential".as_slice()]).unwrap();
-    drop(conn);
-    let store = Store::open(&path).unwrap();
-    assert_eq!(
-        store.agent_by_token_hash(b"credential").unwrap().record,
-        agent
-    );
-    assert_eq!(
-        store
-            .agent_by_native_id("codex", "native")
-            .unwrap()
-            .record
-            .id,
-        "existing"
-    );
-    assert!(matches!(
-        store.agent_by_token_hash(b"wrong"),
-        Err(Error::NotFound)
-    ));
-    drop(store);
-    assert!(Store::open(&path).is_ok());
-}
-
 impl Store {
     fn register_test(&self, candidate: AgentRecord, hash: &[u8]) -> Result<Registration> {
         let target = self.registration_target(&candidate)?;
         let expected = target.map_or_else(|| candidate.id.clone(), |a| a.record.id);
         self.register(candidate, hash, &expected)
     }
-}
-
-#[test]
-fn version_three_migration_uses_terminal_binding_evidence_and_keeps_launch_intent_separate() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("db");
-    let conn = Connection::open(&path).unwrap();
-    conn.execute_batch(include_str!("schema.sql")).unwrap();
-    conn.execute_batch("CREATE TABLE owned_launches(id TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,data TEXT NOT NULL); PRAGMA user_version=3;").unwrap();
-    let mut terminal = record("terminal-session", None, None);
-    terminal.ownership = "owned".into();
-    terminal.pool_session = Some("different-resource-name".into());
-    let mut unknown = record("managed-unknown", None, None);
-    unknown.ownership = "owned".into();
-    for r in [&terminal, &unknown] {
-        let mut json = serde_json::to_value(r).unwrap();
-        json.as_object_mut().unwrap().remove("protocol");
-        json["caps"].as_object_mut().unwrap().remove("snapshot");
-        conn.execute("INSERT INTO agents(id,harness,ownership,public_json,token_hash) VALUES(?1,?2,?3,?4,?5)",params![r.id,r.harness,r.ownership,json.to_string(),b"hash".as_slice()]).unwrap();
-    }
-    let launch = serde_json::json!({"harness":"codex","mode":"native","cwd":"/tmp","argv":["codex","--no-daemon"]});
-    conn.execute(
-        "INSERT INTO owned_launches(id,data) VALUES(?1,?2)",
-        params![terminal.id, launch.to_string()],
-    )
-    .unwrap();
-    drop(conn);
-    let store = Store::open(&path).unwrap();
-    let saved = store.managed_session(&terminal.id).unwrap();
-    assert_eq!(saved.protocol, "terminal");
-    assert_eq!(
-        serde_json::to_value(&saved.binding).unwrap()["name"],
-        "different-resource-name"
-    );
-    assert_eq!(
-        serde_json::to_value(saved.launch.as_ref().unwrap()).unwrap()["spec"],
-        launch
-    );
-    assert!(store.agent(&terminal.id).unwrap().record.caps.snapshot);
-    assert_eq!(
-        store
-            .agent(&terminal.id)
-            .unwrap()
-            .record
-            .protocol
-            .as_deref(),
-        Some("terminal")
-    );
-    assert!(store.agent(&unknown.id).unwrap().record.protocol.is_none());
-    assert!(matches!(
-        store.managed_session(&unknown.id),
-        Err(Error::NotFound)
-    ));
-    store.disable_managed_recovery(&terminal.id).unwrap();
-    drop(store);
-    let store = Store::open(&path).unwrap();
-    assert!(!store.managed_session(&terminal.id).unwrap().auto_resume);
-    assert!(
-        store
-            .managed_session(&terminal.id)
-            .unwrap()
-            .launch
-            .is_some()
-    );
-    assert_eq!(
-        store.managed_session(&terminal.id).unwrap().binding,
-        saved.binding
-    );
 }
 
 #[test]
