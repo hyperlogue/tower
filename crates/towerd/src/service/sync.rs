@@ -108,12 +108,16 @@ impl Service {
             .allgather_config
             .scopes
             .clone()
-            .unwrap_or_else(|| vec!["read".into(), "send".into()]))
+            .unwrap_or_else(|| vec!["read".into(), "send".into()])
+            .into_iter()
+            .filter(|scope| scope != "terminal:control")
+            .collect())
     }
     pub(crate) fn remote_dispatch(
         &self,
         request: &Request,
         epoch: u64,
+        protocols: [bool; 2],
     ) -> std::result::Result<Value, RpcError> {
         let _guard = self
             .mutation
@@ -124,7 +128,7 @@ impl Service {
             request.method.as_str(),
             "command.execute" | "command.status"
         ) {
-            return self.execution_dispatch(request, epoch);
+            return self.execution_dispatch(request, epoch, protocols);
         }
         if request.method != "daemon.info" {
             return Err(RpcError::protocol(
@@ -187,6 +191,20 @@ impl Service {
         }
         Ok(epoch)
     }
+    pub(super) fn terminal_controls(&self) -> BTreeMap<String, HarnessControls> {
+        if !self.allgather_config.managed
+            || !self.allgather_config.permits_scope("terminal:control")
+        {
+            return BTreeMap::new();
+        }
+        self.backends
+            .get("terminal")
+            .into_iter()
+            .flat_map(|b| b.harnesses())
+            .filter(|h| h.available)
+            .map(|h| (h.harness, HarnessControls::terminal()))
+            .collect()
+    }
     pub(crate) fn sync_hello(&self) -> std::result::Result<Option<AllgatherHello>, RpcError> {
         let host = self.store.host().map_err(storage)?;
         if host.mode != "allgather" {
@@ -201,6 +219,7 @@ impl Service {
             Default::default()
         };
         let acp_harnesses = harness_controls.keys().cloned().collect();
+        let terminal_controls = self.terminal_controls();
         let mut capabilities = vec![
             "policy-sync.v1".into(),
             "session-status.v1".into(),
@@ -221,6 +240,17 @@ impl Service {
                 .map(str::to_owned),
             );
         }
+        if !terminal_controls.is_empty() {
+            for capability in [
+                "terminal-launch.v1",
+                "command-receipts.v1",
+                "session-stream.v1",
+            ] {
+                if !capabilities.iter().any(|c| c == capability) {
+                    capabilities.push(capability.into());
+                }
+            }
+        }
         Ok(Some(AllgatherHello {
             protocol_version: PROTOCOL_VERSION,
             tower_version: env!("CARGO_PKG_VERSION").into(),
@@ -229,6 +259,7 @@ impl Service {
             capabilities,
             acp_harnesses,
             harness_controls,
+            terminal_controls,
         }))
     }
     pub(crate) fn sync_node(&self, node: &str) -> std::result::Result<(), RpcError> {

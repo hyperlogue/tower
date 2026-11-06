@@ -66,6 +66,12 @@ impl Config {
         Ok(root.allgather)
     }
     pub(crate) fn permits_scope(&self, scope: &str) -> bool {
+        if scope == "terminal:control" {
+            return self
+                .scopes
+                .as_ref()
+                .is_some_and(|scopes| scopes.iter().any(|s| s == scope));
+        }
         self.scopes.as_ref().is_none_or(|configured| {
             configured
                 .iter()
@@ -74,7 +80,7 @@ impl Config {
     }
 
     pub(crate) fn enrollment_scopes(&self, read_only: bool) -> Vec<String> {
-        ["read", "send", "acp:control"]
+        ["read", "send", "acp:control", "terminal:control"]
             .into_iter()
             .filter(|scope| (!read_only || *scope == "read") && self.permits_scope(scope))
             .map(str::to_owned)
@@ -87,7 +93,13 @@ impl Config {
             || self.scopes.iter().flatten().any(|s| {
                 !matches!(
                     s.as_str(),
-                    "read" | "send" | "subscribe" | "approve" | "admin" | "acp:control"
+                    "read"
+                        | "send"
+                        | "subscribe"
+                        | "approve"
+                        | "admin"
+                        | "acp:control"
+                        | "terminal:control"
                 )
             })
         {
@@ -337,6 +349,13 @@ async fn connection(
         .all(|c| {
             hello.capabilities.iter().any(|v| v == c) && ack.capabilities.iter().any(|v| v == c)
         });
+    let terminal_enabled = [
+        "terminal-launch.v1",
+        "command-receipts.v1",
+        "session-stream.v1",
+    ]
+    .iter()
+    .all(|c| hello.capabilities.iter().any(|v| v == c) && ack.capabilities.iter().any(|v| v == c));
     let mut catalog = catalog::Sync::new(&hello.capabilities, &ack.capabilities);
     if catalog.enabled() {
         let url = config.url.clone();
@@ -370,7 +389,7 @@ async fn connection(
                 if let Some(frame) = catalog.prepare(&worker, epoch).await? {
                     write(&mut socket, &frame).await?;
                 }
-                if managed_enabled {for frame in execution.prepare(&worker,epoch).await? {write(&mut socket,&frame).await?;}}
+                if managed_enabled || terminal_enabled {for frame in execution.prepare(&worker,epoch,[managed_enabled,terminal_enabled]).await? {write(&mut socket,&frame).await?;}}
             }
             Some(reply)=replies.join_next(),if !replies.is_empty()=>{if let Ok(Some(reply))=reply {worker.execute(move|s|s.check_remote(epoch)).await??;write(&mut socket,&reply).await?;}}
             incoming=socket.next()=>{
@@ -385,7 +404,7 @@ async fn connection(
                         worker.execute(move|s|s.check_remote(epoch)).await??;
                         let frame:Value=serde_json::from_str(&text)?;
                         if frame.get("method").is_none() {
-                            if managed_enabled {execution.response(frame,&worker,epoch).await?;}
+                            if managed_enabled || terminal_enabled {execution.response(frame,&worker,epoch).await?;}
                             continue;
                         }
                         let mut request:Request=serde_json::from_value(frame)?;
@@ -452,13 +471,13 @@ async fn connection(
                             },
                             "sync.resync"=>{publisher.resync();pending_since=None;previous_cursor=None;reply(&mut socket,request.id,Ok(public(json!({"scheduled":true}))?)).await?;continue;}
                             "health"=>request.method="daemon.info".into(),
-                            "command.execute"|"command.status" if !managed_enabled=>{reply(&mut socket,request.id,Err(tower_protocol::RpcError::application("unsupported","Managed execution was not negotiated"))).await?;continue;}
+                            "command.execute"|"command.status" if !managed_enabled && !terminal_enabled=>{reply(&mut socket,request.id,Err(tower_protocol::RpcError::application("unsupported","Managed execution was not negotiated"))).await?;continue;}
                             _=>{},
                         }
                         if replies.len()>=32 {
                             if let Some(id)=request.id {write(&mut socket,&Response{jsonrpc:"2.0".into(),id,body:ResponseBody::Failure{error:tower_protocol::RpcError::application("rate_limited","Too many remote requests")}}).await?;}
                         }else{
-                            let worker=worker.clone();replies.spawn(async move{let id=request.id.clone();let result=worker.remote(request,epoch).await;id.map(|id|Response{jsonrpc:"2.0".into(),id,body:match result{Ok(result)=>ResponseBody::Success{result},Err(error)=>ResponseBody::Failure{error}}})});
+                            let worker=worker.clone();replies.spawn(async move{let id=request.id.clone();let result=worker.remote(request,epoch,[managed_enabled,terminal_enabled]).await;id.map(|id|Response{jsonrpc:"2.0".into(),id,body:match result{Ok(result)=>ResponseBody::Success{result},Err(error)=>ResponseBody::Failure{error}}})});
                         }
                     }
                     _=>return Err(Error::Other("Unsupported sync frame".into())),
@@ -484,6 +503,14 @@ mod tests {
         assert_eq!(admin.enrollment_scopes(false), ["read", "send"]);
         let read: super::Config = toml::from_str("scopes=['read']").unwrap();
         assert_eq!(read.enrollment_scopes(false), ["read"]);
+        assert!(!default.permits_scope("terminal:control"));
+        assert!(!admin.permits_scope("terminal:control"));
+        let terminal: super::Config = toml::from_str("scopes=['read','terminal:control']").unwrap();
+        assert_eq!(
+            terminal.enrollment_scopes(false),
+            ["read", "terminal:control"]
+        );
+        assert_eq!(terminal.enrollment_scopes(true), ["read"]);
     }
 
     use super::*;

@@ -23,6 +23,29 @@ impl RuntimeBinding {
     pub fn namespace(&self) -> String {
         serde_json::to_string(&(&self.origin, &self.machine_id)).expect("string tuple serializes")
     }
+    pub fn scope(&self) -> &'static str {
+        if self.protocol == "terminal" {
+            "terminal:control"
+        } else {
+            "acp:control"
+        }
+    }
+    pub fn from_session(session: &crate::ManagedSession) -> Result<Option<Self>> {
+        let value = serde_json::to_value(&session.binding).map_err(|_| {
+            tower_protocol::RpcError::application("internal_error", "Invalid session binding")
+        })?;
+        let value = if session.protocol == "terminal" {
+            let Some(value) = value.get("execution") else {
+                return Ok(None);
+            };
+            value.clone()
+        } else {
+            value
+        };
+        serde_json::from_value(value).map(Some).map_err(|_| {
+            tower_protocol::RpcError::application("internal_error", "Invalid execution binding")
+        })
+    }
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct RuntimeView {

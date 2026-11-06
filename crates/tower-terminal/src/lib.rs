@@ -230,6 +230,8 @@ fn observation(id: &str, name: &str, session: Option<&Session>) -> Observation {
         terminal: Some(TerminalState {
             pool_session: name.into(),
             attach_count: session.map_or(0, |s| s.attach_count),
+            running: false,
+            terminated: false,
         }),
         recovery_pending: state == "reserved",
         metadata: Default::default(),
@@ -305,10 +307,30 @@ impl TerminalBackend {
             && state.id == session.id
             && state.generation == binding.plan.generation
         {
-            let live = record.is_some_and(|r| r.state == "running")
-                && state.boot_id == tower_pal::boot_id().unwrap_or_default()
+            let live = record.is_some_and(|r| {
+                r.state == "running"
+                    && r.pid == Some(state.launcher_pid)
+                    && r.pid_start_time == Some(state.launcher_start_time)
+            }) && state.boot_id == tower_pal::boot_id().unwrap_or_default()
                 && tower_pal::process_identity(state.launcher_pid)
                     .is_ok_and(|p| p.start_time == state.launcher_start_time);
+            if let Some(terminal) = &mut result.terminal {
+                terminal.running = live && state.exit_code.is_none();
+                let gone = record.is_none()
+                    && state.exit_code.is_some()
+                    && !launcher_alive(&state)?
+                    && tower_pal::protocol_group_terminated(tower_pal::ProcessIdentity {
+                        pid: state.launcher_pid,
+                        start_time: state.launcher_start_time,
+                        parent: 0,
+                    })
+                    .unwrap_or(false);
+                terminal.terminated = (record.is_some_and(|r| r.state == "exited") || gone)
+                    && state.exit_code.is_some()
+                    && (state.harness != tower_agents::Harness::Codex
+                        || !state.private.contains_key("server_pid")
+                        || codex_cleanup_confirmed(&binding.plan));
+            }
             if live || record.is_some_and(|r| r.state == "exited") || record.is_none() {
                 if live {
                     result.status = state.status.clone();
@@ -710,6 +732,8 @@ impl ManagedBackend for TerminalBackend {
             terminal: Some(TerminalState {
                 pool_session: id.into(),
                 attach_count: 0,
+                running: false,
+                terminated: false,
             }),
         })
     }
@@ -843,6 +867,10 @@ impl ManagedBackend for TerminalBackend {
             pool::request(&self.paths, &Request::Kill { name: name.clone() }),
             Ok(Reply::Ok)
         ) {
+            let observation = self.state(session, None)?;
+            if observation.terminal.as_ref().is_some_and(|t| t.terminated) {
+                return Ok(observation);
+            }
             return Err(error(
                 "stop_unconfirmed",
                 "Terminal pool could not confirm termination",

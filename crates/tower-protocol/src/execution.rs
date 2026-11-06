@@ -7,6 +7,15 @@ pub struct HarnessControls {
     pub capabilities: Vec<String>,
     pub cancel_mode: Option<String>,
 }
+impl HarnessControls {
+    pub fn terminal() -> Self {
+        Self {
+            protocol: "terminal".into(),
+            capabilities: Vec::new(),
+            cancel_mode: Some("runtime".into()),
+        }
+    }
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ExecutionCommand {

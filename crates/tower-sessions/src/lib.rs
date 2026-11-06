@@ -7,7 +7,7 @@ pub mod terminal;
 
 pub type Result<T> = std::result::Result<T, RpcError>;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ManagedSession {
     pub id: String,
     pub protocol: String,
@@ -27,7 +27,7 @@ pub struct PreparedSession {
     pub terminal: Option<TerminalState>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Observation {
     pub id: String,
     // None retains the existing binding; Some persists a newly assigned handle.
@@ -41,7 +41,7 @@ pub struct Observation {
     pub metadata: SessionMetadata,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct SessionMetadata {
     pub shared_process: Option<bool>,
     pub native_session_id: Option<String>,

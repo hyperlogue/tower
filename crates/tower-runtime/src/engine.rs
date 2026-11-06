@@ -74,7 +74,11 @@ pub(crate) fn cleanup_command(c: &ExecutionCommand) -> bool {
                 Some("decline" | "cancel")
             ))
 }
-async fn authorize(paths: &tower_pal::Paths, b: &Binding, c: &ExecutionCommand) -> Result<()> {
+pub(crate) async fn authorize(
+    paths: &tower_pal::Paths,
+    b: &Binding,
+    c: &ExecutionCommand,
+) -> Result<()> {
     let token =
         tower_pal::read_private(&paths.state.join("runtime/owner.key")).map_err(internal)?;
     let token = String::from_utf8(token).map_err(internal)?;

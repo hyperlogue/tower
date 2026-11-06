@@ -7,7 +7,7 @@ impl Service {
     fn execution_host(&self) -> std::result::Result<&dyn ExecutionHost, RpcError> {
         self.backends
             .execution()
-            .ok_or_else(|| app("unsupported", "Managed structured runtimes are unavailable"))
+            .ok_or_else(|| app("unsupported", "Managed runtimes are unavailable"))
     }
     pub(crate) fn execution_namespace(&self) -> std::result::Result<String, RpcError> {
         let url = String::from_utf8(
@@ -123,14 +123,17 @@ impl Service {
             .store
             .managed_session(&p.binding.tower_session_id)
             .map_err(storage)?;
-        let stored: RuntimeBinding = params(&session.binding)?;
+        let stored = RuntimeBinding::from_session(&session)?
+            .ok_or_else(|| app("runtime_conflict", "Session has no execution owner"))?;
         if serde_json::to_value(&stored).ok() != serde_json::to_value(&p.binding).ok() {
             return Err(app(
                 "runtime_fenced",
                 "Runtime binding is no longer current",
             ));
         }
-        let cleanup = p.cleanup && matches!(p.kind.as_str(), "cancel" | "reply");
+        let cleanup = stored.protocol != "terminal"
+            && p.cleanup
+            && matches!(p.kind.as_str(), "cancel" | "reply");
         if cleanup {
             return value(serde_json::json!({"authorized":true}));
         }
@@ -143,7 +146,7 @@ impl Service {
             let actor = Actor::Allgather {
                 scope: self.remote_scopes()?,
             };
-            require(&actor, "acp:control")?;
+            require(&actor, stored.scope())?;
             if !self.policy_ready() {
                 return Err(app(
                     "denied",
@@ -167,6 +170,7 @@ impl Service {
         &self,
         request: &Request,
         epoch: u64,
+        protocols: [bool; 2],
     ) -> std::result::Result<Value, RpcError> {
         if !self.allgather_config.managed {
             return Err(app("unsupported", "Managed execution is disabled"));
@@ -177,10 +181,28 @@ impl Service {
         if request.method == "command.status" {
             require(&actor, "read")?;
             let p: ExecutionStatus = params(&request.params)?;
+            if let Some(view) = host
+                .list(Some(&namespace))?
+                .iter()
+                .find(|v| v.binding.runtime_id == p.runtime_id)
+                && !protocols[usize::from(view.binding.protocol == "terminal")]
+            {
+                return Err(app(
+                    "unsupported_control",
+                    "Runtime protocol was not negotiated",
+                ));
+            }
             return value(host.status(&namespace, &p)?);
         }
-        require(&actor, "acp:control")?;
         let c: ExecutionCommand = params(&request.params)?;
+        host.status(
+            &namespace,
+            &ExecutionStatus {
+                command_id: c.command_id.clone(),
+                runtime_id: c.runtime_id.clone(),
+                generation: c.generation.clone(),
+            },
+        )?;
         let payload: serde_json::Value =
             serde_json::to_value(&c.payload).map_err(|_| invalid("Invalid command payload"))?;
         let cleanup = c.kind == "cancel"
@@ -206,8 +228,8 @@ impl Service {
             .map(|v| v.binding.clone());
         if binding.is_none() {
             for s in self.store.managed_sessions().map_err(storage)? {
-                if matches!(s.protocol.as_str(), "acp" | "codex-app-server")
-                    && let Ok(b) = params::<RuntimeBinding>(&s.binding)
+                if matches!(s.protocol.as_str(), "acp" | "codex-app-server" | "terminal")
+                    && let Some(b) = RuntimeBinding::from_session(&s)?
                     && b.namespace() == namespace
                     && b.runtime_id == c.runtime_id
                 {
@@ -215,6 +237,28 @@ impl Service {
                     break;
                 }
             }
+        }
+        let terminal = binding
+            .as_ref()
+            .map_or(payload["protocol"] == "terminal", |b| {
+                b.protocol == "terminal"
+            });
+        if !protocols[usize::from(terminal)] {
+            return Err(app(
+                "unsupported_control",
+                "Runtime protocol was not negotiated",
+            ));
+        }
+        require(
+            &actor,
+            if terminal {
+                "terminal:control"
+            } else {
+                "acp:control"
+            },
+        )?;
+        if terminal {
+            validate_terminal_command(&c)?;
         }
         if let Some(b) = &binding {
             if b.generation != c.generation || b.session_id != c.session_id {
@@ -254,8 +298,12 @@ impl Service {
             let protocol = payload["protocol"]
                 .as_str()
                 .ok_or_else(|| invalid("Managed protocol is required"))?;
-            if host
-                .controls()
+            let controls = if protocol == "terminal" {
+                self.terminal_controls()
+            } else {
+                host.controls()
+            };
+            if controls
                 .get(harness)
                 .is_none_or(|profile| profile.protocol != protocol)
             {
@@ -385,7 +433,8 @@ impl Service {
                 .store
                 .managed_session(&b.tower_session_id)
                 .map_err(storage)?;
-            let current: RuntimeBinding = params(&current.binding)?;
+            let current = RuntimeBinding::from_session(&current)?
+                .ok_or_else(|| app("runtime_conflict", "Session has no execution owner"))?;
             if current.namespace() != b.namespace()
                 || current.runtime_id != b.runtime_id
                 || current.generation != b.generation
@@ -405,7 +454,11 @@ impl Service {
         let session = ManagedSession {
             id: b.tower_session_id.clone(),
             protocol: b.protocol.clone(),
-            binding: value(b)?,
+            binding: if b.protocol == "terminal" {
+                value(serde_json::json!({"execution":b}))?
+            } else {
+                value(b)?
+            },
             launch: None,
             auto_resume: false,
         };
@@ -490,5 +543,26 @@ impl Service {
         }
         self.vcs.link_session(&session.id)?;
         Ok(())
+    }
+}
+
+fn validate_terminal_command(c: &ExecutionCommand) -> std::result::Result<(), RpcError> {
+    let p: serde_json::Value =
+        serde_json::to_value(&c.payload).map_err(|_| invalid("Invalid terminal payload"))?;
+    match c.kind.as_str() {
+        "launch"
+            if p.as_object().is_some_and(|p| p.len() == 3)
+                && p["protocol"] == "terminal"
+                && p["harness"].is_string()
+                && p["cwd"].is_string() =>
+        {
+            Ok(())
+        }
+        "cancel" if p.as_object().is_some_and(|p| p.is_empty()) => Ok(()),
+        "launch" | "cancel" => Err(invalid("Invalid terminal command payload")),
+        _ => Err(app(
+            "unsupported_control",
+            "Terminal runtimes support only launch and whole-runtime stop",
+        )),
     }
 }

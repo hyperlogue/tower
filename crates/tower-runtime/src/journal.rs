@@ -213,6 +213,13 @@ PRAGMA user_version=1;").map_err(internal)?;
             verify_takeover(&tx, binding, command)?;
             tx.execute("INSERT INTO runtimes(namespace,runtime_id,generation,logical_session,tower_id,owner_id,binding,state) VALUES(?1,?2,?3,?4,?5,?6,?7,'starting')",params![namespace,binding.runtime_id,binding.generation,binding.session_id,binding.tower_session_id,binding.owner_id,serde_json::to_string(binding).map_err(internal)?]).map_err(internal)?;
         }
+        if binding.protocol == "terminal" {
+            tx.execute(
+                "UPDATE runtimes SET coverage='partial' WHERE namespace=?1 AND runtime_id=?2",
+                params![namespace, binding.runtime_id],
+            )
+            .map_err(internal)?;
+        }
         let receipt = ExecutionReceipt {
             command_id: command.command_id.clone(),
             runtime_id: command.runtime_id.clone(),
@@ -468,6 +475,28 @@ impl Journal {
                     pending_events: Some(pending_events),
                 },
             ))
+        })
+        .collect()
+    }
+    pub fn terminal_observation(
+        &self,
+        binding: &Binding,
+        observation: &serde_json::Value,
+    ) -> Result<()> {
+        self.lock()?.execute("UPDATE runtimes SET metadata=json_set(metadata,'$.observation',json(?1)) WHERE namespace=?2 AND runtime_id=?3 AND generation=?4", params![serde_json::to_string(observation).map_err(internal)?,binding.namespace(),binding.runtime_id,binding.generation]).map_err(internal)?;
+        Ok(())
+    }
+    pub fn unsettled(&self, binding: &Binding) -> Result<Vec<(String, ExecutionReceipt)>> {
+        let conn = self.lock()?;
+        let mut q = conn.prepare("SELECT kind,receipt FROM commands WHERE namespace=?1 AND runtime_id=?2 AND generation=?3 AND json_extract(receipt,'$.dispatch.state')!='finished'").map_err(internal)?;
+        q.query_map(
+            params![binding.namespace(), binding.runtime_id, binding.generation],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .map_err(internal)?
+        .map(|r| {
+            let (kind, body) = r.map_err(internal)?;
+            Ok((kind, serde_json::from_str(&body).map_err(internal)?))
         })
         .collect()
     }

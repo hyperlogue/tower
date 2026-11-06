@@ -493,6 +493,28 @@ Explicit configuration can restrict the scopes requested during enrollment:
 scopes = ["read", "send", "acp:control"]
 ```
 
+To allow Allgather to launch interactive agent terminals, add the literal
+`terminal:control` scope, restart the Tower daemon, and run browser enrollment
+again to approve it:
+
+```toml
+[allgather]
+scopes = ["read", "send", "acp:control", "terminal:control"]
+```
+
+Select `mode=terminal` in Allgather's session launch operation. Tower starts the
+named harness in an 80×24 terminal. Use `tower-cli attach TOWER_SESSION_ID` on
+that host or over SSH to interact with it. Allgather can stop the whole runtime;
+prompt, reply, configuration, and resume are unsupported for this mode. Codex
+terminals use the configured shared app-server. No shell command, environment,
+or per-session endpoint can be supplied through this launch interface.
+
+Terminal launch requires both local configuration and browser consent; `admin`,
+`send`, and `acp:control` do not grant it. `[allgather] managed = false` disables
+both remote launch modes. Terminal lifecycle events contain no PTY output or
+transcript. A surviving pool session retains its identity across daemon restart;
+a lost execution is fenced and is not automatically relaunched.
+
 Credentials are saved with mode 0600. Tower owns session state and local rules.
 Allgather owns its policy table. Disconnecting or revoking the server-side key
 retains Allgather mode and cached policy until local logout or re-enrollment.

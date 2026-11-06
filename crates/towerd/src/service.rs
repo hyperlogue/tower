@@ -135,9 +135,9 @@ impl Actor {
     fn authorized(&self, scope: &str) -> bool {
         match self {
             Self::Human => true,
-            Self::Allgather { scope: scopes } => scopes
-                .iter()
-                .any(|s| s == scope || (scope != "acp:control" && s == "admin")),
+            Self::Allgather { scope: scopes } => scopes.iter().any(|s| {
+                s == scope || (!matches!(scope, "acp:control" | "terminal:control") && s == "admin")
+            }),
             Self::Token(t) => t.scope.iter().any(|s| s == scope || s == "admin"),
             _ => matches!(scope, "read" | "subscribe"),
         }

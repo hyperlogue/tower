@@ -52,6 +52,8 @@ pub struct AllgatherHello {
     pub acp_harnesses: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub harness_controls: BTreeMap<String, crate::HarnessControls>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub terminal_controls: BTreeMap<String, crate::HarnessControls>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AllgatherHelloAck {

@@ -29,7 +29,7 @@ pub fn capabilities(active: bool, resume: bool) -> Capabilities {
     caps.resume = resume;
     caps
 }
-fn observation(v: &RuntimeView) -> Result<Observation> {
+pub(crate) fn observation(v: &RuntimeView) -> Result<Observation> {
     let m: serde_json::Value = decode(&v.metadata)?;
     let native = m["native_session_id"]
         .as_str()

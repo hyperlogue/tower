@@ -21,6 +21,7 @@ struct Host {
     journal: Arc<Journal>,
     owners: Mutex<BTreeMap<String, Arc<engine::Handle>>>,
     shutdown: tokio::sync::Notify,
+    terminal: Option<Arc<dyn tower_sessions::ManagedBackend>>,
 }
 fn key(b: &Binding) -> String {
     serde_json::to_string(&(b.namespace(), &b.runtime_id, &b.generation)).expect("string tuple")
@@ -42,13 +43,15 @@ impl Host {
         Ok(())
     }
     fn execute(&self, b: Binding, c: ExecutionCommand) -> Result<Value> {
-        if b.protocol
-            != if b.harness == "codex" {
-                "codex-app-server"
-            } else {
-                "acp"
-            }
-            || !matches!(b.harness.as_str(), "codex" | "claude-code" | "antigravity")
+        let terminal = b.protocol == "terminal";
+        if (!terminal
+            && (b.protocol
+                != if b.harness == "codex" {
+                    "codex-app-server"
+                } else {
+                    "acp"
+                }
+                || !matches!(b.harness.as_str(), "codex" | "claude-code" | "antigravity")))
             || !std::path::Path::new(&b.cwd).is_absolute()
         {
             return Err(error("invalid_params", "Unsupported runtime binding"));
@@ -63,6 +66,24 @@ impl Host {
         )?;
         if prior.state != "missing" {
             return value(self.journal.admit(&b, &c)?);
+        }
+        if terminal {
+            crate::terminal::validate(&b, &c)?;
+            let backend = self
+                .terminal
+                .as_ref()
+                .ok_or_else(|| error("unsupported_control", "Terminal execution is unavailable"))?;
+            if c.kind == "launch"
+                && !backend
+                    .harnesses()
+                    .iter()
+                    .any(|h| h.harness == b.harness && h.available)
+            {
+                return Err(error(
+                    "unsupported_control",
+                    "Terminal harness is unavailable",
+                ));
+            }
         }
         let mut owners = self.owners.lock().map_err(internal)?;
         let handle = if let Some(h) = owners.get(&key(&b)) {
@@ -90,14 +111,29 @@ impl Host {
             owners.insert(key(&b), handle.clone());
             let failed_binding = b.clone();
             let failed_journal = self.journal.clone();
-            let task = tokio::spawn(engine::run(
-                self.paths.clone(),
-                self.journal.clone(),
-                b,
-                handle,
-                normal,
-                control,
-            ));
+            let task = if terminal {
+                tokio::spawn(crate::terminal::run(
+                    self.paths.clone(),
+                    self.journal.clone(),
+                    b,
+                    self.terminal
+                        .as_ref()
+                        .expect("checked terminal backend")
+                        .clone(),
+                    normal,
+                    control,
+                    false,
+                ))
+            } else {
+                tokio::spawn(engine::run(
+                    self.paths.clone(),
+                    self.journal.clone(),
+                    b,
+                    handle,
+                    normal,
+                    control,
+                ))
+            };
             tokio::spawn(async move {
                 if task.await.is_err() {
                     let _ = failed_journal.fence(&failed_binding, "owner_task_failed", "unknown");
@@ -105,6 +141,12 @@ impl Host {
             });
             return value(receipt);
         };
+        if terminal && c.kind != "cancel" {
+            return Err(error(
+                "runtime_conflict",
+                "A terminal runtime already has a launch",
+            ));
+        }
         if c.kind == "reply" {
             let p = serde_json::to_value(&c.payload).map_err(internal)?;
             handle.requests.validate_reply(&p)?;
@@ -135,6 +177,16 @@ impl Host {
             "hello" => Ok(json!({"version":1})),
             "shutdown" => Ok(Value::Null),
             "execute" => self.execute(parse(p["binding"].clone())?, parse(p["command"].clone())?),
+            "terminal.session" => {
+                let binding: Binding = parse(p["binding"].clone())?;
+                if p["live"] == true && self.journal.state(&binding)?.1 {
+                    return Err(error(
+                        "runtime_fenced",
+                        "Terminal generation is no longer live",
+                    ));
+                }
+                value(crate::terminal::session(&self.journal, &binding)?)
+            }
             "status" => value(
                 self.journal.status(
                     p["namespace"]
@@ -214,6 +266,18 @@ impl Host {
                         .is_some_and(|h| !h.normal.is_closed())
                 {
                     let m = self.journal.metadata(&b)?;
+                    if b.protocol == "terminal" {
+                        if m.pointer("/observation/terminal/running") == Some(&Value::Bool(true)) {
+                            self.journal.append(
+                                &b,
+                                "runtime_state",
+                                parse(crate::terminal::state_payload(&b, &m, "running", false))?,
+                                None,
+                                true,
+                            )?;
+                        }
+                        return Ok(Value::Null);
+                    }
                     if m[if b.protocol == "acp" {
                         "acp_session_id"
                     } else {
@@ -391,7 +455,10 @@ async fn recover_shared_codex(paths: &tower_pal::Paths, metadata: &Value) -> boo
         Ok(Ok(()))
     )
 }
-pub async fn run(paths: tower_pal::Paths) -> Result<()> {
+pub async fn run(
+    paths: tower_pal::Paths,
+    terminal: Option<Arc<dyn tower_sessions::ManagedBackend>>,
+) -> Result<()> {
     paths.prepare().map_err(internal)?;
     let _lock =
         tower_pal::SingletonLock::acquire(&paths.run.join("runtime.lock")).map_err(internal)?;
@@ -427,6 +494,7 @@ pub async fn run(paths: tower_pal::Paths) -> Result<()> {
     )?);
     let boot = tower_pal::boot_id().map_err(internal)?;
     let mut recovery = Vec::new();
+    let mut terminal_recovery = Vec::new();
     let mut shared_recovery = tokio::task::JoinSet::new();
     for binding in journal.bindings(None)? {
         let (_, fenced, termination) = journal.state(&binding)?;
@@ -435,6 +503,22 @@ pub async fn run(paths: tower_pal::Paths) -> Result<()> {
             continue;
         }
         let m = journal.metadata(&binding)?;
+        if binding.protocol == "terminal" {
+            if terminal.is_some() && !m["boot_id"].as_str().is_some_and(|old| old != boot) {
+                terminal_recovery.push(binding);
+            } else {
+                journal.fence(
+                    &binding,
+                    "terminal_owner_lost",
+                    if m["boot_id"].as_str().is_some_and(|old| old != boot) {
+                        "confirmed"
+                    } else {
+                        "unknown"
+                    },
+                )?;
+            }
+            continue;
+        }
         if m["boot_id"].as_str().is_some_and(|old| old != boot) {
             journal.fence(&binding, "owner_restarted", "confirmed")?;
             engine::cleanup_environment(&paths, &binding);
@@ -508,7 +592,27 @@ pub async fn run(paths: tower_pal::Paths) -> Result<()> {
         journal,
         owners: Mutex::new(BTreeMap::new()),
         shutdown: tokio::sync::Notify::new(),
+        terminal,
     });
+    for binding in terminal_recovery {
+        let (handle, normal, control) = engine::channels();
+        host.owners
+            .lock()
+            .map_err(internal)?
+            .insert(key(&binding), handle);
+        tokio::spawn(crate::terminal::run(
+            host.paths.clone(),
+            host.journal.clone(),
+            binding,
+            host.terminal
+                .as_ref()
+                .expect("recovery backend checked")
+                .clone(),
+            normal,
+            control,
+            true,
+        ));
+    }
     let gate = Arc::new(tokio::sync::Semaphore::new(32));
     let mut maintenance = tokio::time::interval(Duration::from_secs(60));
     loop {
@@ -571,6 +675,7 @@ mod tests {
             journal: Arc::new(Journal::open(&path.join("runtime.db"), Limits::default()).unwrap()),
             owners: Mutex::new(BTreeMap::new()),
             shutdown: tokio::sync::Notify::new(),
+            terminal: None,
         };
         let b = Binding {
             origin: "https://allgather.example".into(),

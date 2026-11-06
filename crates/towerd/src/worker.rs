@@ -243,6 +243,7 @@ impl ServiceWorker {
         &self,
         request: tower_protocol::Request,
         epoch: u64,
+        protocols: [bool; 2],
     ) -> std::result::Result<tower_protocol::Value, tower_protocol::RpcError> {
         let result = if request.method == "message.send" {
             let permit = self
@@ -270,7 +271,7 @@ impl ServiceWorker {
             .await
             .map_err(|_| Error::Other("delivery worker failed".into()))
         } else {
-            self.execute(move |s| s.remote_dispatch(&request, epoch))
+            self.execute(move |s| s.remote_dispatch(&request, epoch, protocols))
                 .await
         };
         result.map_err(|_| {

@@ -70,7 +70,12 @@ impl Publisher {
         frames.push(frame);
         Ok(())
     }
-    pub async fn prepare(&mut self, worker: &ServiceWorker, epoch: u64) -> Result<Vec<Value>> {
+    pub async fn prepare(
+        &mut self,
+        worker: &ServiceWorker,
+        epoch: u64,
+        protocols: [bool; 2],
+    ) -> Result<Vec<Value>> {
         if self
             .pending
             .values()
@@ -87,9 +92,20 @@ impl Publisher {
         let updates = worker
             .execute(move |s| s.execution_updates(epoch, connection))
             .await??;
-        let views = worker.execute(move |s| s.execution_views(epoch)).await??;
+        let views: Vec<_> = worker
+            .execute(move |s| s.execution_views(epoch))
+            .await??
+            .into_iter()
+            .filter(|v| protocols[usize::from(v.binding.protocol == "terminal")])
+            .collect();
         let mut frames = Vec::new();
         for receipt in updates.receipts {
+            if !views.iter().any(|v| {
+                v.binding.runtime_id == receipt.runtime_id
+                    && v.binding.generation == receipt.generation
+            }) {
+                continue;
+            }
             self.insert(
                 "command.receipt",
                 serde_json::to_value(&receipt)?,
@@ -289,13 +305,14 @@ impl Publisher {
                     p["owner_id"] == b.owner_id
                         && p["tower_session_id"] == b.tower_session_id
                         && matches!(p["state"].as_str(), Some("idle" | "running" | "waiting"))
-                        && p[if b.protocol == "acp" {
-                            "acp_session_id"
-                        } else {
-                            "native_session_id"
-                        }]
-                        .as_str()
-                        .is_some_and(|id| !id.is_empty())
+                        && (b.protocol == "terminal"
+                            || p[if b.protocol == "acp" {
+                                "acp_session_id"
+                            } else {
+                                "native_session_id"
+                            }]
+                            .as_str()
+                            .is_some_and(|id| !id.is_empty()))
                 });
                 let runtime_key = key(&b);
                 let ack = RuntimeCursor {
@@ -304,7 +321,9 @@ impl Publisher {
                     source_key: b.generation,
                     cursor,
                     last_event_key: Some(event.key.clone()),
-                    coverage: if batch.events.iter().any(|e| e.kind == "gap") {
+                    coverage: if b.protocol == "terminal"
+                        || batch.events.iter().any(|e| e.kind == "gap")
+                    {
                         "partial"
                     } else {
                         "complete"

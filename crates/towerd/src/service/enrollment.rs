@@ -207,7 +207,7 @@ impl Service {
             .scopes
             .ok_or_else(|| app("enrollment_failed", "Enrollment omitted approved scopes"))?;
         if scopes.is_empty()
-            || scopes.len() > 3
+            || scopes.len() > 4
             || scopes.iter().any(|s| !p.plan.scopes.contains(s))
         {
             return Err(app(

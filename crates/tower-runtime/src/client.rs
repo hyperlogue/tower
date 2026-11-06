@@ -14,6 +14,14 @@ impl Client {
     pub fn new(paths: tower_pal::Paths) -> Self {
         Self { paths }
     }
+    pub(crate) fn terminal_session(
+        &self,
+        binding: &Binding,
+        live: bool,
+    ) -> Result<tower_sessions::ManagedSession> {
+        self.ensure()?;
+        self.request("terminal.session", json!({"binding":binding,"live":live}))
+    }
     pub fn shutdown(&self) -> Result<()> {
         self.request("shutdown", json!({}))
     }

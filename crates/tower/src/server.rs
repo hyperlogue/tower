@@ -55,7 +55,10 @@ fn execute(command: Command) -> Result<()> {
             let backends = tower_sessions::Backends::new(
                 "terminal",
                 vec![
-                    Arc::new(tower_terminal::TerminalBackend::new(paths.clone())),
+                    Arc::new(tower_runtime::TerminalBackend::new(
+                        Arc::new(tower_terminal::TerminalBackend::new(paths.clone())),
+                        execution.clone(),
+                    )),
                     Arc::new(tower_runtime::Backend::new(
                         execution.clone(),
                         "codex-app-server",
@@ -81,7 +84,8 @@ fn execute(command: Command) -> Result<()> {
             if detach {
                 tower_pal::detach_runtime(&paths)?;
             }
-            runtime()?.block_on(tower_runtime::run(paths))?;
+            let terminal = Arc::new(tower_terminal::TerminalBackend::new(paths.clone()));
+            runtime()?.block_on(tower_runtime::run(paths, Some(terminal)))?;
         }
         Command::Runtime {
             command: OwnerCommand::Stop,

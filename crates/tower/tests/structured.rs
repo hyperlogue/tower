@@ -1,5 +1,7 @@
 #[path = "support/structured.rs"]
 mod fixture;
+#[path = "support/remote_terminal.rs"]
+mod remote_terminal;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::{
@@ -86,6 +88,7 @@ impl Drop for Fixture {
             (env!("CARGO_BIN_EXE_tower"), &["__runtime", "stop"][..]),
             (env!("CARGO_BIN_EXE_tower"), &["__codex", "stop"][..]),
             (env!("CARGO_BIN_EXE_tower-cli"), &["daemon", "stop"][..]),
+            (env!("CARGO_BIN_EXE_tower-terminal-pool"), &["stop"][..]),
         ] {
             let _ = self
                 .program(binary, args)
@@ -150,11 +153,19 @@ impl Server {
         Self::start_with_retirement(f, false).await
     }
     async fn start_with_retirement(f: &Fixture, retire: bool) -> Self {
+        Self::start_modes(f, retire, false).await
+    }
+    async fn start_modes(f: &Fixture, retire: bool, terminal: bool) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let config = f.root.path().join("config/tower");
         std::fs::create_dir_all(&config).unwrap();
-        std::fs::write(config.join("config.toml"),format!("[allgather]\nurl='ws://127.0.0.1:{port}/tower'\nmanaged=true\nscopes=['read','send','acp:control']\n[scan]\nenabled=false\n")).unwrap();
+        let scopes = if terminal {
+            "['read','terminal:control']"
+        } else {
+            "['read','send','acp:control']"
+        };
+        std::fs::write(config.join("config.toml"),format!("[allgather]\nurl='ws://127.0.0.1:{port}/tower'\nmanaged=true\nscopes={scopes}\n[scan]\nenabled=false\n")).unwrap();
         let (sender, mut receive) = mpsc::channel::<Call>(32);
         let frames = Arc::new(Mutex::new(Vec::new()));
         let observed = frames.clone();
@@ -172,14 +183,24 @@ impl Server {
                     hello["params"]["harness_controls"]["codex"]["protocol"],
                     "codex-app-server"
                 );
-                let caps = json!([
-                    "policy-sync.v1",
-                    "session-status.v1",
-                    "managed-acp.v1",
-                    "command-receipts.v1",
-                    "session-stream.v1",
-                    "session-resume.v1"
-                ]);
+                let caps = if terminal {
+                    json!([
+                        "policy-sync.v1",
+                        "session-status.v1",
+                        "terminal-launch.v1",
+                        "command-receipts.v1",
+                        "session-stream.v1"
+                    ])
+                } else {
+                    json!([
+                        "policy-sync.v1",
+                        "session-status.v1",
+                        "managed-acp.v1",
+                        "command-receipts.v1",
+                        "session-stream.v1",
+                        "session-resume.v1"
+                    ])
+                };
                 socket.send(Message::Text(json!({"jsonrpc":"2.0","id":"hello","result":{"node_name":"fixture-machine","protocol_version":{"major":1,"minor":4},"capabilities":caps}}).to_string().into())).await.unwrap();
                 socket.send(Message::Text(json!({"jsonrpc":"2.0","method":"policy.push","params":{"policy_id":"tower","revision":1,"rules":[]}}).to_string().into())).await.unwrap();
                 let mut pending = BTreeMap::new();
