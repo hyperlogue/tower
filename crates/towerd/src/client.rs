@@ -152,6 +152,8 @@ impl Client {
         wire::write_frame(self.reader.get_mut(), &request).await?;
         let timeout = if method == "approval.watch" {
             610
+        } else if method == "vcs.prepare" {
+            210
         } else if method == "message.send"
             || method == "pool.upgrade"
             || method.starts_with("allgather.enrollment.")

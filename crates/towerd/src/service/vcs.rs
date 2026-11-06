@@ -185,8 +185,15 @@ impl Service {
         &self,
         r: &Request,
         peer: Peer,
-        id: &str,
-    ) -> std::result::Result<(tower_store::StoredVcsOperation, bool), RpcError> {
+        p: &VcsExecute,
+    ) -> std::result::Result<
+        (
+            tower_store::StoredVcsOperation,
+            Option<tower_vcs::Authentication>,
+        ),
+        RpcError,
+    > {
+        let id = &p.plan_id;
         let _lock = self
             .mutation
             .lock()
@@ -198,9 +205,20 @@ impl Service {
             return Err(app("denied", "This VCS plan belongs to another caller"));
         }
         if op.record.state != "prepared" {
-            return Ok((op, false));
+            return Ok((op, None));
         }
         let prepared = Vcs::prepared(&op)?;
+        let auth = crate::vcs::authentication(
+            p.auth.as_ref().unwrap_or(&VcsAuth::Host),
+            peer,
+            &self.paths,
+        )?;
+        if auth.mode() != prepared.review().authentication {
+            return Err(app(
+                "auth_context_mismatch",
+                "Supply the authentication mode used to prepare this plan",
+            ));
+        }
         for path in prepared.affected_paths() {
             let cwd = self
                 .paths
@@ -214,7 +232,7 @@ impl Service {
             .store
             .claim_vcs_operation(id, &actor.id(), now_ms())
             .map_err(storage)?;
-        Ok((self.vcs.operation(id)?, claimed))
+        Ok((self.vcs.operation(id)?, claimed.then_some(auth)))
     }
     pub(crate) fn vcs_directory_available(&self, path: &Path) -> std::result::Result<(), RpcError> {
         let path = path.canonicalize().unwrap_or_else(|_| path.to_owned());

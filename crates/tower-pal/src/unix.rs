@@ -267,6 +267,14 @@ pub fn private_socket(path: &Path) -> io::Result<()> {
     let (resolved, _) = resolve_owned_socket(path)?;
     fs::set_permissions(resolved, fs::Permissions::from_mode(0o600))
 }
+pub fn private_socket_identity(path: &Path) -> io::Result<(PathBuf, (u64, u64))> {
+    let path = require_private_socket(path)?;
+    let (current, metadata) = resolve_owned_socket(&path)?;
+    if current != path {
+        return Err(denied("private socket changed during validation"));
+    }
+    Ok((path, (metadata.dev(), metadata.ino())))
+}
 pub struct IpcListener {
     listener: UnixListener,
     path: PathBuf,

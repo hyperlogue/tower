@@ -53,6 +53,27 @@ fn operation(kind: &str, options: Value) -> Result<tower_vcs::Operation> {
     serde_json::from_value(options)
         .map_err(|_| RpcError::application("unsupported", "Unsupported VCS operation or options"))
 }
+pub(crate) fn authentication(
+    auth: &VcsAuth,
+    peer: tower_pal::Peer,
+    paths: &tower_pal::Paths,
+) -> Result<tower_vcs::Authentication> {
+    match auth {
+        VcsAuth::Host => Ok(tower_vcs::Authentication::host()),
+        VcsAuth::SshAgent { socket } => {
+            if peer.uid != tower_pal::uid() || peer.pid.is_none() {
+                return Err(RpcError::application(
+                    "unsupported_auth_transport",
+                    "SSH-agent authentication requires a local UDS caller",
+                ));
+            }
+            let path = paths.absolute_cwd(&socket.0).map_err(|_| {
+                RpcError::application("auth_unavailable", "Invalid agent socket path")
+            })?;
+            tower_vcs::Authentication::ssh_agent(&path).map_err(native)
+        }
+    }
+}
 #[derive(Clone, Default, Deserialize)]
 #[serde(default)]
 pub(crate) struct Config {
@@ -96,8 +117,17 @@ impl Vcs {
         serde_json::from_value(c.binding.clone()).map_err(failure)
     }
     pub fn prepared(op: &StoredVcsOperation) -> Result<Prepared> {
-        Prepared::deserialize(&op.prepared)
-            .map_err(|_| RpcError::application("internal_error", "Invalid stored VCS plan"))
+        let invalid = || RpcError::application("internal_error", "Invalid stored VCS plan");
+        let (data, forwarded) = match op.prepared.get("format") {
+            None => (&op.prepared, false),
+            Some(format) if format == "vcs.ssh-agent.v1" => (&op.prepared["prepared"], true),
+            _ => return Err(invalid()),
+        };
+        let prepared = Prepared::deserialize(data).map_err(|_| invalid())?;
+        if (prepared.review().authentication == tower_vcs::AuthMode::SshAgent) != forwarded {
+            return Err(invalid());
+        }
+        Ok(prepared)
     }
     pub fn checkout(&self, id: &str) -> Result<StoredCheckout> {
         self.store.checkout(id).map_err(|e| match e {
@@ -263,8 +293,15 @@ impl Vcs {
                 RpcError::application("invalid_params", "Invalid worktree creation options")
             })?;
             Some(
-                self.prepare_binding(&discovery.source, operation, actor, None, p.repository_id)
-                    .await?,
+                self.prepare_binding(
+                    &discovery.source,
+                    operation,
+                    actor,
+                    None,
+                    p.repository_id,
+                    &tower_vcs::Authentication::host(),
+                )
+                .await?,
             )
         } else {
             None
@@ -427,7 +464,12 @@ impl Vcs {
             _ => failure(e),
         })
     }
-    pub async fn prepare(&self, p: VcsPrepare, actor: String) -> Result<VcsOperation> {
+    pub async fn prepare(
+        &self,
+        p: VcsPrepare,
+        actor: String,
+        auth: &tower_vcs::Authentication,
+    ) -> Result<VcsOperation> {
         let c = self.checkout(&p.checkout_id)?;
         let b = Self::binding(&c)?;
         let operation = operation(&p.operation, p.options)?;
@@ -437,6 +479,7 @@ impl Vcs {
             actor,
             Some(p.checkout_id),
             c.record.repository_id,
+            auth,
         )
         .await
     }
@@ -447,8 +490,9 @@ impl Vcs {
         actor: String,
         checkout_id: Option<String>,
         repository_id: Option<String>,
+        auth: &tower_vcs::Authentication,
     ) -> Result<VcsOperation> {
-        let prepared = tower_vcs::prepare(b, operation, &self.root)
+        let prepared = tower_vcs::prepare_with_auth(b, operation, &self.root, auth)
             .await
             .map_err(native)?;
         let mut review = serde_json::to_value(prepared.review()).map_err(failure)?;
@@ -467,10 +511,17 @@ impl Vcs {
             result: None,
             error: None,
         };
+        let prepared = serde_json::to_value(prepared).map_err(failure)?;
         self.store
             .save_vcs_plan(&StoredVcsOperation {
                 actor,
-                prepared: serde_json::to_value(prepared).map_err(failure)?,
+                // Older daemons must fail to decode agent-bound plans rather than
+                // ignore the new auth mode and execute them with host credentials.
+                prepared: if auth.mode() == tower_vcs::AuthMode::SshAgent {
+                    json!({"format":"vcs.ssh-agent.v1","prepared":prepared})
+                } else {
+                    prepared
+                },
                 record: record.clone(),
             })
             .map_err(failure)?;
@@ -483,6 +534,7 @@ impl Vcs {
         peer: tower_pal::Peer,
         mut op: StoredVcsOperation,
         _permit: tokio::sync::OwnedSemaphorePermit,
+        auth: tower_vcs::Authentication,
     ) {
         let prepared = Self::prepared(&op);
         let result = match prepared {
@@ -490,7 +542,7 @@ impl Vcs {
                 let check = service.clone();
                 let recheck = request.clone();
                 let operation = prepared.operation_kind().to_string();
-                tower_vcs::execute(&prepared, move |paths| {
+                tower_vcs::execute_with_auth(&prepared, &auth, move |paths| {
                     check
                         .vcs_execution_check(&recheck, peer, paths, &operation)
                         .map_err(|e| tower_vcs::Error::new(e.data.code, false))
@@ -560,5 +612,28 @@ impl Vcs {
             return prepared.review().destination.iter().cloned().collect();
         }
         prepared.affected_paths().to_vec()
+    }
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
+    #[test]
+    fn forwarded_agents_require_a_local_peer_identity() {
+        let auth = VcsAuth::SshAgent {
+            socket: Secret("/unavailable-agent".into()),
+        };
+        let error = authentication(
+            &auth,
+            tower_pal::Peer {
+                uid: tower_pal::uid(),
+                pid: None,
+            },
+            &tower_pal::Paths::discover().unwrap(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.data.code, "unsupported_auth_transport");
+        assert!(!format!("{auth:?}").contains("/unavailable-agent"));
     }
 }

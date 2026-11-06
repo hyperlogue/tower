@@ -84,12 +84,28 @@ pub struct CheckoutBind {
     pub checkout_id: String,
     pub repository_id: Option<String>,
 }
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum VcsAuth {
+    #[default]
+    Host,
+    SshAgent {
+        socket: crate::Secret,
+    },
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VcsPrepare {
     pub checkout_id: String,
     pub operation: String,
     #[serde(default)]
     pub options: crate::Value,
+    #[serde(default)]
+    pub auth: VcsAuth,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct VcsExecute {
+    pub plan_id: String,
+    pub auth: Option<VcsAuth>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VcsPlanParams {

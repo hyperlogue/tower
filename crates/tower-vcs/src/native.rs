@@ -40,6 +40,8 @@ pub(crate) fn environment() -> tower_pal::Environment {
 }
 fn clean_environment(mut env: tower_pal::Environment) -> tower_pal::Environment {
     env.retain(|k, _| !k.starts_with("GIT_"));
+    env.remove("SSH_AUTH_SOCK");
+    env.remove("SSH_AGENT_PID");
     env.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
     env.insert("GIT_OPTIONAL_LOCKS".into(), "0".into());
     env.insert("LC_ALL".into(), "C".into());
@@ -53,6 +55,26 @@ pub(crate) async fn run(
     network: bool,
     mutation: bool,
     extra: &[(String, String)],
+) -> Result<(i32, Vec<u8>)> {
+    run_with_auth(
+        binding,
+        cwd,
+        args,
+        network,
+        mutation,
+        extra,
+        &crate::Authentication::host(),
+    )
+    .await
+}
+pub(crate) async fn run_with_auth(
+    binding: Option<&Binding>,
+    cwd: &Path,
+    args: &[String],
+    network: bool,
+    mutation: bool,
+    extra: &[(String, String)],
+    auth: &crate::Authentication,
 ) -> Result<(i32, Vec<u8>)> {
     let mut argv = vec![
         "git".into(),
@@ -75,6 +97,9 @@ pub(crate) async fn run(
     argv.extend_from_slice(args);
     let mut env = environment();
     env.extend(extra.iter().cloned());
+    if network {
+        auth.apply(&mut env)?;
+    }
     tower_pal::capture(
         &argv,
         &env,
@@ -574,10 +599,14 @@ mod tests {
                 ("GIT_CONFIG_KEY_0".into(), "core.worktree".into()),
                 ("GIT_CONFIG_VALUE_0".into(), "wrong".into()),
                 ("GIT_CONFIG_PARAMETERS".into(), "injected".into()),
+                ("SSH_AUTH_SOCK".into(), "stale-dashboard-agent".into()),
+                ("SSH_AGENT_PID".into(), "123".into()),
             ]
             .into(),
         );
         assert_eq!(env["PATH"], "/bin");
+        assert!(!env.contains_key("SSH_AUTH_SOCK"));
+        assert!(!env.contains_key("SSH_AGENT_PID"));
         assert!(
             env.keys()
                 .filter(|k| k.starts_with("GIT_"))

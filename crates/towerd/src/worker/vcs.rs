@@ -74,7 +74,8 @@ impl ServiceWorker {
             }
             "vcs.prepare" => {
                 let p: VcsPrepare = decode(&r.params)?;
-                encode(vcs.prepare(p, actor).await?)
+                let auth = crate::vcs::authentication(&p.auth, peer, &vcs.paths)?;
+                encode(vcs.prepare(p, actor, &auth).await?)
             }
             "vcs.operation" => {
                 let p: VcsPlanParams = decode(&r.params)?;
@@ -101,14 +102,14 @@ impl ServiceWorker {
                 )
             }
             "vcs.execute" => {
-                let p: VcsPlanParams = decode(&r.params)?;
+                let p: VcsExecute = decode(&r.params)?;
                 let request = r.clone();
-                let (op, claimed) = self
-                    .execute(move |s| s.vcs_claim(&request, peer, &p.plan_id))
+                let (op, auth) = self
+                    .execute(move |s| s.vcs_claim(&request, peer, &p))
                     .await
                     .map_err(failure)??;
                 let record = op.record.clone();
-                if claimed {
+                if let Some(auth) = auth {
                     let permit = permit.take().expect("execution permit");
                     tokio::spawn(vcs.clone().execute(
                         self.service.clone(),
@@ -116,6 +117,7 @@ impl ServiceWorker {
                         peer,
                         op,
                         permit,
+                        auth,
                     ));
                 }
                 encode(record)

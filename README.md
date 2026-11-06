@@ -157,7 +157,8 @@ worktree_root = "~/worktrees"
 ```
 
 The default is `~/worktrees`. Native Git access uses the host's configured
-credentials. Tower does not obtain Git credentials from Allgather. Local read
+credentials unless the caller supplies an SSH-agent context for that operation.
+Tower does not obtain Git credentials from Allgather. Local read
 credentials can inspect checkouts; registration, binding, and mutation require
 local administrative authority. VCS methods accept checkout or plan IDs, never
 an arbitrary working-directory path. Paths enter through explicit registration.
@@ -168,6 +169,52 @@ plan returns its retained receipt. Interrupted operations with uncertain effects
 stay `unknown` and are not retried. They reserve the repository until an
 administrator inspects Git state and any remaining processes, then runs
 `tower-cli vcs release PLAN_ID --yes`. Release preserves the unknown outcome.
+
+### Forwarded SSH agents
+
+From an SSH connection with agent forwarding enabled:
+
+```sh
+tower-cli vcs prepare CHECKOUT_ID push --auth ssh-agent
+tower-cli vcs execute PLAN_ID
+```
+
+The CLI reads its own `SSH_AUTH_SOCK`. Execute uses the prepared authentication
+mode and waits for the operation to settle when that mode is `ssh_agent`.
+Use a fresh forwarded connection for execution after reviewing the plan.
+`--auth host` explicitly selects host authentication; preparation defaults to it.
+Changing the authentication mode requires a new plan. Retrying a started or
+finished operation returns its receipt without requiring the old agent.
+
+Frontends can retain their persistent Tower RPC connection and use a separate,
+temporary SSH connection to obtain and hold a forwarded agent socket. Negotiate
+`vcs.ssh-agent.v1`, then send an `auth` field on `vcs.prepare` and `vcs.execute`:
+
+```json
+{"kind":"ssh_agent","socket":"/remote/private/agent.sock"}
+```
+
+Both push and pull preparation contact the remote. Close the forwarding
+connection after preparation, and reopen one for execution. Keep it alive until
+`vcs.operation` reports completion, failure, or uncertainty; the initial
+`vcs.execute` response can be `running`. Forwarding loss does not prove a push
+failed. Query the retained receipt instead of automatically retrying it.
+
+Only authorized local UDS callers can supply a socket. Tower checks its owner,
+privacy and identity, and rechecks it before network Git commands. The socket
+path can be absolute or use the host-canonical `~/` form. The resolved socket
+is kept in memory and applied only to that operation's network children; it is
+not saved in plans or sent to Allgather. Plans expose only `review.authentication`.
+Each execution supplies a fresh socket. HTTP requests cannot nominate one.
+Agent-bound plans use a private storage format that older Tower binaries reject;
+they cannot be downgraded into host-authenticated execution.
+
+This follows normal SSH authentication behavior: host SSH configuration and
+custom SSH commands still apply. It does not enforce agent-only authentication.
+Tower never changes its process environment, and VCS children do not inherit
+an incidental agent from the environment that started the daemon. Host-specific
+agent settings can still be configured through OpenSSH. Existing local policy,
+offline restrictions and checked VCS targets apply in either mode.
 
 Allgather receives machine-scoped checkout observations, not Git contents or
 credentials. Catalog and checkout updates use acknowledged deltas when smaller,

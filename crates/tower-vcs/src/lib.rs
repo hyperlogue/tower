@@ -3,6 +3,9 @@ use std::{fmt, path::PathBuf};
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+mod auth;
+pub use auth::{AuthMode, Authentication};
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Error {
     pub code: String,
@@ -140,6 +143,8 @@ impl Operation {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Review {
+    #[serde(default)]
+    pub authentication: AuthMode,
     pub operation: String,
     pub system: String,
     pub source: Option<PathBuf>,
@@ -262,9 +267,23 @@ pub async fn prepare(
     operation: Operation,
     worktree_root: &std::path::Path,
 ) -> Result<Prepared> {
+    prepare_with_auth(binding, operation, worktree_root, &Authentication::host()).await
+}
+pub async fn prepare_with_auth(
+    binding: &Binding,
+    operation: Operation,
+    worktree_root: &std::path::Path,
+    auth: &Authentication,
+) -> Result<Prepared> {
+    if auth.mode() == AuthMode::SshAgent
+        && !matches!(operation, Operation::Push { .. } | Operation::Pull { .. })
+    {
+        return Err(Error::new("unsupported_auth_operation", false));
+    }
+    auth.validate()?;
     tokio::time::timeout(
         std::time::Duration::from_secs(180),
-        operations::prepare(binding, operation, worktree_root),
+        operations::prepare(binding, operation, worktree_root, auth),
     )
     .await
     .map_err(|_| Error::new("preparation_timed_out", false))?
@@ -273,10 +292,21 @@ pub async fn execute(
     prepared: &Prepared,
     check: impl Fn(&[PathBuf]) -> Result<()> + Send + Sync,
 ) -> Result<Outcome> {
+    execute_with_auth(prepared, &Authentication::host(), check).await
+}
+pub async fn execute_with_auth(
+    prepared: &Prepared,
+    auth: &Authentication,
+    check: impl Fn(&[PathBuf]) -> Result<()> + Send + Sync,
+) -> Result<Outcome> {
+    if prepared.review.authentication != auth.mode() {
+        return Err(Error::new("auth_context_mismatch", false));
+    }
+    auth.validate()?;
     let dispatched = std::sync::atomic::AtomicBool::new(false);
     let mut applied = tokio::time::timeout(
         std::time::Duration::from_secs(180),
-        operations::execute(prepared, check, &dispatched),
+        operations::execute(prepared, auth, check, &dispatched),
     )
     .await
     .map_err(|_| {
@@ -284,7 +314,11 @@ pub async fn execute(
             "operation_timed_out",
             dispatched.load(std::sync::atomic::Ordering::Acquire),
         )
-    })??;
+    })?
+    .map_err(|mut error| {
+        error.may_have_effect |= dispatched.load(std::sync::atomic::Ordering::Acquire);
+        error
+    })?;
     applied.outcome.refresh_pending = !operations::refresh_tracking(prepared).await;
     Ok(applied.outcome)
 }

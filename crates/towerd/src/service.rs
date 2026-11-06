@@ -1025,6 +1025,7 @@ impl Service {
                     "clipboard.images.v1".into(),
                     "checkouts.v1".into(),
                     "vcs.checked-operations.v1".into(),
+                    "vcs.ssh-agent.v1".into(),
                     "sessions.metadata.v1".into(),
                     "host.metrics.v1".into(),
                 ];

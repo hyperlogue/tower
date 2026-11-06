@@ -293,3 +293,288 @@ fn selected_checkout_cannot_launch_into_a_replaced_directory() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+struct AgentFixture {
+    path: PathBuf,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+impl AgentFixture {
+    fn new(root: &Path, name: &'static str) -> Self {
+        use std::io::Write;
+        let path = root.join(format!("{name}.sock"));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        tower_pal::private_socket(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = stop.clone();
+        let thread = std::thread::spawn(move || {
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.write_all(name.as_bytes());
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5))
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            }
+        });
+        Self {
+            path,
+            stop,
+            thread: Some(thread),
+        }
+    }
+    fn auth(&self) -> Value {
+        json!({"kind":"ssh_agent","socket":self.path})
+    }
+}
+impl Drop for AgentFixture {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.thread.take().unwrap().join().unwrap();
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+#[test]
+fn vcs_agents_are_per_phase_private_and_never_replayed_after_an_uncertain_push() {
+    let f = Fixture::new();
+    let repo = f.repo();
+    let root = f.root.path();
+    let remote = root.join("remote.git");
+    f.git(
+        root,
+        &[
+            "clone",
+            "--bare",
+            repo.to_str().unwrap(),
+            remote.to_str().unwrap(),
+        ],
+    );
+    let ssh = root.join("ssh-fixture.mjs");
+    std::fs::write(&ssh, include_str!("fixtures/vcs-ssh.mjs")).unwrap();
+    let log = root.join("ssh-calls");
+    let hold = root.join("hold-push");
+    let lose = root.join("lose-agent");
+    std::fs::write(
+        root.join("ssh-fixture.mjs.json"),
+        json!({"remote":remote,"log":log,"hold":hold,"lose":lose}).to_string(),
+    )
+    .unwrap();
+    f.git(
+        &repo,
+        &[
+            "config",
+            "core.sshCommand",
+            &format!("node '{}'", ssh.display()),
+        ],
+    );
+    f.git(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "ssh://fixture.invalid/repository",
+        ],
+    );
+    let id = f.call(&["checkout", "register", repo.to_str().unwrap()])["checkouts"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    std::fs::write(repo.join("file"), "next").unwrap();
+    f.git(&repo, &["commit", "-am", "Next"]);
+    let a = AgentFixture::new(root, "agent-a");
+    let output = f
+        .command(&[
+            "vcs",
+            "prepare",
+            &id,
+            "push",
+            "--options",
+            r#"{"remote":"origin","reference":"main"}"#,
+            "--auth",
+            "ssh-agent",
+        ])
+        .env("SSH_AUTH_SOCK", &a.path)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let plan: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(plan["review"]["authentication"], "ssh_agent");
+    let persisted = rusqlite::Connection::open(root.join("state/tower/tower.db"))
+        .unwrap()
+        .query_row(
+            "SELECT prepared FROM vcs_operations WHERE id=?1",
+            [plan["plan_id"].as_str().unwrap()],
+            |r| r.get::<_, String>(0),
+        )
+        .unwrap();
+    assert!(persisted.contains("ssh_agent"));
+    assert_eq!(
+        serde_json::from_str::<Value>(&persisted).unwrap()["format"],
+        "vcs.ssh-agent.v1"
+    );
+    assert!(!persisted.contains(a.path.to_str().unwrap()));
+    assert!(!persisted.contains("agent-a.sock"));
+    let plan_id = plan["plan_id"].as_str().unwrap();
+    let a_path = a.path.clone();
+    drop(a);
+    f.call(&["daemon", "stop"]);
+    let no_auth = f
+        .command(&[
+            "rpc",
+            "vcs.execute",
+            &json!({"plan_id":plan_id}).to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!no_auth.status.success());
+    assert_eq!(
+        f.rpc("vcs.operation", json!({"plan_id":plan_id}))["state"],
+        "prepared"
+    );
+    let b = AgentFixture::new(root, "agent-b");
+    std::fs::write(&hold, "wait").unwrap();
+    assert_eq!(
+        f.rpc("vcs.execute", json!({"plan_id":plan_id,"auth":b.auth()}))["state"],
+        "running"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !std::fs::read_to_string(&log)
+        .unwrap_or_default()
+        .contains(r#""command":"receive""#)
+    {
+        assert!(std::time::Instant::now() < deadline);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(
+        f.rpc("vcs.operation", json!({"plan_id":plan_id}))["state"],
+        "running"
+    );
+    std::fs::remove_file(&hold).unwrap();
+    assert_eq!(f.call(&["vcs", "wait", plan_id])["state"], "completed");
+    let calls: Vec<Value> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|s| serde_json::from_str(s).unwrap())
+        .collect();
+    assert!(
+        calls
+            .iter()
+            .any(|c| c["agent"] == "agent-a" && c["command"] == "upload")
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|c| c["agent"] == "agent-b" && c["command"] == "receive")
+    );
+    let b_path = b.path.clone();
+    drop(b);
+    assert_eq!(f.call(&["vcs", "execute", plan_id])["state"], "completed");
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap().lines().count(),
+        calls.len()
+    );
+    let database = rusqlite::Connection::open(root.join("state/tower/tower.db")).unwrap();
+    let dump: String = database
+        .prepare("SELECT prepared FROM vcs_operations")
+        .unwrap()
+        .query_map([], |r| r.get::<_, String>(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    for path in [&a_path, &b_path] {
+        assert!(!dump.contains(path.to_str().unwrap()));
+    }
+
+    let clone = root.join("another-clone");
+    f.git(
+        root,
+        &["clone", repo.to_str().unwrap(), clone.to_str().unwrap()],
+    );
+    f.git(
+        &clone,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "ssh://fixture.invalid/repository",
+        ],
+    );
+    f.git(
+        &clone,
+        &[
+            "config",
+            "core.sshCommand",
+            &format!("node '{}'", ssh.display()),
+        ],
+    );
+    let clone_id = f.call(&["checkout", "register", clone.to_str().unwrap()])["checkouts"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let d = AgentFixture::new(root, "agent-d");
+    let e = AgentFixture::new(root, "agent-e");
+    let request_d = json!({"checkout_id":id,"operation":"push","options":{"remote":"origin","reference":"main"},"auth":{"kind":"ssh_agent","socket":"~/agent-d.sock"}});
+    let request_e = json!({"checkout_id":clone_id,"operation":"push","options":{"remote":"origin","reference":"main"},"auth":e.auth()});
+    std::thread::scope(|scope| {
+        let one = scope.spawn(|| f.rpc("vcs.prepare", request_d));
+        let two = scope.spawn(|| f.rpc("vcs.prepare", request_e));
+        assert_eq!(one.join().unwrap()["state"], "prepared");
+        assert_eq!(two.join().unwrap()["state"], "prepared");
+    });
+    let trace = std::fs::read_to_string(&log).unwrap();
+    for line in trace.lines() {
+        let call: Value = serde_json::from_str(line).unwrap();
+        if call["agent"] == "agent-d" {
+            assert_eq!(call["cwd"], repo.canonicalize().unwrap().to_str().unwrap());
+        }
+        if call["agent"] == "agent-e" {
+            assert_eq!(call["cwd"], clone.canonicalize().unwrap().to_str().unwrap());
+        }
+    }
+    assert!(trace.contains("agent-d") && trace.contains("agent-e"));
+    drop((d, e));
+
+    std::fs::write(repo.join("file"), "uncertain next").unwrap();
+    f.git(&repo, &["commit", "-am", "Uncertain fixture"]);
+    let c = AgentFixture::new(root, "agent-c");
+    let second = f.rpc("vcs.prepare", json!({"checkout_id":id,"operation":"push","options":{"remote":"origin","reference":"main"},"auth":c.auth()}));
+    let second_id = second["plan_id"].as_str().unwrap();
+    std::fs::write(&lose, "lose socket after remote success").unwrap();
+    let output = f
+        .command(&["vcs", "execute", second_id])
+        .env("SSH_AUTH_SOCK", &c.path)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let unknown: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(unknown["state"], "unknown", "{unknown}");
+    assert_eq!(unknown["error"]["data"]["may_have_effect"], true);
+    assert_eq!(
+        f.git(&remote, &["rev-parse", "main"]),
+        f.git(&repo, &["rev-parse", "main"])
+    );
+    let before = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(
+        f.rpc("vcs.execute", json!({"plan_id":second_id}))["state"],
+        "unknown"
+    );
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), before);
+    let retained: String = database
+        .query_row(
+            "SELECT prepared FROM vcs_operations WHERE id=?1",
+            [second_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(!retained.contains("agent-c.sock"));
+}

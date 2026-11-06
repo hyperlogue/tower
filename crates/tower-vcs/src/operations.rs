@@ -329,9 +329,14 @@ fn cwd(b: &Binding) -> &Path {
         .filter(|p| p.is_dir())
         .unwrap_or(&b.common_dir)
 }
-async fn remote_oid(b: &Binding, url: &str, reference: &str) -> Result<Option<String>> {
+async fn remote_oid(
+    b: &Binding,
+    url: &str,
+    reference: &str,
+    auth: &crate::Authentication,
+) -> Result<Option<String>> {
     let (alias, env) = remote_environment(url);
-    let (code, bytes) = native::run(
+    let (code, bytes) = native::run_with_auth(
         Some(b),
         cwd(b),
         &[
@@ -344,6 +349,7 @@ async fn remote_oid(b: &Binding, url: &str, reference: &str) -> Result<Option<St
         true,
         false,
         &env,
+        auth,
     )
     .await?;
     if code != 0 {
@@ -364,9 +370,15 @@ async fn remote_oid(b: &Binding, url: &str, reference: &str) -> Result<Option<St
     }
     Ok(found)
 }
-async fn fetch(b: &Binding, url: &str, reference: &str, oid: &str) -> Result<()> {
+async fn fetch(
+    b: &Binding,
+    url: &str,
+    reference: &str,
+    oid: &str,
+    auth: &crate::Authentication,
+) -> Result<()> {
     let (alias, env) = remote_environment(url);
-    let (code, _) = native::run(
+    let (code, _) = native::run_with_auth(
         Some(b),
         cwd(b),
         &[
@@ -381,6 +393,7 @@ async fn fetch(b: &Binding, url: &str, reference: &str, oid: &str) -> Result<()>
         true,
         false,
         &env,
+        auth,
     )
     .await?;
     if code != 0 || revision(b, oid).await.as_deref() != Ok(oid) {
@@ -450,6 +463,7 @@ pub async fn prepare(
     binding: &Binding,
     operation: Operation,
     worktree_root: &Path,
+    auth: &crate::Authentication,
 ) -> Result<Prepared> {
     let _lock = lock(binding).await?;
     let mut root_value = None;
@@ -483,6 +497,7 @@ pub async fn prepare(
         .as_ref()
         .and_then(|p| list.iter().find(|w| w.path == *p));
     let mut review = Review {
+        authentication: auth.mode(),
         operation: operation.kind().into(),
         system: "git".into(),
         source: binding.directory.clone(),
@@ -501,9 +516,9 @@ pub async fn prepare(
             let oid = head.clone().ok_or_else(|| fail("unborn_branch"))?;
             let remote = remote(&actual, selection, reference, true).await?;
             tracking = remote.tracking.clone();
-            let old = remote_oid(&actual, &remote.url, &remote.reference).await?;
+            let old = remote_oid(&actual, &remote.url, &remote.reference, auth).await?;
             if let Some(old) = &old {
-                fetch(&actual, &remote.url, &remote.reference, old).await?;
+                fetch(&actual, &remote.url, &remote.reference, old, auth).await?;
                 ancestor(&actual, old, &oid).await?;
             }
             review.target = Some(oid.clone());
@@ -528,10 +543,10 @@ pub async fn prepare(
             let old = head.as_deref().ok_or_else(|| fail("unborn_branch"))?;
             let remote = remote(&actual, selection, reference, false).await?;
             tracking = remote.tracking.clone();
-            let target = remote_oid(&actual, &remote.url, &remote.reference)
+            let target = remote_oid(&actual, &remote.url, &remote.reference, auth)
                 .await?
                 .ok_or_else(|| fail("remote_reference_missing"))?;
-            fetch(&actual, &remote.url, &remote.reference, &target).await?;
+            fetch(&actual, &remote.url, &remote.reference, &target, auth).await?;
             ancestor(&actual, old, &target).await?;
             review.target = Some(target.clone());
             review.remote = native::public_remote(&remote.url);
@@ -743,7 +758,7 @@ pub(crate) async fn refresh_tracking(p: &Prepared) -> bool {
         .await
         .is_ok_and(|result| result.is_ok())
 }
-async fn revalidate(p: &Prepared) -> Result<()> {
+async fn revalidate(p: &Prepared, auth: &crate::Authentication) -> Result<()> {
     if p.review.operation != p.operation.kind()
         || p.review.system != "git"
         || p.review.head != p.expectation.head
@@ -788,7 +803,7 @@ async fn revalidate(p: &Prepared) -> Result<()> {
             {
                 return Err(fail("invalid_plan"));
             }
-            if remote_oid(&p.binding, url, reference).await? != *expected {
+            if remote_oid(&p.binding, url, reference, auth).await? != *expected {
                 return Err(fail("remote_changed"));
             }
         }
@@ -914,11 +929,12 @@ pub(crate) struct Applied {
 }
 pub async fn execute(
     p: &Prepared,
+    auth: &crate::Authentication,
     check: impl Fn(&[PathBuf]) -> Result<()> + Send + Sync,
     dispatched: &std::sync::atomic::AtomicBool,
 ) -> Result<Applied> {
     let guard = lock(&p.binding).await?;
-    revalidate(p).await?;
+    revalidate(p, auth).await?;
     check(&p.affected_paths)?;
     let mut env = Vec::new();
     let mut network = false;
@@ -1008,14 +1024,16 @@ pub async fn execute(
             native::path_text(path)?.into(),
         ],
     };
+    auth.validate()?;
     dispatched.store(true, std::sync::atomic::Ordering::Release);
-    let (code, _) = native::run(
+    let (code, _) = native::run_with_auth(
         Some(&p.binding),
         cwd(&p.binding),
         &args,
         network,
         true,
         &env,
+        auth,
     )
     .await?;
     if code != 0 {
@@ -1029,7 +1047,7 @@ pub async fn execute(
                 oid,
                 ..
             } => {
-                if remote_oid(&p.binding, url, reference).await?.as_ref() != Some(oid) {
+                if remote_oid(&p.binding, url, reference, auth).await?.as_ref() != Some(oid) {
                     return Err(fail("verification_failed"));
                 }
                 Some(p.binding.clone())
