@@ -577,30 +577,7 @@ impl Journal {
     ) -> Result<ExecutionReceipt> {
         let mut conn = self.lock()?;
         let tx = conn.transaction().map_err(internal)?;
-        let json:String=tx.query_row("SELECT receipt FROM commands WHERE namespace=?1 AND command_id=?2 AND runtime_id=?3 AND generation=?4",params![binding.namespace(),command_id,binding.runtime_id,binding.generation],|r|r.get(0)).map_err(internal)?;
-        let mut receipt: ExecutionReceipt = serde_json::from_str(&json).map_err(internal)?;
-        if receipt.dispatch.state == "finished" {
-            return Ok(receipt);
-        }
-        receipt.receipt_revision += 1;
-        receipt.dispatch.state = if failure
-            .as_ref()
-            .is_some_and(|e| e.code == "dispatch_unknown")
-        {
-            "unknown"
-        } else {
-            "finished"
-        }
-        .into();
-        receipt.dispatch.transport_written = Some(written);
-        receipt.result = result;
-        receipt.error = failure;
-        save_receipt(&tx, &binding.namespace(), &receipt)?;
-        tx.execute(
-            "UPDATE commands SET payload=NULL WHERE namespace=?1 AND command_id=?2",
-            params![binding.namespace(), command_id],
-        )
-        .map_err(internal)?;
+        let receipt = finish_dispatch_tx(&tx, binding, command_id, written, result, failure)?;
         tx.commit().map_err(internal)?;
         Ok(receipt)
     }
@@ -904,6 +881,40 @@ fn fence_tx(
     .map_err(internal)?;
     tx.execute("UPDATE runtimes SET fenced=1,state='ended',termination=?1,loss=?2,ended_at=coalesce(ended_at,?3),metadata=json_set(metadata,'$.error',?7) WHERE namespace=?4 AND runtime_id=?5 AND generation=?6",params![loss.termination,serde_json::to_string(&loss).map_err(internal)?,millis() as i64,binding.namespace(),binding.runtime_id,binding.generation,if matches!(loss.reason.as_str(),"local_stop"|"server_restart"|"stop_runtime"){None}else{Some(&loss.reason)}]).map_err(internal)?;
     Ok(loss)
+}
+fn finish_dispatch_tx(
+    tx: &Transaction<'_>,
+    binding: &Binding,
+    command_id: &str,
+    written: bool,
+    result: Option<ExecutionResult>,
+    failure: Option<ExecutionError>,
+) -> Result<ExecutionReceipt> {
+    let json:String=tx.query_row("SELECT receipt FROM commands WHERE namespace=?1 AND command_id=?2 AND runtime_id=?3 AND generation=?4",params![binding.namespace(),command_id,binding.runtime_id,binding.generation],|r|r.get(0)).map_err(internal)?;
+    let mut receipt: ExecutionReceipt = serde_json::from_str(&json).map_err(internal)?;
+    if receipt.dispatch.state == "finished" {
+        return Ok(receipt);
+    }
+    receipt.receipt_revision += 1;
+    receipt.dispatch.state = if failure
+        .as_ref()
+        .is_some_and(|e| e.code == "dispatch_unknown")
+    {
+        "unknown"
+    } else {
+        "finished"
+    }
+    .into();
+    receipt.dispatch.transport_written = Some(written);
+    receipt.result = result;
+    receipt.error = failure;
+    save_receipt(tx, &binding.namespace(), &receipt)?;
+    tx.execute(
+        "UPDATE commands SET payload=NULL WHERE namespace=?1 AND command_id=?2",
+        params![binding.namespace(), command_id],
+    )
+    .map_err(internal)?;
+    Ok(receipt)
 }
 fn ensure_live(tx: &Transaction<'_>, binding: &Binding) -> Result<()> {
     let fenced: Option<bool> = tx

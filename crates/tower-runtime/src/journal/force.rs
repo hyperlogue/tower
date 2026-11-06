@@ -219,12 +219,20 @@ impl Journal {
         tx.commit().map_err(internal)
     }
     pub fn force_failed(&self, b: &Binding, c: &ExecutionCommand, code: &str) -> Result<()> {
-        if self.force_phase(b)?.as_deref() == Some("dispatched") {
-            self.fence(b, "dispatch_unknown", "unknown")?;
-            return Ok(());
+        let mut conn = self.lock()?;
+        let tx = conn.transaction().map_err(internal)?;
+        let phase:String=tx.query_row("SELECT f.phase FROM force_resumes f JOIN commands c USING(namespace,command_id) WHERE c.namespace=?1 AND c.command_id=?2 AND c.runtime_id=?3 AND c.generation=?4",params![b.namespace(),c.command_id,b.runtime_id,b.generation],|r|r.get(0)).map_err(internal)?;
+        if phase == "dispatched" {
+            fence_tx(&tx, b, "dispatch_unknown", "unknown")?;
+            return tx.commit().map_err(internal);
         }
-        self.lock()?.execute("UPDATE force_resumes SET phase='failed' WHERE namespace=?1 AND command_id=?2 AND phase!='dispatched'",params![b.namespace(),c.command_id]).map_err(internal)?;
-        self.finish_dispatch(
+        tx.execute(
+            "UPDATE force_resumes SET phase='failed' WHERE namespace=?1 AND command_id=?2",
+            params![b.namespace(), c.command_id],
+        )
+        .map_err(internal)?;
+        finish_dispatch_tx(
+            &tx,
             b,
             &c.command_id,
             false,
@@ -236,8 +244,8 @@ impl Journal {
                 may_have_effect: true,
             }),
         )?;
-        self.fence(b, code, "confirmed")?;
-        Ok(())
+        fence_tx(&tx, b, code, "confirmed")?;
+        tx.commit().map_err(internal)
     }
     pub fn never_dispatched(&self, b: &Binding) -> Result<bool> {
         let conn = self.lock()?;
@@ -438,6 +446,13 @@ mod tests {
             "unknown",
             "A crash after dispatch cannot claim that the replacement never ran"
         );
+        let uncertain = j.admit(&b, &c).unwrap();
+        assert_eq!(uncertain.state, "accepted");
+        assert_eq!(uncertain.acceptance, accepted.acceptance);
+        assert_eq!(uncertain.dispatch.state, "unknown");
+        assert_eq!(uncertain.error.as_ref().unwrap().code, "dispatch_unknown");
+        assert_eq!(uncertain.error.as_ref().unwrap().stage, "recovery");
+        assert!(uncertain.error.as_ref().unwrap().may_have_effect);
         let mut changed = c.clone();
         changed.payload = serde_json::from_value(
             json!({"force":true,"cleanup":[{"runtime_id":"different","generation":"different"}]}),
@@ -523,9 +538,63 @@ mod tests {
             j.force_ready(&b, &c).unwrap_err().data.code,
             "cleanup_unconfirmed"
         );
+        let before = j.admit(&b, &c).unwrap();
+        j.lock().unwrap().execute_batch("CREATE TRIGGER reject_replacement_loss BEFORE UPDATE OF fenced ON runtimes WHEN NEW.runtime_id='new' BEGIN SELECT RAISE(ABORT, 'interrupted finalization'); END;").unwrap();
+        assert!(j.force_failed(&b, &c, "cleanup_unconfirmed").is_err());
+        assert_eq!(j.force_phase(&b).unwrap().as_deref(), Some("cleanup"));
+        assert_eq!(j.admit(&b, &c).unwrap(), before);
+        assert!(j.force_command(&b).unwrap().is_some());
+        assert!(!j.state(&b).unwrap().1);
+        j.lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER reject_replacement_loss")
+            .unwrap();
         j.force_failed(&b, &c, "cleanup_unconfirmed").unwrap();
         assert_eq!(j.state(&b).unwrap().2, "confirmed");
         assert!(j.force_command(&b).unwrap().is_none());
         assert_eq!(j.force_targets(&b, &c.command_id).unwrap().len(), 2);
+        let final_receipt = j.admit(&b, &c).unwrap();
+        assert_eq!(
+            serde_json::to_value(&final_receipt).unwrap(),
+            json!({
+                "command_id":c.command_id,"runtime_id":b.runtime_id,"generation":b.generation,
+                "receipt_revision":before.receipt_revision+1,"state":"accepted",
+                "acceptance":before.acceptance,
+                "dispatch":{"state":"finished","transport_written":false},
+                "error":{"code":"cleanup_unconfirmed","message":"Force resume did not complete; no replacement was dispatched","stage":"execution","may_have_effect":true}
+            })
+        );
+        let loss = j
+            .losses(&b.namespace())
+            .unwrap()
+            .into_iter()
+            .find(|loss| loss.runtime_id == b.runtime_id)
+            .unwrap();
+        assert_eq!(loss.owner_id, b.owner_id);
+        assert_eq!(loss.generation, b.generation);
+        assert_eq!(loss.report_revision, 1);
+        assert_eq!(loss.termination, "confirmed");
+        assert_eq!(loss.reason, "cleanup_unconfirmed");
+        assert_eq!(j.state(&old).unwrap().2, "confirmed");
+        assert_eq!(j.state(&second).unwrap().2, "unknown");
+        drop(j);
+        let j = Journal::open(&path, Limits::default()).unwrap();
+        j.force_failed(&b, &c, "cleanup_unconfirmed").unwrap();
+        assert_eq!(j.admit(&b, &c).unwrap(), final_receipt);
+        let replay = j
+            .losses(&b.namespace())
+            .unwrap()
+            .into_iter()
+            .find(|loss| loss.runtime_id == b.runtime_id)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(replay).unwrap(),
+            serde_json::to_value(loss).unwrap()
+        );
+        assert!(j.force_command(&b).unwrap().is_none());
+        assert_eq!(
+            j.begin_dispatch(&b, &c.command_id).unwrap_err().data.code,
+            "runtime_fenced"
+        );
     }
 }
