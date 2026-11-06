@@ -547,6 +547,7 @@ fn local_offline_management_does_not_change_received_policy() {
         from: "*".into(),
         to: "*".into(),
         action: "deny".into(),
+        kind: None,
         created_by: "allgather".into(),
         created_at: 1,
     };

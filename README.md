@@ -558,6 +558,13 @@ Tower ID on another machine is permitted; IDs are never parsed for routing.
 A rejected record remains locally usable with `sync_state: rejected`.
 The status command reports redacted policy-application and connection errors.
 
+In Allgather mode, starting, resuming, or controlling a session, and VCS
+mutations, require a local `session` rule. Message rules do not apply to them:
+
+```sh
+tower-cli rules add --kind session --from allgather --to 'cwd:~/work' --action allow
+```
+
 Launch structured sessions from Allgather after permitting the relevant local
 policy. Install the native CLI on the machine and configure its native login first.
 Codex always uses app-server for this interface. Claude Code and Antigravity use

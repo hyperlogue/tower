@@ -182,6 +182,7 @@ fn local_approval_cannot_override_remote_policy() {
         from: "*".into(),
         to: "*".into(),
         action: "ask".into(),
+        kind: None,
         created_by: "remote".into(),
         created_at: 0,
     };
@@ -456,6 +457,7 @@ fn remote_messages_require_scopes_and_both_policy_tables() {
                 from: "*".into(),
                 to: "*".into(),
                 action: "deny".into(),
+                kind: None,
                 created_by: "allgather".into(),
                 created_at: 1,
             }],
@@ -533,6 +535,7 @@ fn allgather_cannot_administer_local_state_even_with_admin_scope() {
                     from: "*".into(),
                     to: "*".into(),
                     action: "deny".into(),
+                    kind: None,
                     created_by: "allgather".into(),
                     created_at: 1,
                 }],
@@ -710,4 +713,37 @@ fn private_delivery_updates_merge_atomically_and_ignore_stale_sequences() {
     .unwrap();
     assert!(store.delivery(&b).unwrap().thread_id.is_none());
     assert_eq!(store.agent(&b).unwrap().record.caps.message, "none");
+}
+
+#[test]
+fn message_rules_do_not_authorize_session_operations() {
+    let (_dir, store, service) = setup();
+    store.set_enrollment("allgather", None).unwrap();
+    store.apply_policy(1, &[]).unwrap();
+    let actor = Actor::Allgather { scope: Vec::new() };
+    let to = crate::policy::Subject {
+        id: "*",
+        harness: Some("claude"),
+        cwd: Some("~/work/repo"),
+    };
+    for (kind, allowed) in [
+        (serde_json::Value::Null, false),
+        ("message".into(), false),
+        ("session".into(), true),
+    ] {
+        call(
+            &service,
+            "rules.replace",
+            serde_json::json!({"rules":[{"id":"work","from":"*","to":"cwd:~/work","action":"allow","kind":kind,"created_by":"human","created_at":1}]}),
+            human(),
+        )
+        .unwrap();
+        let result = service.session_policy(&actor, to);
+        assert_eq!(result.is_ok(), allowed, "{kind}");
+        if !allowed {
+            assert_eq!(result.unwrap_err().data.code, "approval_required");
+        }
+    }
+    let invalid = serde_json::json!({"rule":{"id":"x","from":"*","to":"*","action":"allow","kind":"launch","created_by":"human","created_at":1}});
+    assert!(call(&service, "rules.put", invalid, human()).is_err());
 }

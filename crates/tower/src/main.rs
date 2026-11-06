@@ -374,6 +374,9 @@ enum RulesCommand {
         to: String,
         #[arg(long, default_value = "allow")]
         action: String,
+        /// `session` governs starting and controlling sessions instead of messages.
+        #[arg(long, value_parser = ["message", "session"])]
+        kind: Option<String>,
         #[arg(long)]
         id: Option<String>,
     },
@@ -1066,6 +1069,7 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
                 from,
                 to,
                 action,
+                kind,
                 id,
             } => print_json(
                 &client
@@ -1077,6 +1081,7 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
                                 from,
                                 to,
                                 action,
+                                kind,
                                 created_by: String::new(),
                                 created_at: 0,
                             },

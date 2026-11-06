@@ -1368,6 +1368,12 @@ fn validate_rule(rule: &Rule) -> std::result::Result<(), RpcError> {
     if !matches!(rule.action.as_str(), "allow" | "ask" | "deny") {
         return Err(invalid("Unknown rule action"));
     }
+    if !matches!(
+        rule.kind.as_deref(),
+        None | Some(crate::policy::MESSAGE | crate::policy::SESSION)
+    ) {
+        return Err(invalid("Unknown rule kind"));
+    }
     for selector in [&rule.from, &rule.to] {
         if selector.is_empty()
             || selector.len() > 4096

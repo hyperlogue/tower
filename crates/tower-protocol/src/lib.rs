@@ -361,6 +361,10 @@ pub struct Rule {
     pub from: String,
     pub to: String,
     pub action: String,
+    /// A local rule governs messages unless this is `session`, which governs
+    /// starting and controlling sessions. Allgather rules govern both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     pub created_by: String,
     pub created_at: u64,
 }

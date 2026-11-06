@@ -46,6 +46,7 @@ fn rule(id: &str, action: &str) -> Rule {
         from: "*".into(),
         to: "*".into(),
         action: action.into(),
+        kind: None,
         created_by: "human".into(),
         created_at: 1,
     }
