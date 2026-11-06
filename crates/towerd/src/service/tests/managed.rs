@@ -343,7 +343,7 @@ fn pool_upgrade_can_require_idle_terminal_sessions() {
     assert_eq!(upgrade(true).unwrap_err().data.code, "sessions_busy");
     assert_eq!(terminal.pool_restarts.load(Ordering::Relaxed), 0);
     upgrade(false).unwrap();
-    set("idle");
+    set("waiting_approval");
     upgrade(true).unwrap();
     assert_eq!(terminal.pool_restarts.load(Ordering::Relaxed), 2);
 }

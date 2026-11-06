@@ -61,10 +61,9 @@ impl Service {
                     .map_err(storage)?
                     .record
                     .status;
-                if matches!(
-                    status.as_str(),
-                    "starting" | "working" | "waiting_input" | "waiting_approval"
-                ) {
+                // Sessions waiting for input or approval never become idle on
+                // their own.
+                if matches!(status.as_str(), "starting" | "working") {
                     return Err(app("sessions_busy", "A terminal session is not idle"));
                 }
             }
