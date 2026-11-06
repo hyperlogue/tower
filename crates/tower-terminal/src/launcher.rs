@@ -119,6 +119,41 @@ fn report(path: &Path, report: &Report) -> io::Result<()> {
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "launcher report timed out"))?
         })
 }
+/// Asks a resumed agent to continue the turn its previous incarnation was
+/// running, once, as soon as it accepts input.
+fn continue_turn(paths: &tower_pal::Paths, plan: &LauncherPlan, state: &mut RuntimeState) {
+    if !plan.continue_turn
+        || state.private.contains_key("continued")
+        || !super::injection::allowed(paths, plan.spec.harness)
+    {
+        return;
+    }
+    let Ok(proof) = super::injection::proof(state) else {
+        return;
+    };
+    state.private.insert("continued".into(), true.into());
+    let (paths, name) = (paths.clone(), plan.id.clone());
+    tokio::spawn(async move {
+        // A just-started agent can report readiness before the pool has seen
+        // it enable bracketed paste.
+        for _ in 0..40 {
+            let mut proof = proof.clone();
+            proof.checked_at = tower_pal::monotonic_ms();
+            let text = tower_agents::runtime::CONTINUE.to_owned();
+            match super::injection::send(paths.clone(), name.clone(), proof, text).await {
+                Err(e)
+                    if matches!(
+                        e.data.details.get("reason"),
+                        Some(tower_protocol::Value::String(r)) if r == "target_busy_pty"
+                    ) =>
+                {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                _ => return,
+            }
+        }
+    });
+}
 pub fn stop(plan: &LauncherPlan, token: &str) -> io::Result<()> {
     report(
         Path::new(&plan.control_socket),
@@ -433,6 +468,7 @@ async fn serve(
                     let kind=event.kind;let before=state.seq;let was_idle=state.status=="idle";events::apply(state,event,now());
                     if state.seq!=before {
                         super::injection::observe_idle(state,kind,was_idle);
+                        continue_turn(&paths,plan,state);
                         if let Some(endpoint)=report.delivery && tower_agents::delivery::validate(&endpoint).is_ok() && endpoint.messaging_socket.is_some() && endpoint.messaging_token.is_some() {
                             state.private.insert("delivery".into(),serde_json::to_value(endpoint)?);
                         }

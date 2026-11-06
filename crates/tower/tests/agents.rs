@@ -712,6 +712,42 @@ cat
 }
 
 #[test]
+fn pool_upgrade_nudges_an_agent_that_was_working() {
+    let f = Fixture::new();
+    let config = f.root.path().join("c/tower");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join("config.toml"), "[inject.opencode]\npty=true\n").unwrap();
+    let script = f.root.path().join("bin/opencode");
+    std::fs::write(&script,r#"#!/bin/sh
+stty raw -echo
+printf '\033[?2004h'
+printf '{"session_id":"pty-native","root_confirmed":true}' | "$TOWER_TEST_BIN" hook opencode SessionStart
+case " $* " in
+*" pty-native "*) ;;
+*) printf '{"session_id":"pty-native"}' | "$TOWER_TEST_BIN" hook opencode UserPromptSubmit ;;
+esac
+printf READY
+cat
+"#).unwrap();
+    let opened = f.call(&["open", "opencode", "--headless"]);
+    let id = opened["id"].as_str().unwrap();
+    let before = f.wait(id, "working");
+    f.call(&["pool", "upgrade"]);
+    let after = f.wait(id, "idle");
+    assert_ne!(after["pid"], before["pid"]);
+    let until = Instant::now() + Duration::from_secs(5);
+    while !f.call(&["snapshot", id])["buffer"]
+        .as_str()
+        .unwrap()
+        .contains("Tower restarted and interrupted")
+    {
+        assert!(Instant::now() < until, "the resumed agent was not nudged");
+        thread::sleep(Duration::from_millis(20));
+    }
+    f.call(&["kill", id]);
+}
+
+#[test]
 fn codex_launch_explains_a_daemon_that_cannot_start() {
     let f = Fixture::new();
     let codex = f.root.path().join("bin/codex");

@@ -215,8 +215,11 @@ The generated jobs are `tower` and `tower-terminal-pool` and have separate
 lifetimes.
 
 A running pool keeps its version when binaries are updated. Run
-`tower-cli pool upgrade` to replace it; its sessions restart and resume their
-conversations. `--wait-idle` first waits until no terminal session is mid-turn.
+`tower-cli pool upgrade` to replace it; its sessions, including those launched
+from Allgather, restart under the same IDs and resume their conversations. An
+agent that was mid-turn is told to continue when PTY input is enabled for it
+(`[inject.HARNESS] pty`, on by default for Claude Code). `--wait-idle` first waits until no terminal session is
+mid-turn.
 The server replaces a pool with a different protocol version automatically.
 
 Snapshots contain reconstructed ANSI text, with a `truncated` flag for discarded

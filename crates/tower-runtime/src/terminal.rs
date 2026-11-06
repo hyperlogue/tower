@@ -227,6 +227,45 @@ async fn cancel_pending(
     Ok(false)
 }
 
+/// Relaunches a lost terminal session on its native conversation. Returns
+/// `None` when the conversation cannot be resumed.
+async fn resume(
+    paths: &tower_pal::Paths,
+    journal: &Journal,
+    b: &Binding,
+    backend: Arc<dyn ManagedBackend>,
+    lost: &ManagedSession,
+) -> Result<Option<ManagedSession>> {
+    let recover_backend = backend.clone();
+    let lost_session = lost.clone();
+    let Some(prepared) =
+        tokio::task::spawn_blocking(move || recover_backend.recover(&lost_session))
+            .await
+            .map_err(internal)??
+    else {
+        return Ok(None);
+    };
+    let next = ManagedSession {
+        id: lost.id.clone(),
+        protocol: "terminal".into(),
+        binding: prepared.binding,
+        launch: Some(prepared.launch),
+        auto_resume: true,
+    };
+    let mut metadata = journal.metadata(b)?;
+    metadata["terminal_session"] = serde_json::to_value(&next).map_err(internal)?;
+    let (state, _, _) = journal.state(b)?;
+    journal.update_metadata(b, &state, &metadata)?;
+    let token = paths.token_path(&b.tower_session_id).map_err(internal)?;
+    let token = Secret(
+        String::from_utf8(tower_pal::read_private(&token).map_err(internal)?).map_err(internal)?,
+    );
+    let start_session = next.clone();
+    tokio::task::spawn_blocking(move || backend.start(&start_session, &token))
+        .await
+        .map_err(internal)??;
+    Ok(Some(next))
+}
 pub(crate) async fn run(
     ctx: engine::Context,
     b: Binding,
@@ -350,7 +389,8 @@ async fn run_inner(
             protocol: "terminal".into(),
             binding: prepared.binding,
             launch: Some(prepared.launch),
-            auto_resume: false,
+            // A lost pool session resumes in the same runtime.
+            auto_resume: true,
         };
         let mut metadata = json!({"terminal_session":native,"launch_command_id":command.command_id,"boot_id":tower_pal::boot_id().map_err(internal)?});
         let payload = state_payload(b, &metadata, "starting", false);
@@ -409,6 +449,7 @@ async fn run_inner(
         }
         native
     };
+    let mut native = native;
     let started = tokio::time::Instant::now();
     let mut tick = tokio::time::interval(Duration::from_millis(500));
     loop {
@@ -447,6 +488,16 @@ async fn run_inner(
             }
             _ = tick.tick() => {
                 match observe(backend.clone(), native.clone()).await {
+                    // The pool lost the session, for example when it was
+                    // replaced: resume the conversation in the same runtime.
+                    Ok(observation) if observation.status == "lost" && !journal.state(b)?.1 => {
+                        match resume(paths, journal, b, backend.clone(), &native).await {
+                            Ok(Some(next)) => native = next,
+                            _ => {
+                                if record(journal, b, observation, false)? { return Ok(()) }
+                            }
+                        }
+                    }
                     Ok(observation) => {
                         if !journal.state(b)?.1 && observation.terminal.as_ref().is_some_and(|t| t.running) {
                             // Positive identity evidence can settle a lost create reply without resubmission.

@@ -706,6 +706,7 @@ impl ManagedBackend for TerminalBackend {
                 .to_string_lossy()
                 .into_owned(),
             spec: spec.clone(),
+            continue_turn: false,
         };
         let binding = Binding {
             name: id.into(),
@@ -984,7 +985,13 @@ impl ManagedBackend for TerminalBackend {
                 {
                     return Ok(None);
                 }
-                self.prepare_resume(session, None, None).map(Some)
+                let mut prepared = self.prepare_resume(session, None, None)?;
+                if state.status == "working" {
+                    let mut binding: Binding = decode(&prepared.binding)?;
+                    binding.plan.continue_turn = true;
+                    prepared.binding = encode(binding)?;
+                }
+                Ok(Some(prepared))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let plan: Plan = decode(session.launch.as_ref().expect("checked above"))?;

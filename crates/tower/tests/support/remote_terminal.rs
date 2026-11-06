@@ -228,7 +228,7 @@ async fn terminal_launch_attaches_and_recovers_without_replay_or_structured_cont
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn terminal_pool_loss_fences_instead_of_starting_a_replacement() {
+async fn terminal_pool_loss_fences_a_session_that_cannot_resume() {
     let f = Fixture::new();
     install_pi(&f);
     let s = Server::start_modes(&f, false, true).await;
@@ -298,4 +298,81 @@ async fn terminal_codex_stop_preserves_the_other_shared_host_thread() {
     assert_eq!(b_after["native_session_id"], b["native_session_id"]);
     assert_eq!(b_after["caps"]["attach"], true);
     f.cli(&["kill", &second]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_pool_upgrade_resumes_a_terminal_runtime_in_place() {
+    let f = Fixture::new();
+    let script = f.root.path().join("bin/opencode");
+    std::fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+printf '{{"session_id":"remote-native","root_confirmed":true}}' | '{}' hook opencode SessionStart
+case " $* " in *" remote-native "*) echo RESUMED ;; esac
+echo TERMINAL-READY
+cat
+"#,
+            env!("CARGO_BIN_EXE_tower-cli")
+        ),
+    )
+    .unwrap();
+    tower_pal::make_executable(&script).unwrap();
+    let s = Server::start_modes(&f, false, true).await;
+    consent(&f);
+    let (_, id) = launch(&f, &s, "pool-upgrade", "opencode").await;
+    let record = |f: &Fixture| f.rpc("agent.get", json!({"id":id}));
+    let before = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let r = record(&f);
+            if r["native_session_id"] == "remote-native" {
+                break r;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    f.cli(&["pool", "upgrade"]);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let out = f.command(&["--json", "snapshot", &id]).output().unwrap();
+            if String::from_utf8_lossy(&out.stdout).contains("RESUMED") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let after = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let r = record(&f);
+            if r["pid"] != before["pid"] && r["pid"].is_number() {
+                break r;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(after["native_session_id"], "remote-native");
+    assert!(
+        !s.frames
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|v| v["method"] == "runtime.lost")
+    );
+    let cancel = command("stop-upgraded", "pool-upgrade", "cancel", json!({}));
+    assert_eq!(
+        s.call("command.execute", cancel).await["result"]["state"],
+        "accepted"
+    );
+    s.until(|v| {
+        v["method"] == "command.receipt"
+            && v["params"]["command_id"] == "stop-upgraded"
+            && v["params"]["result"]["outcome"] == "stopped"
+    })
+    .await;
 }

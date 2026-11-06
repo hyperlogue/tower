@@ -31,7 +31,13 @@ pub struct LauncherPlan {
     pub tower_socket: String,
     pub control_socket: String,
     pub spec: AgentSpec,
+    /// The previous incarnation was mid-turn: nudge the agent once ready.
+    #[serde(default)]
+    pub continue_turn: bool,
 }
+/// Sent to an agent whose turn a Tower or pool restart interrupted.
+pub const CONTINUE: &str =
+    "Tower restarted and interrupted your previous turn. Continue where you left off.";
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct AgentDetail {

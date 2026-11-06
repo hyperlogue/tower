@@ -29,9 +29,7 @@ pub(crate) enum Start {
     /// Reopens the native session of a suspended or orphaned live runtime.
     Continue,
 }
-/// Sent to an agent whose turn a restart interrupted.
-pub(crate) const CONTINUE: &str =
-    "Tower restarted and interrupted your previous turn. Continue where you left off.";
+use tower_agents::runtime::CONTINUE;
 /// What a continued engine restores from the previous server.
 struct Continuation {
     active: Option<String>,
