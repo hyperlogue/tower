@@ -64,7 +64,24 @@ pub struct RuntimeUpdates {
     pub requests: Vec<RuntimeRequest>,
 }
 pub use tower_protocol::HarnessControls;
+/// A command the runtime is about to dispatch to a native agent.
+pub struct Authorization {
+    pub binding: RuntimeBinding,
+    pub command_id: String,
+    pub kind: String,
+    /// Cancelling or declining work, which needs no policy approval.
+    pub cleanup: bool,
+}
+pub type Future<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>;
+/// Checks current policy just before dispatch; supplied by the server.
+pub type Authorize = std::sync::Arc<dyn Fn(Authorization) -> Future<Result<()>> + Send + Sync>;
 pub trait ExecutionHost: Send + Sync {
+    /// Called once at startup, before any command is executed.
+    fn bind(&self, _authorize: Authorize) {}
+    /// Stops every runtime before the server exits.
+    fn shutdown(&self) -> Future<()> {
+        Box::pin(async {})
+    }
     fn controls(&self) -> std::collections::BTreeMap<String, HarnessControls>;
     fn execute(
         &self,

@@ -34,15 +34,40 @@ pub enum Error {
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
-pub async fn run(paths: Paths, startup: &str, backends: tower_sessions::Backends) -> Result<()> {
+/// Runs the server. `backends` is built only after the singleton lock is
+/// held, so recovery of a previous server's sessions never runs twice.
+pub async fn run<F, B>(paths: Paths, startup: &str, backends: B) -> Result<()>
+where
+    B: FnOnce() -> F,
+    F: std::future::Future<Output = Result<tower_sessions::Backends>>,
+{
     paths.prepare()?;
     let _lock = SingletonLock::acquire(&paths.run.join("towerd.lock"))?;
     tower_pal::ignore_hangup()?;
     tower_pal::private_file(&paths.database, true)?;
+    let backends = backends().await?;
+    let execution = backends.execution().cloned();
     let store = Arc::new(tower_store::Store::open(&paths.database)?);
     let service = Service::new(paths.clone(), store, startup, backends)?;
     service.recover_registry()?;
     let service = ServiceWorker::new(service);
+    if let Some(execution) = &execution {
+        let worker = service.clone();
+        execution.bind(Arc::new(move |request| {
+            let worker = worker.clone();
+            Box::pin(async move {
+                worker
+                    .execute(move |s| s.authorize_execution(&request))
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(RpcError::application(
+                            "authority_unavailable",
+                            "Tower authorization is unavailable",
+                        ))
+                    })
+            })
+        }));
+    }
     let listener = IpcListener::bind(&paths.socket).await?;
     let http = http::start(&paths, service.clone()).await?;
     let allgather = allgather::start(paths.clone(), service.clone())?;
@@ -107,6 +132,9 @@ pub async fn run(paths: Paths, startup: &str, backends: tower_sessions::Backends
     let _ = checkout_refresh.await;
     while tasks.join_next().await.is_some() {}
     let _ = maintenance.await;
+    if let Some(execution) = &execution {
+        execution.shutdown().await;
+    }
     service.drain().await?;
     drop(listener);
     result

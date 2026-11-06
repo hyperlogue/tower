@@ -1,4 +1,4 @@
-use crate::{Binding, Client, Result, error, internal};
+use crate::{Binding, Result, Runtime, error, internal};
 use std::sync::Arc;
 use tower_protocol::{
     PoolInfo, Secret, SessionOpenParams,
@@ -11,15 +11,15 @@ use tower_sessions::{
 
 pub struct TerminalBackend {
     native: Arc<dyn ManagedBackend>,
-    client: Arc<Client>,
+    runtime: Arc<Runtime>,
 }
 impl TerminalBackend {
-    pub fn new(native: Arc<dyn ManagedBackend>, client: Arc<Client>) -> Self {
-        Self { native, client }
+    pub fn new(native: Arc<dyn ManagedBackend>, runtime: Arc<Runtime>) -> Self {
+        Self { native, runtime }
     }
     fn session(&self, s: &ManagedSession, live: bool) -> Result<ManagedSession> {
         match Binding::from_session(s)? {
-            Some(binding) => self.client.terminal_session(&binding, live),
+            Some(binding) => self.runtime.terminal_session(&binding, live),
             None => Ok(s.clone()),
         }
     }
@@ -67,7 +67,7 @@ impl ManagedBackend for TerminalBackend {
             self.native.observe(&local)?
         };
         if !remote.is_empty() {
-            let views = self.client.list(None)?;
+            let views = self.runtime.list(None)?;
             for binding in remote {
                 if let Some(view) = views.iter().find(|v| {
                     v.binding.namespace() == binding.namespace()
@@ -106,7 +106,7 @@ impl ManagedBackend for TerminalBackend {
     }
     fn stop(&self, s: &ManagedSession) -> Result<Observation> {
         if let Some(binding) = Binding::from_session(s)? {
-            self.client.stop(&binding)?;
+            self.runtime.stop(&binding)?;
             self.observe(std::slice::from_ref(s))?
                 .into_iter()
                 .next()

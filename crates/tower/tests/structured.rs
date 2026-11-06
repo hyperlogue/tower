@@ -85,7 +85,6 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         for (binary, args) in [
-            (env!("CARGO_BIN_EXE_tower"), &["__runtime", "stop"][..]),
             ("codex", &["app-server", "daemon", "stop"][..]),
             (env!("CARGO_BIN_EXE_tower-cli"), &["daemon", "stop"][..]),
             (env!("CARGO_BIN_EXE_tower-terminal-pool"), &["stop"][..]),
@@ -262,7 +261,7 @@ async fn complete(s: &Server, id: &str) {
     .await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn managed_adapters_preserve_receipts_permissions_and_processes_across_reconnect() {
+async fn managed_adapters_preserve_receipts_permissions_and_resume_after_restart() {
     let f = Fixture::new();
     let s = Server::start(&f).await;
     for (harness, protocol) in [
@@ -312,21 +311,7 @@ async fn managed_adapters_preserve_receipts_permissions_and_processes_across_rec
         if harness == "antigravity" {
             let record = f.rpc("agent.get", json!({"id":id}));
             assert!(record["native_session_id"].is_null());
-            s.frames.lock().unwrap().clear();
-            f.cli(&["daemon", "stop"]);
-            f.cli(&["daemon", "status"]);
-            let reannounced = s
-                .until(|v| {
-                    v["method"] == "session.events"
-                        && v["params"]["runtime_id"] == runtime
-                        && v["params"]["events"].as_array().is_some_and(|events| {
-                            events.iter().any(|e| {
-                                e["kind"] == "runtime_state" && e["payload"]["state"] == "idle"
-                            })
-                        })
-                })
-                .await;
-            for event in reannounced["params"]["events"].as_array().unwrap() {
+            for event in ready["params"]["events"].as_array().unwrap() {
                 if event["kind"] == "runtime_state" {
                     assert!(event["payload"]["acp_session_id"].is_string());
                     assert!(event["payload"].get("native_session_id").is_none());
@@ -384,27 +369,14 @@ async fn managed_adapters_preserve_receipts_permissions_and_processes_across_rec
                 .is_some_and(|id| !id.is_empty())
         );
         assert_eq!(before["cwd"], "~");
+        // A server restart stops the server-owned process; Allgather resumes.
         f.cli(&["daemon", "stop"]);
         f.cli(&["daemon", "status"]);
-        let after = f.rpc("agent.get", json!({"id":id}));
-        assert_eq!(before["pid"], after["pid"]);
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        let next = command(
-            &format!("next-{harness}"),
-            runtime,
-            "prompt",
-            json!({"content":[{"type":"text","text":"continued"}]}),
-        );
-        assert_eq!(
-            s.call("command.execute", next).await["result"]["state"],
-            "accepted"
-        );
-        complete(&s, &format!("next-{harness}")).await;
-        f.cli(&["kill", &id]);
         s.until(|v| {
             v["method"] == "runtime.lost"
                 && v["params"]["runtime_id"] == runtime
                 && v["params"]["termination"] == "confirmed"
+                && v["params"]["reason"] == "server_restart"
         })
         .await;
         let resumed_runtime = format!("resumed-{runtime}");
@@ -472,7 +444,7 @@ async fn managed_adapters_preserve_receipts_permissions_and_processes_across_rec
     let dispatches = std::fs::read_to_string(f.root.path().join("dispatches")).unwrap();
     assert_eq!(
         dispatches.lines().count(),
-        9,
+        6,
         "Duplicates must not reach native input"
     );
     for file in std::fs::read_dir(f.root.path().join("state/tower/runtime")).unwrap() {
@@ -619,13 +591,14 @@ async fn owner_crash_fences_uncertain_dispatch_without_replaying_the_prompt() {
     })
     .await
     .unwrap();
-    let socket = tower_pal::connect(&f.root.path().join("state/tower/run/runtime.sock"))
+    let socket = tower_pal::connect(&f.root.path().join("state/tower/run/towerd.sock"))
         .await
         .unwrap();
-    let owner =
+    let server =
         tower_pal::process_identity(tower_pal::peer(&socket).unwrap().pid.unwrap()).unwrap();
     drop(socket);
-    tower_pal::force_terminate_process(owner.pid, owner.start_time).unwrap();
+    tower_pal::force_terminate_process(server.pid, server.start_time).unwrap();
+    f.cli(&["daemon", "start"]);
     s.until(|v| v["method"] == "runtime.lost" && v["params"]["runtime_id"] == "crash")
         .await;
     let terminal_after = f.rpc("agent.get", json!({"id":terminal_id}));

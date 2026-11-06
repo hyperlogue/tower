@@ -282,7 +282,7 @@ for terminal and structured sessions. By default Tower connects to its socket,
 `codex app-server daemon start`; if that fails, the session's terminal explains
 how to start it. Codex manages the daemon's lifecycle and updates.
 Each session has a separate native thread and private execution environment.
-The daemon survives Tower daemon, terminal, and runtime-owner restarts. Stopping a
+The daemon survives Tower daemon and terminal restarts. Stopping a
 session interrupts its turn, stops its background terminals, and waits for its
 thread to unload. If termination cannot be confirmed, Tower reports uncertainty
 and preserves the service and other sessions.
@@ -551,7 +551,10 @@ records; oversized snapshots fail without truncation. Local rules and approvals
 are not part of the status projection.
 
 Managed commands have durable receipts and generation-bound execution owners.
-Reconnection reads their status and does not repeat uncertain commands. Transcript
+Reconnection reads their status and does not repeat uncertain commands.
+The Tower daemon owns structured agent processes. Stopping it interrupts each
+running turn and stops the process. Local sessions resume when the daemon starts
+again; Allgather resumes the sessions it launched. Transcript
 events use a separate bounded journal and are released after acknowledgment.
 Private permission requests, form requests, URL interactions, and replies remain
 in memory. Explicit resume keeps the Tower session ID and creates a fresh execution
@@ -690,7 +693,7 @@ CLIs or the unpublished Tracetape checkout.
 | `tower-sessions` | Managed backend contract and optional capability interfaces |
 | `tower-terminal` | Terminal backend, launcher supervision, Codex relay, and attach client |
 | `tower-agents` | Launchers, hooks, and resume adapters for nine harnesses |
-| `tower-runtime` | Independent structured runtime owner, native adapters, receipts, and transcript journal |
+| `tower-runtime` | Structured execution, native adapters, receipts, and transcript journal |
 | `towerd` | Registry, managed backends, authorization, rules, and events |
 | `tower-clipboard` | Image provider, transfer broker, and native helper shims |
 | `tower-vcs` | Checked Git/worktree discovery and operations |

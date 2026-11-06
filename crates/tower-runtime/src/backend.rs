@@ -1,4 +1,4 @@
-use crate::{Binding, Client, Result, error, internal, random_id};
+use crate::{Binding, Result, Runtime, error, internal, random_id};
 use std::sync::Arc;
 use tower_protocol::{Capabilities, Secret, SessionOpenParams, Value};
 use tower_sessions::{
@@ -6,13 +6,13 @@ use tower_sessions::{
     execution::{ExecutionHost, RuntimeView},
 };
 pub struct Backend {
-    client: Arc<Client>,
+    runtime: Arc<Runtime>,
     protocol: String,
 }
 impl Backend {
-    pub fn new(client: Arc<Client>, protocol: &str) -> Self {
+    pub fn new(runtime: Arc<Runtime>, protocol: &str) -> Self {
         Self {
-            client,
+            runtime,
             protocol: protocol.into(),
         }
     }
@@ -35,8 +35,11 @@ pub(crate) fn observation(v: &RuntimeView) -> Result<Observation> {
         .as_str()
         .filter(|v| !v.is_empty())
         .map(str::to_owned);
+    // A local session the server stopped for its restart is reported lost,
+    // which makes the server recover it with a resumed generation.
+    let restarted = v.binding.origin == "local" && m.get("server_restart").is_some();
     let status = if v.fenced {
-        if v.termination == "confirmed" {
+        if v.termination == "confirmed" && !restarted {
             "exited"
         } else {
             "lost"
@@ -83,7 +86,7 @@ impl ManagedBackend for Backend {
         &self.protocol
     }
     fn harnesses(&self) -> Vec<tower_protocol::HarnessInfo> {
-        self.client
+        self.runtime
             .controls()
             .into_iter()
             .filter(|(_, c)| c.protocol == self.protocol)
@@ -121,7 +124,7 @@ impl ManagedBackend for Backend {
             .map(|h| h.id())
             .unwrap_or(&p.harness);
         if self
-            .client
+            .runtime
             .controls()
             .get(harness)
             .is_none_or(|c| c.protocol != self.protocol)
@@ -160,7 +163,15 @@ impl ManagedBackend for Backend {
             },
             serde_json::json!({"harness":b.harness,"cwd":b.cwd,"protocol":b.protocol,"generation":b.generation,"resume_session_id":b.resume_session_id}),
         )?;
-        self.client.execute(&b, &c)?;
+        self.runtime.execute(&b, &c)?;
+        if self.runtime.take_continuation(&b.runtime_id)? {
+            let prompt = crate::command(
+                &b,
+                "prompt",
+                serde_json::json!({"content":[{"type":"text","text":crate::runtime::CONTINUE}]}),
+            )?;
+            self.runtime.execute(&b, &prompt)?;
+        }
         Ok(Observation {
             id: s.id.clone(),
             binding: None,
@@ -174,7 +185,7 @@ impl ManagedBackend for Backend {
         })
     }
     fn observe(&self, sessions: &[ManagedSession]) -> Result<Vec<Observation>> {
-        let views = self.client.list(None)?;
+        let views = self.runtime.list(None)?;
         sessions
             .iter()
             .filter_map(|s| {
@@ -193,9 +204,9 @@ impl ManagedBackend for Backend {
     }
     fn stop(&self, s: &ManagedSession) -> Result<Observation> {
         let b: Binding = decode(&s.binding)?;
-        self.client.stop(&b)?;
+        self.runtime.stop(&b)?;
         let v = self
-            .client
+            .runtime
             .list(Some(&b.namespace()))?
             .into_iter()
             .find(|v| v.binding.runtime_id == b.runtime_id)
@@ -218,13 +229,7 @@ impl ManagedBackend for Backend {
                 "Structured resume does not accept native arguments",
             ));
         }
-        let view = self
-            .client
-            .list(Some(&old.namespace()))?
-            .into_iter()
-            .find(|v| v.binding.runtime_id == old.runtime_id)
-            .ok_or_else(|| error("not_found", "Runtime disappeared"))?;
-        let m: serde_json::Value = decode(&view.metadata)?;
+        let m: serde_json::Value = decode(&self.view(&old)?.metadata)?;
         let native = m[if old.protocol == "acp" {
             "acp_session_id"
         } else {
@@ -239,13 +244,42 @@ impl ManagedBackend for Backend {
         b.resume_session_id = Some(native.into());
         self.prepared(b)
     }
+    /// Resumes a local session that a server restart interrupted.
+    fn recover(&self, s: &ManagedSession) -> Result<Option<PreparedSession>> {
+        let old: Binding = decode(&s.binding)?;
+        let view = self.view(&old)?;
+        let m: serde_json::Value = decode(&view.metadata)?;
+        let Some(restart) = m.get("server_restart") else {
+            return Ok(None);
+        };
+        if old.origin != "local" || !view.fenced || view.termination != "confirmed" {
+            return Ok(None);
+        }
+        let prepared = match self.prepare_resume(s, None, None) {
+            Ok(prepared) => prepared,
+            Err(e) if e.data.code == "resume_unavailable" => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        if restart["interrupted_turn"] == true {
+            let next: Binding = decode(&prepared.binding)?;
+            self.runtime.continue_after_resume(&next.runtime_id)?;
+        }
+        Ok(Some(prepared))
+    }
 }
 impl Backend {
+    fn view(&self, b: &Binding) -> Result<RuntimeView> {
+        self.runtime
+            .list(Some(&b.namespace()))?
+            .into_iter()
+            .find(|v| v.binding.runtime_id == b.runtime_id)
+            .ok_or_else(|| error("not_found", "Runtime disappeared"))
+    }
     fn observed(&self, view: &RuntimeView) -> Result<Observation> {
         let mut observed = observation(view)?;
         observed.metadata.cwd = Some(
-            self.client
-                .paths
+            self.runtime
+                .paths()
                 .display_cwd(&view.binding.cwd)
                 .map_err(internal)?,
         );

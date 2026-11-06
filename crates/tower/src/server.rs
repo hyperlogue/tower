@@ -17,21 +17,8 @@ enum Command {
         #[arg(long)]
         detach: bool,
     },
-    #[command(name = "__runtime", hide = true)]
-    Runtime {
-        #[command(subcommand)]
-        command: OwnerCommand,
-    },
     #[command(name = "__acp", hide = true)]
     Acp { harness: String },
-}
-#[derive(Subcommand)]
-enum OwnerCommand {
-    Run {
-        #[arg(long)]
-        detach: bool,
-    },
-    Stop,
 }
 fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_multi_thread()
@@ -45,46 +32,32 @@ fn execute(command: Command) -> Result<()> {
             if detach {
                 tower_pal::detach(&paths)?;
             }
-            let runtime = runtime()?;
-            let execution = Arc::new(tower_runtime::Client::new(paths.clone()));
-            let backends = tower_sessions::Backends::new(
-                "terminal",
-                vec![
-                    Arc::new(tower_runtime::TerminalBackend::new(
-                        Arc::new(tower_terminal::TerminalBackend::new(paths.clone())),
-                        execution.clone(),
-                    )),
-                    Arc::new(tower_runtime::Backend::new(
-                        execution.clone(),
-                        "codex-app-server",
-                    )),
-                    Arc::new(tower_runtime::Backend::new(execution.clone(), "acp")),
-                ],
-            )?
-            .with_execution(execution)
-            .with_delivery(Arc::new(tower_agents::delivery::NativeDelivery));
-            runtime.block_on(towerd::run(
-                paths,
-                if detach {
-                    "detached; caller cgroup may apply"
-                } else {
-                    "foreground"
-                },
-                backends,
-            ))?;
+            let startup = if detach {
+                "detached; caller cgroup may apply"
+            } else {
+                "foreground"
+            };
+            runtime()?.block_on(towerd::run(paths.clone(), startup, || async move {
+                let terminal = Arc::new(tower_terminal::TerminalBackend::new(paths.clone()));
+                let execution = tower_runtime::Runtime::open(paths, terminal.clone()).await?;
+                Ok(tower_sessions::Backends::new(
+                    "terminal",
+                    vec![
+                        Arc::new(tower_runtime::TerminalBackend::new(
+                            terminal,
+                            execution.clone(),
+                        )),
+                        Arc::new(tower_runtime::Backend::new(
+                            execution.clone(),
+                            "codex-app-server",
+                        )),
+                        Arc::new(tower_runtime::Backend::new(execution.clone(), "acp")),
+                    ],
+                )?
+                .with_execution(execution)
+                .with_delivery(Arc::new(tower_agents::delivery::NativeDelivery)))
+            }))?;
         }
-        Command::Runtime {
-            command: OwnerCommand::Run { detach },
-        } => {
-            if detach {
-                tower_pal::detach_runtime(&paths)?;
-            }
-            let terminal = Arc::new(tower_terminal::TerminalBackend::new(paths.clone()));
-            runtime()?.block_on(tower_runtime::run(paths, Some(terminal)))?;
-        }
-        Command::Runtime {
-            command: OwnerCommand::Stop,
-        } => tower_runtime::Client::new(paths).shutdown()?,
         Command::Acp { harness } => runtime()?.block_on(tower_runtime::bridge::run(&harness))?,
     }
     Ok(())

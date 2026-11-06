@@ -441,40 +441,34 @@ impl Journal {
         rows.map(|r| serde_json::from_str(&r.map_err(internal)?).map_err(internal))
             .collect()
     }
-    pub fn views_page(
+    pub fn views(
         &self,
         namespace: Option<&str>,
-        after: u64,
-    ) -> Result<Vec<(u64, tower_sessions::execution::RuntimeView)>> {
+    ) -> Result<Vec<tower_sessions::execution::RuntimeView>> {
         let conn = self.lock()?;
-        let after = i64::try_from(after).map_err(internal)?;
-        let mut q=conn.prepare("SELECT rowid,binding,state,fenced,termination,metadata,next_sequence>ack_sequence+1 FROM runtimes WHERE (?1 IS NULL OR namespace=?1) AND rowid>?2 ORDER BY rowid LIMIT 64").map_err(internal)?;
-        q.query_map(params![namespace, after], |r| {
+        let mut q=conn.prepare("SELECT binding,state,fenced,termination,metadata,next_sequence>ack_sequence+1 FROM runtimes WHERE ?1 IS NULL OR namespace=?1 ORDER BY rowid").map_err(internal)?;
+        q.query_map(params![namespace], |r| {
             Ok((
-                r.get::<_, i64>(0)?,
+                r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, bool>(3)?,
+                r.get::<_, bool>(2)?,
+                r.get::<_, String>(3)?,
                 r.get::<_, String>(4)?,
-                r.get::<_, String>(5)?,
-                r.get::<_, bool>(6)?,
+                r.get::<_, bool>(5)?,
             ))
         })
         .map_err(internal)?
         .map(|r| {
-            let (id, binding, state, fenced, termination, metadata, pending_events) =
+            let (binding, state, fenced, termination, metadata, pending_events) =
                 r.map_err(internal)?;
-            Ok((
-                id as u64,
-                tower_sessions::execution::RuntimeView {
-                    binding: serde_json::from_str(&binding).map_err(internal)?,
-                    metadata: serde_json::from_str(&metadata).map_err(internal)?,
-                    state,
-                    fenced,
-                    termination,
-                    pending_events: Some(pending_events),
-                },
-            ))
+            Ok(tower_sessions::execution::RuntimeView {
+                binding: serde_json::from_str(&binding).map_err(internal)?,
+                metadata: serde_json::from_str(&metadata).map_err(internal)?,
+                state,
+                fenced,
+                termination,
+                pending_events: Some(pending_events),
+            })
         })
         .collect()
     }
@@ -911,7 +905,7 @@ impl Journal {
             save_receipt(&tx, &binding.namespace(), &receipt)?;
         }
         tx.execute("UPDATE commands SET payload=NULL WHERE namespace=?1 AND runtime_id=?2 AND generation=?3",params![binding.namespace(),binding.runtime_id,binding.generation]).map_err(internal)?;
-        tx.execute("UPDATE runtimes SET fenced=1,state='ended',termination=?1,loss=?2,ended_at=coalesce(ended_at,?3),metadata=json_set(metadata,'$.error',?7) WHERE namespace=?4 AND runtime_id=?5 AND generation=?6",params![loss.termination,serde_json::to_string(&loss).map_err(internal)?,millis() as i64,binding.namespace(),binding.runtime_id,binding.generation,if matches!(loss.reason.as_str(),"local_stop"|"runtime_shutdown"|"stop_runtime"){None}else{Some(&loss.reason)}]).map_err(internal)?;
+        tx.execute("UPDATE runtimes SET fenced=1,state='ended',termination=?1,loss=?2,ended_at=coalesce(ended_at,?3),metadata=json_set(metadata,'$.error',?7) WHERE namespace=?4 AND runtime_id=?5 AND generation=?6",params![loss.termination,serde_json::to_string(&loss).map_err(internal)?,millis() as i64,binding.namespace(),binding.runtime_id,binding.generation,if matches!(loss.reason.as_str(),"local_stop"|"server_restart"|"stop_runtime"){None}else{Some(&loss.reason)}]).map_err(internal)?;
         tx.commit().map_err(internal)?;
         Ok(loss)
     }

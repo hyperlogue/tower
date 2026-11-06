@@ -74,56 +74,23 @@ pub(crate) fn cleanup_command(c: &ExecutionCommand) -> bool {
                 Some("decline" | "cancel")
             ))
 }
-pub(crate) async fn authorize(
-    paths: &tower_pal::Paths,
-    b: &Binding,
-    c: &ExecutionCommand,
-) -> Result<()> {
-    let token =
-        tower_pal::read_private(&paths.state.join("runtime/owner.key")).map_err(internal)?;
-    let token = String::from_utf8(token).map_err(internal)?;
-    let mut socket = tower_pal::connect(&paths.socket).await.map_err(|_| {
-        error(
-            "authority_unavailable",
-            "Tower authorization service is unavailable",
-        )
-    })?;
-    let request = json!({"jsonrpc":"2.0","id":"runtime-authorize","method":"runtime.authorize","params":{"credential":token,"binding":b,"command_id":c.command_id,"kind":c.kind,"cleanup":cleanup_command(c),"expires_at":c.expires_at}});
-    wire::json_line(&mut socket, &request).await?;
-    let v = tokio::time::timeout(
-        Duration::from_secs(5),
-        wire::line(&mut BufReader::new(socket)),
-    )
-    .await
-    .map_err(|_| error("authority_unavailable", "Tower authorization timed out"))??
-    .ok_or_else(|| error("authority_unavailable", "Tower authorization closed"))?;
-    if v["result"]["authorized"] == true {
-        Ok(())
-    } else {
-        Err(error(
-            "denied",
-            "Current control connection and policy are required",
-        ))
-    }
+/// What every runtime task needs from the server.
+#[derive(Clone)]
+pub(crate) struct Context {
+    pub paths: tower_pal::Paths,
+    pub journal: Arc<Journal>,
+    pub authority: crate::runtime::Authority,
 }
 
 pub(crate) async fn run(
-    paths: tower_pal::Paths,
-    journal: Arc<Journal>,
+    ctx: Context,
     binding: Binding,
     handle: Arc<Handle>,
     mut normal: mpsc::Receiver<ExecutionCommand>,
     mut control: mpsc::Receiver<Control>,
 ) {
-    let result = run_inner(
-        &paths,
-        &journal,
-        &binding,
-        &handle,
-        &mut normal,
-        &mut control,
-    )
-    .await;
+    let result = run_inner(&ctx, &binding, &handle, &mut normal, &mut control).await;
+    let (paths, journal) = (&ctx.paths, &ctx.journal);
     if let Err(e) = result {
         let known_before_spawn = journal
             .metadata(&binding)
@@ -156,7 +123,7 @@ pub(crate) async fn run(
         .state(&binding)
         .is_ok_and(|(_, fenced, termination)| fenced && termination == "confirmed")
     {
-        cleanup_environment(&paths, &binding);
+        cleanup_environment(paths, &binding);
     }
 }
 
@@ -448,8 +415,7 @@ impl State<'_> {
 }
 
 async fn run_inner(
-    paths: &tower_pal::Paths,
-    journal: &Journal,
+    ctx: &Context,
     b: &Binding,
     handle: &Handle,
     normal: &mut mpsc::Receiver<ExecutionCommand>,
@@ -459,7 +425,8 @@ async fn run_inner(
         .recv()
         .await
         .ok_or_else(|| error("runtime_lost", "Launch was not supplied"))?;
-    authorize(paths, b, &launch).await?;
+    let (paths, journal) = (&ctx.paths, &*ctx.journal);
+    ctx.authority.check(b, &launch).await?;
     let env = tower_agents::environment::project_environment(
         std::path::Path::new(&b.cwd),
         &tower_pal::Program::Cli.path().map_err(internal)?,
@@ -549,7 +516,7 @@ async fn run_inner(
     } else {
         None
     };
-    authorize(paths, b, &launch).await?;
+    ctx.authority.check(b, &launch).await?;
     if control.try_recv().is_ok() {
         return Err(error(
             "runtime_cancelled",
@@ -678,7 +645,7 @@ async fn run_inner(
                             s.stop_reason = Some(reason);
                             return Ok(());
                         }
-                        Some(Control::Command(c)) => dispatch(paths, &mut s, &mut input, c).await?,
+                        Some(Control::Command(c)) => dispatch(ctx, &mut s, &mut input, c).await?,
                         None => return Err(error("runtime_lost", "Runtime control channel closed")),
                     }
                 }
@@ -710,7 +677,7 @@ async fn run_inner(
                         && s.active.is_none()
                         && let Some(c) = s.queue.pop_front()
                     {
-                        dispatch(paths, &mut s, &mut input, c).await?;
+                        dispatch(ctx, &mut s, &mut input, c).await?;
                     }
                 }
             }
@@ -720,6 +687,12 @@ async fn run_inner(
     s.handle.requests.retire_all()?;
     let terminated = stop_process(&mut process, &mut s, &mut input, &mut incoming).await;
     if let Some(reason) = s.stop_reason.take() {
+        if reason == "server_restart" {
+            // Lets the next server resume this session and continue the turn.
+            s.metadata["server_restart"] = json!({"interrupted_turn": s.active.is_some()});
+            let (state, _, _) = journal.state(b)?;
+            journal.update_metadata(b, &state, &s.metadata)?;
+        }
         if terminated && s.active.is_some() {
             s.end_turn("cancelled")?;
         }
@@ -928,7 +901,7 @@ async fn stop_process(
     }
 }
 async fn dispatch(
-    paths: &tower_pal::Paths,
+    ctx: &Context,
     s: &mut State<'_>,
     input: &mut NativeInput,
     c: ExecutionCommand,
@@ -937,7 +910,7 @@ async fn dispatch(
         if parse_time(&c.expires_at)? <= millis() {
             return Err(error("command_expired", "Command expired"));
         }
-        authorize(paths, s.binding, &c).await?;
+        ctx.authority.check(s.binding, &c).await?;
         Ok(())
     }
     .await;

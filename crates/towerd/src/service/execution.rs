@@ -7,6 +7,7 @@ impl Service {
     fn execution_host(&self) -> std::result::Result<&dyn ExecutionHost, RpcError> {
         self.backends
             .execution()
+            .map(|e| &**e)
             .ok_or_else(|| app("unsupported", "Managed runtimes are unavailable"))
     }
     pub(crate) fn execution_namespace(&self) -> std::result::Result<String, RpcError> {
@@ -92,32 +93,17 @@ impl Service {
         }
         self.execution_host()?.fence(&b, &reason)
     }
-    pub(super) fn authorize_runtime(
+    /// Policy check the runtime makes just before dispatching a command.
+    pub(crate) fn authorize_execution(
         &self,
-        request: &Request,
-        peer: Peer,
-    ) -> std::result::Result<Value, RpcError> {
-        #[derive(Deserialize)]
-        struct Check {
-            credential: Secret,
-            binding: RuntimeBinding,
-            kind: String,
-            cleanup: bool,
-            expires_at: String,
-            command_id: String,
-        }
-        let p: Check = params(&request.params)?;
-        if peer.uid != tower_pal::uid()
-            || peer.pid.is_none()
-            || request.context.bearer_token.is_some()
-            || request.context.agent_token.is_some()
-            || !tower_pal::read_private(&self.paths.state.join("runtime/owner.key"))
-                .is_ok_and(|key| bool::from(key.as_slice().ct_eq(p.credential.0.as_bytes())))
-        {
-            return Err(app("unauthorized", "Runtime owner credential required"));
-        }
-        if p.command_id.is_empty() || p.expires_at.is_empty() {
-            return Err(invalid("Command identity and deadline required"));
+        p: &tower_sessions::execution::Authorization,
+    ) -> std::result::Result<(), RpcError> {
+        let _guard = self
+            .mutation
+            .lock()
+            .map_err(|_| app("internal_error", "Mutation lock unavailable"))?;
+        if p.command_id.is_empty() {
+            return Err(invalid("Command identity required"));
         }
         let session = self
             .store
@@ -135,7 +121,7 @@ impl Service {
             && p.cleanup
             && matches!(p.kind.as_str(), "cancel" | "reply");
         if cleanup {
-            return value(serde_json::json!({"authorized":true}));
+            return Ok(());
         }
         let actor = if stored.origin == "local" {
             Actor::Human
@@ -163,8 +149,7 @@ impl Service {
                 harness: Some(&record.harness),
                 cwd: Some(&record.cwd),
             },
-        )?;
-        value(serde_json::json!({"authorized":true}))
+        )
     }
     pub(super) fn execution_dispatch(
         &self,

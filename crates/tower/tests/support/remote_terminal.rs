@@ -59,14 +59,16 @@ async fn launch(f: &Fixture, s: &Server, name: &str, harness: &str) -> (Value, S
     complete(s, name).await;
     (command, id)
 }
+/// Crashes the server, which owns runtimes, and starts a new one.
 async fn kill_owner(f: &Fixture) {
-    let socket = tower_pal::connect(&f.root.path().join("state/tower/run/runtime.sock"))
+    let socket = tower_pal::connect(&f.root.path().join("state/tower/run/towerd.sock"))
         .await
         .unwrap();
     let identity =
         tower_pal::process_identity(tower_pal::peer(&socket).unwrap().pid.unwrap()).unwrap();
     drop(socket);
     tower_pal::force_terminate_process(identity.pid, identity.start_time).unwrap();
+    f.cli(&["daemon", "start"]);
 }
 fn starts(f: &Fixture) -> usize {
     std::fs::read_to_string(f.root.path().join("pi-starts"))

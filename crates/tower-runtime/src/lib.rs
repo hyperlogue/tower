@@ -1,18 +1,16 @@
 mod backend;
-mod client;
 mod controls;
 mod engine;
-mod host;
 mod journal;
 mod requests;
+mod runtime;
 mod terminal;
 mod terminal_backend;
 mod wire;
 pub use backend::Backend;
+pub use runtime::Runtime;
 pub use terminal_backend::TerminalBackend;
 pub mod bridge;
-pub use client::Client;
-pub use host::run;
 pub(crate) use journal::{Binding, Journal, Limits};
 use tower_protocol::RpcError;
 

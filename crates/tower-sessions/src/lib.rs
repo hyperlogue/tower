@@ -123,8 +123,8 @@ impl Backends {
         self.execution = Some(execution);
         self
     }
-    pub fn execution(&self) -> Option<&dyn execution::ExecutionHost> {
-        self.execution.as_deref()
+    pub fn execution(&self) -> Option<&Arc<dyn execution::ExecutionHost>> {
+        self.execution.as_ref()
     }
     pub fn with_delivery(mut self, delivery: Arc<dyn messaging::RegisteredDelivery>) -> Self {
         self.delivery = Some(delivery);

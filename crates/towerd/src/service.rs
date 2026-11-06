@@ -769,9 +769,6 @@ impl Service {
             .mutation
             .lock()
             .map_err(|_| app("internal_error", "Mutation lock unavailable"))?;
-        if request.method == "runtime.authorize" {
-            return self.authorize_runtime(request, peer);
-        }
         let actor = self.actor(&request.context, peer)?;
         self.dispatch_actor(request, actor, peer)
     }

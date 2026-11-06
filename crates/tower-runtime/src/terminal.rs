@@ -168,7 +168,7 @@ fn recover_commands(journal: &Journal, b: &Binding, running: bool) -> Result<()>
 }
 
 async fn cancel_pending(
-    paths: &tower_pal::Paths,
+    authority: &crate::runtime::Authority,
     journal: &Journal,
     b: &Binding,
     launch_id: &str,
@@ -177,7 +177,7 @@ async fn cancel_pending(
     while let Ok(stop) = control.try_recv() {
         let reason = match stop {
             engine::Control::Command(c) => {
-                if let Err(e) = engine::authorize(paths, b, &c).await {
+                if let Err(e) = authority.check(b, &c).await {
                     journal.finish_dispatch(
                         b,
                         &c.command_id,
@@ -227,17 +227,16 @@ async fn cancel_pending(
 }
 
 pub(crate) async fn run(
-    paths: tower_pal::Paths,
-    journal: Arc<Journal>,
+    ctx: engine::Context,
     b: Binding,
     backend: Arc<dyn ManagedBackend>,
     mut normal: mpsc::Receiver<ExecutionCommand>,
     mut control: mpsc::Receiver<engine::Control>,
     recover: bool,
 ) {
+    let journal = &ctx.journal;
     if let Err(e) = run_inner(
-        &paths,
-        &journal,
+        &ctx,
         &b,
         backend.clone(),
         &mut normal,
@@ -247,22 +246,22 @@ pub(crate) async fn run(
     .await
     {
         let _ = journal.fence(&b, &e.data.code, "unknown");
-        if let Ok(session) = session(&journal, &b)
+        if let Ok(session) = session(journal, &b)
             && let Ok(observation) = stop(backend, session).await
         {
-            let _ = record(&journal, &b, observation, false);
+            let _ = record(journal, &b, observation, false);
         }
     }
 }
 async fn run_inner(
-    paths: &tower_pal::Paths,
-    journal: &Journal,
+    ctx: &engine::Context,
     b: &Binding,
     backend: Arc<dyn ManagedBackend>,
     normal: &mut mpsc::Receiver<ExecutionCommand>,
     control: &mut mpsc::Receiver<engine::Control>,
     recover: bool,
 ) -> Result<()> {
+    let (paths, journal) = (&ctx.paths, &*ctx.journal);
     let native = if recover {
         let native = match session(journal, b) {
             Ok(native) => native,
@@ -302,10 +301,10 @@ async fn run_inner(
         let Some(command) = normal.recv().await else {
             return Ok(());
         };
-        if cancel_pending(paths, journal, b, &command.command_id, control).await? {
+        if cancel_pending(&ctx.authority, journal, b, &command.command_id, control).await? {
             return Ok(());
         }
-        if let Err(e) = engine::authorize(paths, b, &command).await {
+        if let Err(e) = ctx.authority.check(b, &command).await {
             journal.finish_dispatch(
                 b,
                 &command.command_id,
@@ -357,7 +356,7 @@ async fn run_inner(
         journal.append(b, "runtime_state", public(&payload)?, None, true)?;
         metadata["lifecycle"] = payload;
         journal.update_metadata(b, "starting", &metadata)?;
-        if let Err(e) = engine::authorize(paths, b, &command).await {
+        if let Err(e) = ctx.authority.check(b, &command).await {
             journal.finish_dispatch(
                 b,
                 &command.command_id,
@@ -368,7 +367,7 @@ async fn run_inner(
             journal.fence(b, &e.data.code, "confirmed")?;
             return Ok(());
         }
-        if cancel_pending(paths, journal, b, &command.command_id, control).await? {
+        if cancel_pending(&ctx.authority, journal, b, &command.command_id, control).await? {
             return Ok(());
         }
         if !journal.begin_dispatch(b, &command.command_id)? {
@@ -420,7 +419,7 @@ async fn run_inner(
                     engine::Control::Stop(reason) => (None, reason),
                 };
                 if let Some(c) = &command {
-                    if let Err(e) = engine::authorize(paths, b, c).await {
+                    if let Err(e) = ctx.authority.check(b, c).await {
                         journal.finish_dispatch(b, &c.command_id, false, None, Some(failure(&e.data.code, "dispatch", false)))?;
                         continue;
                     }
@@ -567,18 +566,9 @@ mod tests {
             .control
             .try_send(engine::Control::Stop("local_stop".into()))
             .unwrap();
-        let paths = tower_pal::Paths {
-            home: root.path().into(),
-            state: root.path().into(),
-            config_home: root.path().into(),
-            run: root.path().into(),
-            socket: root.path().join("tower.sock"),
-            database: root.path().join("tower.db"),
-            tokens: root.path().join("tokens"),
-            logs: root.path().join("logs"),
-        };
+        let authority = crate::runtime::Authority::default();
         assert!(
-            cancel_pending(&paths, &journal, &b, &c.command_id, &mut control)
+            cancel_pending(&authority, &journal, &b, &c.command_id, &mut control)
                 .await
                 .unwrap()
         );

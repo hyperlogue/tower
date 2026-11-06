@@ -1,60 +1,6 @@
 use crate::{Result, error};
-use serde::{Serialize, de::DeserializeOwned};
-use std::io::{Read, Write};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
-pub async fn read<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R) -> Result<T> {
-    let n = r
-        .read_u32()
-        .await
-        .map_err(|_| error("runtime_unavailable", "Runtime connection closed"))?
-        as usize;
-    if n > tower_protocol::MAX_FRAME_BYTES {
-        return Err(error("too_large", "Runtime frame exceeds limit"));
-    }
-    let mut bytes = vec![0; n];
-    r.read_exact(&mut bytes)
-        .await
-        .map_err(|_| error("runtime_unavailable", "Incomplete runtime frame"))?;
-    serde_json::from_slice(&bytes).map_err(|_| error("invalid_params", "Invalid runtime frame"))
-}
-pub async fn write<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, v: &T) -> Result<()> {
-    let bytes = serde_json::to_vec(v).map_err(crate::internal)?;
-    if bytes.len() > tower_protocol::MAX_FRAME_BYTES {
-        return Err(error("too_large", "Runtime frame exceeds limit"));
-    }
-    w.write_u32(bytes.len() as u32)
-        .await
-        .map_err(crate::internal)?;
-    w.write_all(&bytes).await.map_err(crate::internal)?;
-    w.flush().await.map_err(crate::internal)
-}
-pub fn call<T: Serialize, U: DeserializeOwned>(
-    stream: &mut tower_pal::BlockingIpcStream,
-    v: &T,
-) -> Result<U> {
-    let bytes = serde_json::to_vec(v).map_err(crate::internal)?;
-    if bytes.len() > tower_protocol::MAX_FRAME_BYTES {
-        return Err(error("too_large", "Runtime frame exceeds limit"));
-    }
-    stream
-        .write_all(&(bytes.len() as u32).to_be_bytes())
-        .and_then(|_| stream.write_all(&bytes))
-        .map_err(|_| error("runtime_unavailable", "Runtime write failed"))?;
-    let mut n = [0; 4];
-    stream
-        .read_exact(&mut n)
-        .map_err(|_| error("runtime_unavailable", "Runtime read failed"))?;
-    let n = u32::from_be_bytes(n) as usize;
-    if n > tower_protocol::MAX_FRAME_BYTES {
-        return Err(error("too_large", "Runtime reply exceeds limit"));
-    }
-    let mut bytes = vec![0; n];
-    stream
-        .read_exact(&mut bytes)
-        .map_err(|_| error("runtime_unavailable", "Runtime reply incomplete"))?;
-    serde_json::from_slice(&bytes).map_err(crate::internal)
-}
 pub async fn line<R: AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
 ) -> Result<Option<serde_json::Value>> {
