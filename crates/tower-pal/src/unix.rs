@@ -340,13 +340,34 @@ fn detach_log(paths: &Paths, name: &str) -> io::Result<()> {
     let mut log = private_file(&paths.logs.join(name), true)?;
     use std::io::{Seek, SeekFrom};
     log.seek(SeekFrom::End(0))?;
-    daemonize::Daemonize::new()
-        .working_directory("/")
-        .umask(0o077)
-        .stdout(log.try_clone()?)
-        .stderr(log)
-        .start()
-        .map_err(io::Error::other)
+    let null = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/null")?;
+    if let nix::unistd::ForkResult::Parent { child } = fork()? {
+        let code = match nix::sys::wait::waitpid(child, None)? {
+            nix::sys::wait::WaitStatus::Exited(_, code) => code,
+            _ => 1,
+        };
+        std::process::exit(code);
+    }
+    std::env::set_current_dir("/")?;
+    nix::unistd::setsid()?;
+    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o077));
+    // A second fork leaves the session, so the daemon cannot regain a terminal.
+    if let nix::unistd::ForkResult::Parent { .. } = fork()? {
+        std::process::exit(0);
+    }
+    nix::unistd::dup2_stdin(&null)?;
+    nix::unistd::dup2_stdout(&log)?;
+    nix::unistd::dup2_stderr(&log)?;
+    Ok(())
+}
+#[allow(unsafe_code)]
+fn fork() -> nix::Result<nix::unistd::ForkResult> {
+    // SAFETY: detach runs before the process starts any other thread, so the
+    // child cannot inherit a lock held by a thread that no longer exists.
+    unsafe { nix::unistd::fork() }
 }
 
 pub type BlockingIpcStream = std::os::unix::net::UnixStream;

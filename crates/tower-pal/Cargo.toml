@@ -19,7 +19,6 @@ tokio.workspace = true
 tempfile.workspace = true
 fs2 = "0.4"
 signal-hook = "0.3"
-daemonize = "0.5"
 rustix = { version = "1", features = ["process", "time"] }
 nix = { version = "0.31", features = ["process", "signal", "fs", "socket", "user", "poll"] }
 libc = "0.2"
