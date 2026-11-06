@@ -33,102 +33,51 @@ pub enum Token {
     String(Vec<u8>),
     Opaque(Vec<u8>),
 }
-/// Attached clients are the human's own terminals, so forward only strings
-/// with a display, notification, or shell-integration effect. Others can reach
-/// the clipboard, write files, redefine keys, or drive terminal remote control.
+/// A clipboard read returns the human's local clipboard to the session as
+/// input, so it never reaches attached clients. Everything else, including
+/// clipboard writes, is forwarded as when running the program directly.
 /// Returns `None` while the prefix cannot decide yet.
 fn allowed_string(pending: &[u8], complete: bool) -> Option<bool> {
-    let body = &pending[2..];
-    let wait = if complete { Some(false) } else { None };
-    match pending[1] {
-        b']' => allowed_osc(body, complete),
-        b'P' => {
-            let params = body
-                .iter()
-                .take_while(|b| matches!(b, b'0'..=b'9' | b';' | b':'))
-                .count();
-            let rest = &body[params..];
-            let inter = rest
-                .iter()
-                .take_while(|b| (0x20..=0x2f).contains(*b))
-                .count();
-            match rest.get(inter) {
-                // Sixel graphics, DECRQSS, and XTGETTCAP.
-                Some(b'q') => Some(matches!(&rest[..inter], b"" | b"$" | b"+")),
-                Some(_) => Some(false),
-                None => wait,
-            }
-        }
-        // Kitty graphics.
-        b'_' => body.first().map_or(wait, |&b| Some(b == b'G')),
-        _ => Some(false),
+    if pending[1] != b']' {
+        return Some(true);
     }
-}
-fn allowed_osc(body: &[u8], complete: bool) -> Option<bool> {
+    let body = &pending[2..];
     let digits = body.iter().take_while(|b| b.is_ascii_digit()).count();
+    if digits > 16 {
+        // No real OSC number is this long; it cannot be classified safely.
+        return Some(false);
+    }
     let (number, rest) = body.split_at(digits);
     let args = match rest.split_first() {
-        _ if digits > 16 => return Some(false),
-        Some((b';', args)) if digits > 0 => args,
+        Some((b';', args)) => args,
         None if !complete => return None,
-        None if digits > 0 => b"",
-        _ => return Some(false),
+        _ => return Some(true),
     };
     // Terminals parse the number numerically, so leading zeros are equivalent.
-    match number
+    let number = number
         .iter()
-        .fold(0u64, |n, d| n * 10 + u64::from(d - b'0'))
-    {
-        0..=2 | 4 | 5 | 7 | 8 | 10..=19 | 21 | 22 | 99 | 104 | 105 | 110..=119 | 133 | 633 => {
-            Some(true)
-        }
-        // ConEmu's subcommand 6 runs GUI macros.
-        9 => match args {
-            [b'6', b';', ..] => Some(false),
-            [] | [b'6'] if !complete => None,
-            [b'6'] => Some(false),
-            _ => Some(true),
-        },
-        777 => keyed(args, complete, &[b"notify;"]),
-        1337 => {
-            for file in [b"File=".as_slice(), b"MultipartFile="] {
-                if let Some(params) = args.strip_prefix(file) {
-                    // Only inline images; other transfers write client files.
-                    let end = params.iter().position(|&b| b == b':');
-                    if end.is_none() && !complete {
-                        return None;
-                    }
-                    let params = &params[..end.unwrap_or(params.len())];
-                    return Some(params.split(|&b| b == b';').any(|p| p == b"inline=1"));
-                }
-            }
-            keyed(
-                args,
-                complete,
-                &[
-                    b"File=",
-                    b"MultipartFile=",
-                    b"FilePart=",
-                    b"FileEnd",
-                    b"SetMark",
-                    b"CurrentDir=",
-                    b"RemoteHost=",
-                    b"ShellIntegrationVersion=",
-                    b"SetUserVar=",
-                ],
-            )
-        }
-        _ => Some(false),
+        .fold(0u64, |n, d| n * 10 + u64::from(d - b'0'));
+    if !matches!(number, 52 | 5522) {
+        return Some(true);
     }
-}
-fn keyed(args: &[u8], complete: bool, keys: &[&[u8]]) -> Option<bool> {
-    if keys.iter().any(|k| args.starts_with(k)) {
-        Some(true)
-    } else if !complete && keys.iter().any(|k| k.starts_with(args)) {
-        None
-    } else {
-        Some(false)
+    let end = args.iter().position(|&b| b == b';');
+    if end.is_none() && !complete {
+        return None;
     }
+    if number == 52 {
+        // Selection, then base64 data or `?` to read.
+        return match end.map(|i| args.get(i + 1)) {
+            Some(Some(&b)) => Some(b != b'?'),
+            _ if complete => Some(true),
+            _ => None,
+        };
+    }
+    // Kitty: colon-separated metadata, then the payload.
+    Some(
+        args[..end.unwrap_or(args.len())]
+            .split(|&b| b == b':')
+            .any(|kv| matches!(kv, b"type=write" | b"type=wdata" | b"type=walias")),
+    )
 }
 impl Lexer {
     /// Forward only valid UTF-8 without C1 controls (U+0080..U+009F).
@@ -332,7 +281,7 @@ impl Lexer {
                     ..
                 } = self.state
                 {
-                    // Too long to classify.
+                    // Too long to classify safely.
                     self.pending.clear();
                     self.state = State::DiscardString { escape };
                     continue;

@@ -156,13 +156,18 @@ fn cancelled_csi_is_not_duplicated_on_the_live_stream() {
 }
 
 #[test]
-fn clipboard_queries_and_writes_are_blocked_before_the_client_stream() {
+fn clipboard_reads_are_blocked_but_writes_reach_the_client_stream() {
     let mut t = terminal();
-    for byte in b"\x1b]52;c;?\x1b\\\x1b]52;c;" {
+    for byte in b"\x1b]52;c;?\x1b\\\x1b]5522;type=read;dGV4dA==\x1b\\" {
         assert!(t.process(&[*byte]).bytes.is_empty());
     }
-    assert!(t.process(&vec![b'x'; 100_000]).bytes.is_empty());
-    let out = t.process(b"\x07SAFE");
+    let write = [b"\x1b]52;c;".as_slice(), &vec![b'x'; 100_000], b"\x07"].concat();
+    let mut out = Vec::new();
+    for chunk in write.chunks(7) {
+        out.extend(t.process(chunk).bytes);
+    }
+    assert_eq!(out, write);
+    let out = t.process(b"SAFE");
     assert_eq!(out.bytes, b"SAFE");
     assert!(out.replies.is_empty());
 }
@@ -203,7 +208,7 @@ fn clipboard_sequence_variants_never_reach_the_client_stream() {
             let text = String::from_utf8_lossy(out);
             let clipboard = text.split("\x1b]").skip(1).any(|osc| {
                 let osc = osc.trim_start_matches('0');
-                osc.starts_with("52;") || osc.starts_with("5522;")
+                (osc.starts_with("52;") && osc.contains(";?")) || osc.starts_with("5522;")
             });
             assert!(!clipboard, "{seq:?} forwarded {text:?}");
             assert!(
@@ -247,43 +252,25 @@ fn ordinary_strings_and_text_still_reach_the_client_stream() {
 }
 
 #[test]
-fn strings_outside_the_allowlist_never_reach_the_client_stream() {
-    let long_params = format!("\x1b]1337;File={};inline=1:AAAA\x07", "x".repeat(600));
+fn clipboard_writes_and_other_strings_reach_the_client_stream() {
+    let long_write = format!("\x1b]52;c;{}\x07", "A".repeat(600));
     for seq in [
-        b"\x1b]1337;Copy=;aGk=\x07".as_slice(),
-        b"\x1b]1337;File=name=eA==;inline=0:AAAA\x07",
-        b"\x1b]1337;File=name=eA==:AAAA\x07",
-        b"\x1b]1337;RequestUpload=format=tgz\x07",
-        b"\x1b]5113;ac=send;id=1\x1b\\",
-        b"\x1b]50;?\x07",
-        b"\x1b]9;6;Shell(\"calc\")\x07",
-        b"\x1b]9;6\x07",
-        b"\x1b]777;preexec\x07",
-        b"\x1b]520;x\x07",
-        b"\x1b]\x07",
-        b"\x1b]P0ffffff\x07",
-        b"\x1bP@kitty-cmd{}\x1b\\",
-        b"\x1bP0;1|17/72656D6F7465\x1b\\",
-        b"\x1bPtmux;payload\x1b\\",
-        b"\x1bP1000p\x1b\\",
-        b"\x1b_Xother\x1b\\",
-        b"\x1b^privacy\x1b\\",
-        b"\x1bXstring\x1b\\",
-        b"\x1b]1337;Cop\x18",
-        long_params.as_bytes(),
+        "\x1b]52;c;aGk=\x07",
+        "\x1b]052;;aGk=\x1b\\",
+        "\x1b]5522;type=write\x1b\\\x1b]5522;type=wdata:mime=dGV4dA==;aGk=\x1b\\",
+        "\x1b]1337;Copy=;aGk=\x07\x1b]1337;File=name=eA==:AAAA\x07",
+        "\x1b]5113;ac=send;id=1\x1b\\\x1b]50;?\x07\x1b]777;preexec\x07",
+        "\x1bP@kitty-cmd{}\x1b\\\x1bP0;1|17/72656D\x1b\\\x1b^pm\x1b\\\x1bXsos\x1b\\",
+        &long_write,
     ] {
-        let mut whole = terminal();
-        let mut split = terminal();
-        let forwarded = whole.process(seq).bytes;
-        let mut pieces = Vec::new();
-        for byte in seq {
-            pieces.extend(split.process(&[*byte]).bytes);
+        let mut t = terminal();
+        assert_eq!(t.process(seq.as_bytes()).bytes, seq.as_bytes());
+        let mut t = terminal();
+        let mut out = Vec::new();
+        for byte in seq.as_bytes() {
+            out.extend(t.process(&[*byte]).bytes);
         }
-        for (t, out) in [(&mut whole, forwarded), (&mut split, pieces)] {
-            let text = String::from_utf8_lossy(&out);
-            assert!(!text.contains('\x1b'), "{seq:?} forwarded {text:?}");
-            assert_eq!(t.process(b"SAFE").bytes, b"SAFE");
-        }
+        assert_eq!(out, seq.as_bytes());
     }
 }
 
