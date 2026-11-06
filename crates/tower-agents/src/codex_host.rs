@@ -33,15 +33,18 @@ pub async fn ensure(paths: &Paths) -> Result<Host> {
             match Client::connect(&config.endpoint).await {
                 Ok(client) => client,
                 Err(Error::Unavailable) => {
-                    tokio::task::spawn_blocking(tower_pal::start_codex_host)
-                        .await
-                        .map_err(|_| Error::Unavailable)?
-                        .map_err(|_| Error::Unavailable)?;
+                    start_daemon(paths).await?;
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
                     loop {
                         match Client::connect(&config.endpoint).await {
                             Ok(client) => break client,
                             Err(Error::Unavailable) if tokio::time::Instant::now() < deadline => {
                                 tokio::time::sleep(Duration::from_millis(25)).await;
+                            }
+                            Err(Error::Unavailable) => {
+                                return Err(Error::DaemonStart(
+                                    "finished, but its socket did not accept connections",
+                                ));
                             }
                             Err(e) => return Err(e),
                         }
@@ -69,7 +72,8 @@ pub async fn ensure(paths: &Paths) -> Result<Host> {
         )
     {
         return Err(Error::Config(
-            "Shared Codex requires a Bash or Zsh execution shell",
+            "Codex app-server must run with a Bash or Zsh shell; restart it with SHELL set to one, \
+             for example `SHELL=/bin/bash codex app-server daemon restart`",
         ));
     }
     Ok(Host {
@@ -79,17 +83,9 @@ pub async fn ensure(paths: &Paths) -> Result<Host> {
     })
 }
 
-pub async fn run(paths: Paths) -> std::io::Result<()> {
-    paths.prepare()?;
-    let _lock = SingletonLock::acquire(&paths.run.join("codex-host.lock"))?;
-    tower_pal::ignore_hangup()?;
-    let config = Config::load(&paths).map_err(std::io::Error::other)?;
-    if !config.managed {
-        return Err(std::io::Error::other(
-            "Configured external Codex endpoint has its own lifecycle",
-        ));
-    }
-    tower_pal::prepare_socket_path(&config.endpoint).await?;
+/// Asks Codex to start its own app-server daemon. The daemon inherits this
+/// environment and directory, so neither may carry a caller's identity.
+async fn start_daemon(paths: &Paths) -> Result<()> {
     let mut env = tower_pal::environment();
     for key in [
         "TOWER_AGENT_ID",
@@ -110,112 +106,32 @@ pub async fn run(paths: Paths) -> std::io::Result<()> {
                 .and_then(|n| n.to_str()),
             Some("bash" | "zsh")
         )
-    }) {
-        let shell = tower_pal::find_program("bash", &env)
-            .ok_or_else(|| std::io::Error::other("Codex host needs a supported execution shell"))?;
+    }) && let Some(shell) = tower_pal::find_program("bash", &env)
+    {
         env.insert("SHELL".into(), shell.to_string_lossy().into_owned());
     }
-    let mut child = tower_pal::spawn_protocol(
-        &[
-            "codex".into(),
-            "app-server".into(),
-            "--listen".into(),
-            format!("unix://{}", config.endpoint.display()),
-        ],
-        &env,
-        &paths.home,
-    )?;
-    drop(child.stdin.take());
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| std::io::Error::other("Missing server output"))?;
-    let drain = tokio::spawn(async move {
-        let _ = tokio::io::copy(&mut stdout, &mut tokio::io::sink()).await;
-    });
-    let identity = tower_pal::process_identity(
-        child
-            .id()
-            .ok_or_else(|| std::io::Error::other("Missing server identity"))?,
-    )?;
-    let listener = tower_pal::IpcListener::bind(&paths.run.join("codex-host.sock")).await?;
-    let mut tasks = tokio::task::JoinSet::new();
-    let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
-    let mut tick = tokio::time::interval(Duration::from_millis(100));
-    let mut private = false;
-    let signals = tower_pal::shutdown_signal();
-    tokio::pin!(signals);
-    let result = loop {
-        tokio::select! {
-            result=child.wait()=>break result.map(|_|()),
-            result=&mut signals=>break result,
-            _=shutdown.notified()=>break Ok(()),
-            _=tick.tick(),if !private=>{private=tower_pal::private_socket(&config.endpoint).is_ok();},
-            Some(_)=tasks.join_next(),if !tasks.is_empty()=>{},
-            accepted=listener.accept(),if tasks.len()<16=>{
-                if let Ok((stream,_))=accepted {
-                    let shutdown=shutdown.clone();
-                    tasks.spawn(async move {
-                        let _=tokio::time::timeout(Duration::from_secs(5),async {
-                            let mut stream=BufReader::new(stream);let mut bytes=Vec::new();
-                            loop {let buf=stream.fill_buf().await?;if buf.is_empty(){return Err(std::io::Error::other("closed"));}let n=buf.iter().position(|b|*b==b'\n').map_or(buf.len(),|n|n+1);if bytes.len()+n>1024{return Err(std::io::Error::other("oversized control"));}bytes.extend_from_slice(&buf[..n]);stream.consume(n);if bytes.last()==Some(&b'\n'){break;}}
-                            let v:Value=serde_json::from_slice(&bytes)?;
-                            if v["method"]!="shutdown" {return Err(std::io::Error::other("Unknown host operation"));}
-                            stream.get_mut().write_all(b"{\"stopping\":true}\n").await?;shutdown.notify_one();Ok::<_,std::io::Error>(())
-                        }).await;
-                    });
-                }
-            }
-        }
-    };
-    tasks.abort_all();
-    while tasks.join_next().await.is_some() {}
-    if child.try_wait()?.is_none() {
-        let _ = tower_pal::kill_protocol_group(identity);
-        let _ = child.wait().await;
-    }
-    drain.abort();
-    let _ = drain.await;
-    result
-}
-
-pub async fn stop(paths: &Paths) -> std::io::Result<()> {
-    let stream = match tower_pal::connect(&paths.run.join("codex-host.sock")).await {
-        Ok(stream) => stream,
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
-            ) =>
-        {
-            return Ok(());
-        }
-        Err(e) => return Err(e),
-    };
-    let mut stream = BufReader::new(stream);
-    stream
-        .get_mut()
-        .write_all(b"{\"method\":\"shutdown\"}\n")
-        .await?;
-    let mut line = String::new();
-    tokio::time::timeout(Duration::from_secs(5), stream.read_line(&mut line)).await??;
-    if line != "{\"stopping\":true}\n" {
-        return Err(std::io::Error::other(
-            "Invalid host shutdown acknowledgement",
-        ));
-    }
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        match SingletonLock::acquire(&paths.run.join("codex-host.lock")) {
-            Ok(_) => return Ok(()),
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    && tokio::time::Instant::now() < deadline =>
-            {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-            Err(e) => return Err(e),
-        }
+    let codex = tower_pal::find_program("codex", &env).ok_or(Error::DaemonStart(
+        "could not run because `codex` is not on PATH",
+    ))?;
+    let status = tokio::time::timeout(
+        Duration::from_secs(60),
+        tokio::process::Command::new(codex)
+            .args(["app-server", "daemon", "start"])
+            .env_clear()
+            .envs(&env)
+            .current_dir(&paths.home)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .status(),
+    )
+    .await;
+    match status {
+        Ok(Ok(status)) if status.success() => Ok(()),
+        Ok(Ok(_)) => Err(Error::DaemonStart("failed")),
+        Ok(Err(_)) => Err(Error::DaemonStart("could not run")),
+        Err(_) => Err(Error::DaemonStart("did not finish within 60 seconds")),
     }
 }
 

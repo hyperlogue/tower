@@ -289,7 +289,9 @@ async fn serve(
     let mut server = if plan.spec.mode.as_deref() == Some("app-server") {
         match super::app_server::start(plan, &mut invocation, observations).await {
             Ok(server) => Some(server),
-            Err(_) => {
+            Err(e) => {
+                // The session's terminal is where the person launching it looks.
+                eprintln!("tower: {e}");
                 state.detail.error = Some("app_server_unavailable".into());
                 return Ok(1);
             }

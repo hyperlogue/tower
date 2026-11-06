@@ -93,7 +93,7 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         for (binary, args) in [
             (env!("CARGO_BIN_EXE_tower-terminal-pool"), &["stop"][..]),
-            (env!("CARGO_BIN_EXE_tower"), &["__codex", "stop"][..]),
+            ("codex", &["app-server", "daemon", "stop"][..]),
             (env!("CARGO_BIN_EXE_tower-cli"), &["daemon", "stop"][..]),
         ] {
             let _ = self
@@ -681,4 +681,27 @@ cat
     std::fs::write(config.join("config.toml"), "[inject.opencode]\npty=false\n").unwrap();
     assert_eq!(f.call(&["get", id])["caps"]["message"], "none");
     f.call(&["kill", id]);
+}
+
+#[test]
+fn codex_launch_explains_a_daemon_that_cannot_start() {
+    let f = Fixture::new();
+    let codex = f.root.path().join("bin/codex");
+    std::fs::write(
+        &codex,
+        "#!/bin/sh\ncase \"$1\" in --version|-V) echo 'codex-cli 0.166.0';; *) exit 1;; esac\n",
+    )
+    .unwrap();
+    tower_pal::make_executable(&codex).unwrap();
+    let opened = f.call(&["open", "codex", "--headless"]);
+    let id = opened["id"].as_str().unwrap();
+    let until = Instant::now() + Duration::from_secs(20);
+    loop {
+        let snapshot = f.call(&["snapshot", id]).to_string();
+        if snapshot.contains("Run `codex app-server daemon start` to see the cause") {
+            break;
+        }
+        assert!(Instant::now() < until, "no daemon start error: {snapshot}");
+        thread::sleep(Duration::from_millis(100));
+    }
 }

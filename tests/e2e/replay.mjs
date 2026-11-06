@@ -78,7 +78,7 @@ async function fixture(agent, name, content = "fixture-value\n") {
   return {
     dir, home, work, env, bindings, rpc,
     async close() {
-      for (const [binary, args] of [[pool, ["stop"]], [server, ["__codex", "stop"]], [tower, ["--no-start", "daemon", "stop"]]]) await subprocess(binary, args, env, work).catch(() => {});
+      for (const [binary, args] of [[pool, ["stop"]], ["codex", ["app-server", "daemon", "stop"]], [tower, ["--no-start", "daemon", "stop"]]]) await subprocess(binary, args, env, work).catch(() => {});
     },
     async launch(url) {
       if (agent === "codex") await writeFile(join(home, ".codex/config.toml"), [

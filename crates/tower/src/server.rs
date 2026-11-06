@@ -22,11 +22,6 @@ enum Command {
         #[command(subcommand)]
         command: OwnerCommand,
     },
-    #[command(name = "__codex", hide = true)]
-    Codex {
-        #[command(subcommand)]
-        command: OwnerCommand,
-    },
     #[command(name = "__acp", hide = true)]
     Acp { harness: String },
 }
@@ -90,18 +85,6 @@ fn execute(command: Command) -> Result<()> {
         Command::Runtime {
             command: OwnerCommand::Stop,
         } => tower_runtime::Client::new(paths).shutdown()?,
-        Command::Codex { command } => {
-            if matches!(command, OwnerCommand::Run { detach: true }) {
-                tower_pal::detach_codex_host(&paths)?;
-            }
-            let runtime = runtime()?;
-            match command {
-                OwnerCommand::Run { .. } => {
-                    runtime.block_on(tower_agents::codex_host::run(paths))?
-                }
-                OwnerCommand::Stop => runtime.block_on(tower_agents::codex_host::stop(&paths))?,
-            }
-        }
         Command::Acp { harness } => runtime()?.block_on(tower_runtime::bridge::run(&harness))?,
     }
     Ok(())

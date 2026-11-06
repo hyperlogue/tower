@@ -761,12 +761,9 @@ async fn prepare_codex(
     b: &Binding,
     env: &tower_pal::Environment,
 ) -> Result<NativeSetup> {
-    let host = tower_agents::codex_host::ensure(paths).await.map_err(|_| {
-        error(
-            "app_server_unavailable",
-            "Host Codex app-server is unavailable",
-        )
-    })?;
+    let host = tower_agents::codex_host::ensure(paths)
+        .await
+        .map_err(|e| error("app_server_unavailable", &e.to_string()))?;
     let mut maintenance = tower_agents::codex_service::Client::connect(&host.config.endpoint)
         .await
         .map_err(|_| {

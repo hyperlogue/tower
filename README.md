@@ -275,16 +275,20 @@ Reports continue while the daemon is stopped. Status stays `unknown` until the
 harness supplies evidence. Hook reports retain operational metadata, not prompt text.
 Projects with an `.envrc` require direnv approval before their agents start.
 
-Codex requires version 0.166.0 or later and uses a shared host app-server for
-terminal and structured sessions. Tower starts this service when first needed.
+Codex requires version 0.166.0 or later and uses Codex's own app-server daemon
+for terminal and structured sessions. By default Tower connects to its socket,
+`$CODEX_HOME/app-server-control/app-server-control.sock` (`~/.codex/...` when
+`CODEX_HOME` is unset). If the daemon is not running, Tower runs
+`codex app-server daemon start`; if that fails, the session's terminal explains
+how to start it. Codex manages the daemon's lifecycle and updates.
 Each session has a separate native thread and private execution environment.
-The service survives daemon, terminal, and runtime-owner restarts. Stopping a
+The daemon survives Tower daemon, terminal, and runtime-owner restarts. Stopping a
 session interrupts its turn, stops its background terminals, and waits for its
 thread to unload. If termination cannot be confirmed, Tower reports uncertainty
 and preserves the service and other sessions.
 
-To use an existing host service, set its Unix endpoint once in Tower configuration.
-Tower connects to this endpoint and leaves its process lifecycle to its owner.
+To use another app-server, set its Unix endpoint once in Tower configuration.
+Tower then connects only to that endpoint and never starts a server for it.
 The endpoint cannot be overridden by session options or project configuration.
 
 ```toml
@@ -296,8 +300,8 @@ owned_retention_days = 30
 ```
 
 Put these settings in `~/.config/tower/config.toml` (or `$XDG_CONFIG_HOME/tower/config.toml`).
-Omit `codex.endpoint` to use the Tower-managed service. The service requires a
-Bash or Zsh execution shell. Approved project environment values and Tower MCP
+Omit `codex.endpoint` to use the Codex daemon. The app-server must run with a
+Bash or Zsh `SHELL`; when Tower starts the daemon it supplies Bash if needed. Approved project environment values and Tower MCP
 credentials are stored in private per-session files; they are not placed in
 native configuration values or applied to the shared server environment.
 Per-launch model and permission options remain available through `open -- …`.

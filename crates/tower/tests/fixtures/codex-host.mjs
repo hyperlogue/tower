@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import fs from 'node:fs';
 import net from 'node:net';
+import {spawn} from 'node:child_process';
 import path from 'node:path';
 import {createHash, randomBytes} from 'node:crypto';
 import {fileURLToPath, pathToFileURL} from 'node:url';
@@ -558,10 +559,38 @@ export async function tui(endpoint, args) {
   } catch (error) { peer.socket.destroy(); throw error; }
 }
 
+const reachable = socket => new Promise(resolve => {
+  const probe = net.connect(socket, () => { probe.destroy(); resolve(true); });
+  probe.on('error', () => resolve(false));
+});
+
+// Mirrors `codex app-server daemon start|stop` with its default socket.
+async function daemon(command) {
+  const root = path.join(process.env.CODEX_HOME || path.join(process.env.HOME, '.codex'), 'app-server-control');
+  const socket = path.join(root, 'app-server-control.sock');
+  const pidFile = path.join(root, 'fixture-daemon.pid');
+  if (command === 'start') {
+    fs.mkdirSync(root, {recursive: true, mode: 0o700});
+    if (!await reachable(socket)) {
+      const child = spawn(process.execPath, [fileURLToPath(import.meta.url), 'app-server', '--listen', `unix://${socket}`], {detached: true, stdio: 'ignore'});
+      fs.writeFileSync(pidFile, String(child.pid));
+      child.unref();
+      for (let tries = 0; tries < 400 && !await reachable(socket); tries++) await new Promise(resolve => setTimeout(resolve, 25));
+    }
+    process.stdout.write(`${JSON.stringify({status: 'started', socketPath: socket})}\n`);
+  } else if (command === 'stop') {
+    try { process.kill(Number(fs.readFileSync(pidFile, 'utf8'))); } catch {}
+    fs.rmSync(pidFile, {force: true});
+  } else {
+    throw new Error(`unsupported fixture daemon command ${command}`);
+  }
+}
+
 async function main() {
   const args = process.argv.slice(2);
   if (args[0] === '--version' || args[0] === '-V') { process.stdout.write('codex-cli 0.166.0\n'); return; }
   if (args[0] === 'queue') { process.exitCode = 2; return; }
+  if (args[0] === 'app-server' && args[1] === 'daemon') { await daemon(args[2]); return; }
   if (args[0] === 'app-server') {
     const endpoint = args[args.indexOf('--listen') + 1];
     if (!endpoint?.startsWith('unix://')) throw new Error('fixture app-server requires --listen unix://PATH');

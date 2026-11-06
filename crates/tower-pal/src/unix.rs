@@ -314,14 +314,6 @@ pub fn ignore_hangup() -> io::Result<()> {
 pub fn detach(paths: &Paths) -> io::Result<()> {
     detach_log(paths, "tower.log")
 }
-pub fn detach_codex_host(paths: &Paths) -> io::Result<()> {
-    detach_log(paths, "codex-host.log")
-}
-pub fn start_codex_host() -> io::Result<()> {
-    let mut command = Command::new(super::Program::Server.path()?);
-    command.args(["__codex", "run", "--detach"]);
-    start_background(command)
-}
 pub fn detach_runtime(paths: &Paths) -> io::Result<()> {
     detach_log(paths, "runtime.log")
 }

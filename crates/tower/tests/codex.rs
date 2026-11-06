@@ -124,7 +124,7 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = self
-            .program(env!("CARGO_BIN_EXE_tower"), &["__codex", "stop"])
+            .program("codex", &["app-server", "daemon", "stop"])
             .output();
         let _ = self.command(&["daemon", "stop"]).output();
         if let Ok(mut s) =

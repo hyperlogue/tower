@@ -26,6 +26,8 @@ pub type Socket = WebSocketStream<tower_pal::IpcStream>;
 pub enum Error {
     Config(&'static str),
     Unavailable,
+    /// `codex app-server daemon start` did not produce a reachable daemon.
+    DaemonStart(&'static str),
     Timeout,
     Protocol,
     Limit,
@@ -42,6 +44,11 @@ impl fmt::Display for Error {
         match self {
             Self::Config(message) => f.write_str(message),
             Self::Unavailable => f.write_str("Codex app-server is unavailable"),
+            Self::DaemonStart(reason) => write!(
+                f,
+                "Codex app-server is not running and `codex app-server daemon start` {reason}. \
+                 Run `codex app-server daemon start` to see the cause"
+            ),
             Self::Timeout => f.write_str("Codex app-server operation timed out"),
             Self::Protocol => f.write_str("Codex app-server returned an invalid response"),
             Self::Limit => f.write_str("Codex app-server operation exceeded its limit"),
@@ -67,6 +74,17 @@ pub struct Config {
     pub managed: bool,
 }
 impl Config {
+    /// The socket of Codex's own app-server daemon, which tower may start.
+    fn daemon(paths: &tower_pal::Paths) -> Self {
+        let home = std::env::var_os("CODEX_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .unwrap_or_else(|| paths.home.join(".codex"));
+        Self {
+            endpoint: home.join("app-server-control/app-server-control.sock"),
+            managed: true,
+        }
+    }
     pub fn load(paths: &tower_pal::Paths) -> Result<Self> {
         let raw = tower_pal::read_config(&paths.config_home.join("tower/config.toml"))
             .map_err(|_| Error::Config("Cannot read Tower configuration"))?;
@@ -76,10 +94,7 @@ impl Config {
             .map_err(|_| Error::Config("Invalid Tower configuration"))?
             .unwrap_or_default();
         let Some(codex) = table.get("codex") else {
-            return Ok(Self {
-                endpoint: paths.run.join("codex.sock"),
-                managed: true,
-            });
+            return Ok(Self::daemon(paths));
         };
         let codex = codex
             .as_table()
@@ -90,10 +105,7 @@ impl Config {
             ));
         }
         let Some(endpoint) = codex.get("endpoint") else {
-            return Ok(Self {
-                endpoint: paths.run.join("codex.sock"),
-                managed: true,
-            });
+            return Ok(Self::daemon(paths));
         };
         let endpoint = endpoint
             .as_str()
@@ -665,12 +677,19 @@ mod tests {
         }
     }
     #[test]
-    fn endpoint_configuration_has_one_host_owned_default() {
+    fn endpoint_configuration_defaults_to_the_codex_daemon() {
         let directory = tempfile::tempdir().unwrap();
         let paths = paths(directory.path());
         let default = Config::load(&paths).unwrap();
         assert!(default.managed);
-        assert_eq!(default.endpoint, paths.run.join("codex.sock"));
+        let codex_home = std::env::var_os("CODEX_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .unwrap_or_else(|| paths.home.join(".codex"));
+        assert_eq!(
+            default.endpoint,
+            codex_home.join("app-server-control/app-server-control.sock")
+        );
         tower_pal::private_dir(&paths.config_home.join("tower")).unwrap();
         let config = paths.config_home.join("tower/config.toml");
         tower_pal::write_private(&config, b"[codex]\nendpoint='unix://~/service.sock'\n").unwrap();
