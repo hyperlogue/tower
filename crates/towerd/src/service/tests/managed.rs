@@ -347,3 +347,56 @@ fn pool_upgrade_can_require_idle_terminal_sessions() {
     upgrade(true).unwrap();
     assert_eq!(terminal.pool_restarts.load(Ordering::Relaxed), 2);
 }
+
+#[test]
+fn execution_authority_uses_the_replacement_binding_before_registry_refresh() {
+    use tower_sessions::execution::{Authorization, RuntimeBinding};
+    let (_dir, store, mut s) = setup();
+    let backend = Arc::new(StructuredBackend::new("acp", store.clone()));
+    install(&mut s, "acp", vec![backend]);
+    let id = open(&s, None);
+    store.set_enrollment("allgather", None).unwrap();
+    store.apply_policy(1, &[]).unwrap();
+    call(&s,"rules.replace",serde_json::json!({"rules":[
+        {"id":"deny-new","kind":"session","from":"*","to":"cwd:~/new","action":"deny","created_by":"fixture","created_at":1},
+        {"id":"allow","kind":"session","from":"*","to":"*","action":"allow","created_by":"fixture","created_at":1}
+    ]}),human()).unwrap();
+    let b = RuntimeBinding {
+        origin: "local".into(),
+        machine_id: "local".into(),
+        session_id: id.clone(),
+        runtime_id: "replacement".into(),
+        generation: "replacement-generation".into(),
+        tower_session_id: id.clone(),
+        owner_id: "owner".into(),
+        protocol: "acp".into(),
+        harness: "structured-agent".into(),
+        cwd: s.paths.home.join("new").to_string_lossy().into_owned(),
+        resume_session_id: Some("history".into()),
+    };
+    store
+        .replace_managed(
+            &ManagedSession {
+                id: id.clone(),
+                protocol: "acp".into(),
+                binding: value(&b).unwrap(),
+                launch: None,
+                auto_resume: false,
+            },
+            None,
+            now_ms(),
+        )
+        .unwrap();
+    assert_eq!(store.agent(&id).unwrap().record.cwd, "~/work");
+    let request = Authorization {
+        binding: b,
+        command_id: "resume".into(),
+        kind: "resume".into(),
+        cleanup: false,
+        target: None,
+    };
+    assert_eq!(
+        s.authorize_execution(&request).unwrap_err().data.code,
+        "denied"
+    );
+}

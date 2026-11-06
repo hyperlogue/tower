@@ -1,3 +1,4 @@
+mod force;
 use crate::{Result, error, identifier, internal, millis, parse_time, random_id, timestamp};
 use hmac::{Hmac, KeyInit, Mac};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -96,7 +97,7 @@ impl Journal {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .map_err(internal)?;
-        if version > 1 {
+        if version > 2 {
             return Err(error(
                 "runtime_storage",
                 "Runtime journal belongs to a newer version",
@@ -111,14 +112,14 @@ CREATE TABLE IF NOT EXISTS commands(namespace TEXT NOT NULL,command_id TEXT NOT 
 CREATE TABLE IF NOT EXISTS events(namespace TEXT NOT NULL,runtime_id TEXT NOT NULL,generation TEXT NOT NULL,sequence INTEGER NOT NULL,event_key TEXT NOT NULL,body TEXT NOT NULL,bytes INTEGER NOT NULL,control INTEGER NOT NULL,PRIMARY KEY(namespace,runtime_id,generation,sequence),UNIQUE(namespace,runtime_id,generation,event_key),FOREIGN KEY(namespace,runtime_id,generation) REFERENCES runtimes(namespace,runtime_id,generation));
 CREATE TABLE IF NOT EXISTS counters(id INTEGER PRIMARY KEY CHECK(id=1),spool_bytes INTEGER NOT NULL DEFAULT 0,control_bytes INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS journal_identity(id TEXT PRIMARY KEY);
-CREATE TABLE IF NOT EXISTS takeovers(namespace TEXT NOT NULL,action_id TEXT NOT NULL,command_id TEXT NOT NULL,runtime_id TEXT NOT NULL,generation TEXT NOT NULL,PRIMARY KEY(namespace,action_id));
+CREATE TABLE IF NOT EXISTS force_resumes(namespace TEXT NOT NULL,command_id TEXT NOT NULL,targets TEXT NOT NULL,phase TEXT NOT NULL,cleanup_started INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(namespace,command_id),FOREIGN KEY(namespace,command_id) REFERENCES commands(namespace,command_id));
 CREATE INDEX IF NOT EXISTS commands_runtime ON commands(namespace,runtime_id,generation);
 CREATE INDEX IF NOT EXISTS command_outbox ON commands(namespace,created_at) WHERE receipt_revision>ack_revision;
 CREATE INDEX IF NOT EXISTS pending_payloads ON commands(namespace,runtime_id) WHERE payload IS NOT NULL;
 CREATE INDEX IF NOT EXISTS runtimes_logical ON runtimes(namespace,logical_session);
 CREATE INDEX IF NOT EXISTS runtimes_ended ON runtimes(ended_at) WHERE ended_at IS NOT NULL;
 INSERT OR IGNORE INTO counters(id) VALUES(1);
-PRAGMA user_version=1;").map_err(internal)?;
+PRAGMA user_version=2;").map_err(internal)?;
         let identity: Option<String> = conn
             .query_row("SELECT id FROM journal_identity", [], |r| r.get(0))
             .optional()
@@ -155,6 +156,7 @@ PRAGMA user_version=1;").map_err(internal)?;
     }
     pub fn admit(&self, binding: &Binding, command: &ExecutionCommand) -> Result<ExecutionReceipt> {
         validate(binding, command)?;
+        tower_sessions::execution::force_resume(command)?;
         let fingerprint = self.fingerprint(command)?;
         let namespace = binding.namespace();
         let mut conn = self.lock()?;
@@ -192,6 +194,17 @@ PRAGMA user_version=1;").map_err(internal)?;
             ));
         }
         let runtime:Option<(String,String,bool)>=tx.query_row("SELECT generation,binding,fenced FROM runtimes WHERE namespace=?1 AND runtime_id=?2",params![namespace,binding.runtime_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(internal)?;
+        let targets = if runtime.is_none() {
+            force::validate_new(&tx, binding, command)?
+        } else {
+            if tower_sessions::execution::force_resume(command)?.is_some() {
+                return Err(error(
+                    "runtime_conflict",
+                    "Force resume requires a new runtime and generation",
+                ));
+            }
+            None
+        };
         if let Some((generation, stored, fenced)) = runtime {
             let current: Binding = serde_json::from_str(&stored).map_err(internal)?;
             if generation != binding.generation
@@ -210,7 +223,6 @@ PRAGMA user_version=1;").map_err(internal)?;
             if !matches!(command.kind.as_str(), "launch" | "resume") {
                 return Err(error("not_found", "Runtime has not been created"));
             }
-            verify_takeover(&tx, binding, command)?;
             tx.execute("INSERT INTO runtimes(namespace,runtime_id,generation,logical_session,tower_id,owner_id,binding,state) VALUES(?1,?2,?3,?4,?5,?6,?7,'starting')",params![namespace,binding.runtime_id,binding.generation,binding.session_id,binding.tower_session_id,binding.owner_id,serde_json::to_string(binding).map_err(internal)?]).map_err(internal)?;
         }
         if binding.protocol == "terminal" {
@@ -256,6 +268,9 @@ PRAGMA user_version=1;").map_err(internal)?;
             }
         }
         tx.execute("INSERT INTO commands(namespace,command_id,runtime_id,generation,fingerprint,kind,payload,expires_at,receipt,receipt_revision,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,1,?10)",params![namespace,command.command_id,command.runtime_id,command.generation,fingerprint,command.kind,payload,parse_time(&command.expires_at)? as i64,serde_json::to_string(&receipt).map_err(internal)?,millis() as i64]).map_err(internal)?;
+        if let Some(targets) = targets {
+            force::record(&tx, binding, command, &targets)?;
+        }
         tx.commit().map_err(internal)?;
         Ok(receipt)
     }
@@ -294,83 +309,6 @@ PRAGMA user_version=1;").map_err(internal)?;
         }
         Ok(receipt)
     }
-}
-fn verify_takeover(
-    tx: &Transaction<'_>,
-    binding: &Binding,
-    command: &ExecutionCommand,
-) -> Result<()> {
-    let mut q=tx.prepare("SELECT runtime_id,generation,fenced,loss FROM runtimes WHERE namespace=?1 AND logical_session=?2 AND (fenced=0 OR termination!='confirmed')").map_err(internal)?;
-    let rows = q
-        .query_map(params![binding.namespace(), binding.session_id], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, bool>(2)?,
-                r.get::<_, Option<String>>(3)?,
-            ))
-        })
-        .map_err(internal)?
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(internal)?;
-    let payload = serde_json::to_value(&command.payload).map_err(internal)?;
-    let proof = payload.get("takeover");
-    if rows.is_empty() && proof.is_none() {
-        return Ok(());
-    }
-    if rows.len() != 1
-        || !rows[0].2
-        || command.kind != "resume"
-        || binding.resume_session_id.is_none()
-    {
-        return Err(error(
-            "runtime_overlap",
-            "Previous execution has not been confirmed stopped",
-        ));
-    }
-    let proof = proof.ok_or_else(|| {
-        error(
-            "runtime_overlap",
-            "An explicit owner decision is required for uncertain overlap",
-        )
-    })?;
-    let (runtime, generation, _, loss) = &rows[0];
-    let loss: RuntimeLoss = serde_json::from_str(loss.as_deref().ok_or_else(|| {
-        error(
-            "runtime_overlap",
-            "Previous owner has no durable fence report",
-        )
-    })?)
-    .map_err(internal)?;
-    let action = proof["owner_action_id"]
-        .as_str()
-        .filter(|s| identifier(s))
-        .ok_or_else(|| error("takeover_conflict", "Owner action identity is required"))?;
-    if proof["previous_runtime_id"] != *runtime
-        || proof["previous_generation"] != *generation
-        || proof["loss_id"] != loss.loss_id
-        || proof["expected_loss_revision"].as_u64() != Some(loss.report_revision)
-    {
-        return Err(error(
-            "takeover_conflict",
-            "Owner decision does not match the current loss report",
-        ));
-    }
-    let used: bool = tx
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM takeovers WHERE namespace=?1 AND action_id=?2)",
-            params![binding.namespace(), action],
-            |r| r.get(0),
-        )
-        .map_err(internal)?;
-    if used {
-        return Err(error(
-            "takeover_conflict",
-            "Owner action was already bound to a replacement",
-        ));
-    }
-    tx.execute("INSERT INTO takeovers(namespace,action_id,command_id,runtime_id,generation) VALUES(?1,?2,?3,?4,?5)",params![binding.namespace(),action,command.command_id,binding.runtime_id,binding.generation]).map_err(internal)?;
-    Ok(())
 }
 fn validate(binding: &Binding, command: &ExecutionCommand) -> Result<()> {
     for id in [
@@ -609,11 +547,17 @@ impl Journal {
         if receipt.dispatch.state != "not_started" {
             return Ok(false);
         }
+        force::before_dispatch(&tx, binding, command_id)?;
         if expires <= millis() as i64 {
             return Err(error("command_expired", "Command expired before dispatch"));
         }
         receipt.receipt_revision += 1;
         receipt.dispatch.state = "in_flight".into();
+        tx.execute(
+            "UPDATE force_resumes SET phase='dispatched' WHERE namespace=?1 AND command_id=?2",
+            params![binding.namespace(), command_id],
+        )
+        .map_err(internal)?;
         save_receipt(&tx, &binding.namespace(), &receipt)?;
         tx.execute(
             "UPDATE commands SET payload=NULL WHERE namespace=?1 AND command_id=?2",
@@ -773,6 +717,11 @@ impl Journal {
     }
     pub fn batch(&self, binding: &Binding) -> Result<Option<RuntimeEvents>> {
         let conn = self.lock()?;
+        // A ready event must not overtake a target's confirmed loss report.
+        let cleanup_unacked: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM force_resumes f JOIN commands c USING(namespace,command_id) JOIN json_each(f.targets) target LEFT JOIN runtimes old ON old.namespace=f.namespace AND old.runtime_id=json_extract(target.value,'$.runtime_id') AND old.generation=json_extract(target.value,'$.generation') WHERE c.namespace=?1 AND c.runtime_id=?2 AND c.generation=?3 AND (old.runtime_id IS NULL OR old.termination!='confirmed' OR old.loss_ack<coalesce(json_extract(old.loss,'$.report_revision'),1)))",params![binding.namespace(),binding.runtime_id,binding.generation],|r|r.get(0)).map_err(internal)?;
+        if cleanup_unacked {
+            return Ok(None);
+        }
         let mut query=conn.prepare("SELECT body FROM events WHERE namespace=?1 AND runtime_id=?2 AND generation=?3 ORDER BY sequence LIMIT 200").map_err(internal)?;
         let mut events = Vec::new();
         let mut bytes = 0usize;
@@ -874,74 +823,87 @@ impl Journal {
         }
         let mut conn = self.lock()?;
         let tx = conn.transaction().map_err(internal)?;
-        let old: Option<String> = tx
-            .query_row(
-                "SELECT loss FROM runtimes WHERE namespace=?1 AND runtime_id=?2 AND generation=?3",
-                params![binding.namespace(), binding.runtime_id, binding.generation],
-                |r| r.get(0),
-            )
-            .map_err(internal)?;
-        let first = old.is_none();
-        let mut loss = if let Some(old) = old {
-            serde_json::from_str::<RuntimeLoss>(&old).map_err(internal)?
-        } else {
-            RuntimeLoss {
-                runtime_id: binding.runtime_id.clone(),
-                generation: binding.generation.clone(),
-                loss_id: random_id("loss_")?,
-                report_revision: 1,
-                owner_id: binding.owner_id.clone(),
-                termination: termination.into(),
-                reason: reason.into(),
-                observed_at: timestamp(),
-            }
-        };
-        if !first && (loss.termination == "confirmed" || termination == "unknown") {
-            return Ok(loss);
-        }
-        if loss.termination == "unknown" && termination == "confirmed" {
-            loss.report_revision += 1;
-            loss.termination = "confirmed".into();
-            loss.observed_at = timestamp();
-        }
-        let mut query=tx.prepare("SELECT receipt FROM commands WHERE namespace=?1 AND runtime_id=?2 AND generation=?3 AND json_extract(receipt,'$.dispatch.state')!='finished'").map_err(internal)?;
-        let receipts = query
-            .query_map(
-                params![binding.namespace(), binding.runtime_id, binding.generation],
-                |r| r.get::<_, String>(0),
-            )
-            .map_err(internal)?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(internal)?;
-        drop(query);
-        for json in receipts.into_iter().filter(|_| first) {
-            let mut receipt: ExecutionReceipt = serde_json::from_str(&json).map_err(internal)?;
-            receipt.receipt_revision += 1;
-            let may_have_effect = receipt.dispatch.state != "not_started";
-            receipt.dispatch.state = if may_have_effect {
-                "unknown"
-            } else {
-                "finished"
-            }
-            .into();
-            receipt.error = Some(ExecutionError {
-                code: if may_have_effect {
-                    "dispatch_unknown"
-                } else {
-                    "runtime_lost"
-                }
-                .into(),
-                message: "Runtime ownership was lost".into(),
-                stage: "recovery".into(),
-                may_have_effect,
-            });
-            save_receipt(&tx, &binding.namespace(), &receipt)?;
-        }
-        tx.execute("UPDATE commands SET payload=NULL WHERE namespace=?1 AND runtime_id=?2 AND generation=?3",params![binding.namespace(),binding.runtime_id,binding.generation]).map_err(internal)?;
-        tx.execute("UPDATE runtimes SET fenced=1,state='ended',termination=?1,loss=?2,ended_at=coalesce(ended_at,?3),metadata=json_set(metadata,'$.error',?7) WHERE namespace=?4 AND runtime_id=?5 AND generation=?6",params![loss.termination,serde_json::to_string(&loss).map_err(internal)?,millis() as i64,binding.namespace(),binding.runtime_id,binding.generation,if matches!(loss.reason.as_str(),"local_stop"|"server_restart"|"stop_runtime"){None}else{Some(&loss.reason)}]).map_err(internal)?;
+        let loss = fence_tx(&tx, binding, reason, termination)?;
         tx.commit().map_err(internal)?;
         Ok(loss)
     }
+}
+fn fence_tx(
+    tx: &Transaction<'_>,
+    binding: &Binding,
+    reason: &str,
+    termination: &str,
+) -> Result<RuntimeLoss> {
+    let old: Option<String> = tx
+        .query_row(
+            "SELECT loss FROM runtimes WHERE namespace=?1 AND runtime_id=?2 AND generation=?3",
+            params![binding.namespace(), binding.runtime_id, binding.generation],
+            |r| r.get(0),
+        )
+        .map_err(internal)?;
+    let first = old.is_none();
+    let mut loss = if let Some(old) = old {
+        serde_json::from_str::<RuntimeLoss>(&old).map_err(internal)?
+    } else {
+        RuntimeLoss {
+            runtime_id: binding.runtime_id.clone(),
+            generation: binding.generation.clone(),
+            loss_id: random_id("loss_")?,
+            report_revision: 1,
+            owner_id: binding.owner_id.clone(),
+            termination: termination.into(),
+            reason: reason.into(),
+            observed_at: timestamp(),
+        }
+    };
+    if !first && (loss.termination == "confirmed" || termination == "unknown") {
+        return Ok(loss);
+    }
+    if loss.termination == "unknown" && termination == "confirmed" {
+        loss.report_revision += 1;
+        loss.termination = "confirmed".into();
+        loss.observed_at = timestamp();
+    }
+    let mut query=tx.prepare("SELECT receipt FROM commands WHERE namespace=?1 AND runtime_id=?2 AND generation=?3 AND json_extract(receipt,'$.dispatch.state')!='finished'").map_err(internal)?;
+    let receipts = query
+        .query_map(
+            params![binding.namespace(), binding.runtime_id, binding.generation],
+            |r| r.get::<_, String>(0),
+        )
+        .map_err(internal)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(internal)?;
+    drop(query);
+    for json in receipts.into_iter().filter(|_| first) {
+        let mut receipt: ExecutionReceipt = serde_json::from_str(&json).map_err(internal)?;
+        receipt.receipt_revision += 1;
+        let may_have_effect = receipt.dispatch.state != "not_started";
+        receipt.dispatch.state = if may_have_effect {
+            "unknown"
+        } else {
+            "finished"
+        }
+        .into();
+        receipt.error = Some(ExecutionError {
+            code: if may_have_effect {
+                "dispatch_unknown"
+            } else {
+                "runtime_lost"
+            }
+            .into(),
+            message: "Runtime ownership was lost".into(),
+            stage: "recovery".into(),
+            may_have_effect,
+        });
+        save_receipt(tx, &binding.namespace(), &receipt)?;
+    }
+    tx.execute(
+        "UPDATE commands SET payload=NULL WHERE namespace=?1 AND runtime_id=?2 AND generation=?3",
+        params![binding.namespace(), binding.runtime_id, binding.generation],
+    )
+    .map_err(internal)?;
+    tx.execute("UPDATE runtimes SET fenced=1,state='ended',termination=?1,loss=?2,ended_at=coalesce(ended_at,?3),metadata=json_set(metadata,'$.error',?7) WHERE namespace=?4 AND runtime_id=?5 AND generation=?6",params![loss.termination,serde_json::to_string(&loss).map_err(internal)?,millis() as i64,binding.namespace(),binding.runtime_id,binding.generation,if matches!(loss.reason.as_str(),"local_stop"|"server_restart"|"stop_runtime"){None}else{Some(&loss.reason)}]).map_err(internal)?;
+    Ok(loss)
 }
 fn ensure_live(tx: &Transaction<'_>, binding: &Binding) -> Result<()> {
     let fenced: Option<bool> = tx
@@ -1207,46 +1169,20 @@ mod tests {
         );
     }
     #[test]
-    fn takeover_evidence_is_bound_to_one_replacement_and_the_exact_loss_report() {
+    fn takeover_payload_is_rejected_without_admission() {
         let root = tempfile::tempdir().unwrap();
         let j = Journal::open(&root.path().join("runtime.db"), Limits::default()).unwrap();
         let b = binding();
-        j.admit(&b, &command("launch", "first", json!({}))).unwrap();
-        let loss = j.fence(&b, "owner_unreachable", "unknown").unwrap();
-        let mut next = b.clone();
-        next.runtime_id = "replacement".into();
-        next.generation = "replacement-generation".into();
-        next.owner_id = "new-owner".into();
-        next.resume_session_id = Some("native".into());
-        let proof = json!({"previous_runtime_id":b.runtime_id,"previous_generation":b.generation,"loss_id":loss.loss_id,"expected_loss_revision":loss.report_revision,"owner_action_id":"owner-action"});
-        let mut c = command("resume", "second", json!({"takeover":proof}));
-        c.runtime_id = next.runtime_id.clone();
-        c.generation = next.generation.clone();
-        let accepted = j.admit(&next, &c).unwrap();
-        assert_eq!(j.admit(&next, &c).unwrap(), accepted);
-        j.fence(&next, "stopped", "confirmed").unwrap();
-        let mut third = next.clone();
-        third.runtime_id = "third".into();
-        third.generation = "third-generation".into();
-        let mut retry = c.clone();
-        retry.command_id = "third-command".into();
-        retry.runtime_id = third.runtime_id.clone();
-        retry.generation = third.generation.clone();
-        assert_eq!(
-            j.admit(&third, &retry).unwrap_err().data.code,
-            "takeover_conflict"
+        let c = command(
+            "resume",
+            "legacy",
+            json!({"takeover":{"owner_action_id":"old-action"}}),
         );
-        j.fence(&b, "terminated", "confirmed").unwrap();
-        let mut stale = c.clone();
-        stale.command_id = "stale-proof".into();
-        stale.runtime_id = "stale-runtime".into();
-        stale.generation = "stale-generation".into();
-        third.runtime_id = stale.runtime_id.clone();
-        third.generation = stale.generation.clone();
         assert_eq!(
-            j.admit(&third, &stale).unwrap_err().data.code,
-            "runtime_overlap"
+            j.admit(&b, &c).unwrap_err().data.code,
+            "unsupported_control"
         );
+        assert!(j.bindings(None).unwrap().is_empty());
     }
     #[test]
     fn expired_full_receipts_compact_without_losing_deduplication_or_outcome() {

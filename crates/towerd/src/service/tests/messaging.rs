@@ -398,14 +398,31 @@ fn old_allgather_connections_cannot_act_after_enrollment_rotation() {
         context: human(),
     };
     assert_eq!(
-        s.remote_dispatch(&request, old, [true, false])
-            .unwrap_err()
-            .data
-            .code,
+        s.remote_dispatch(
+            &request,
+            old,
+            crate::allgather::ExecutionProtocols {
+                managed: true,
+                terminal: false,
+                force_resume: false
+            }
+        )
+        .unwrap_err()
+        .data
+        .code,
         "unauthorized"
     );
     assert_eq!(store.rules().unwrap().local_rules.len(), 2);
-    s.remote_dispatch(&request, new, [true, false]).unwrap();
+    s.remote_dispatch(
+        &request,
+        new,
+        crate::allgather::ExecutionProtocols {
+            managed: true,
+            terminal: false,
+            force_resume: false,
+        },
+    )
+    .unwrap();
     assert_eq!(store.rules().unwrap().local_rules.len(), 2);
     assert!(
         s.sync_activate(&Secret("old-key".into()), "stale-node")
@@ -515,7 +532,15 @@ fn allgather_cannot_administer_local_state_even_with_admin_scope() {
         };
         assert_eq!(
             service
-                .remote_dispatch(&request, epoch, [true, false])
+                .remote_dispatch(
+                    &request,
+                    epoch,
+                    crate::allgather::ExecutionProtocols {
+                        managed: true,
+                        terminal: false,
+                        force_resume: false
+                    }
+                )
                 .unwrap_err()
                 .data
                 .code,

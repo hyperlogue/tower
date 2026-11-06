@@ -135,19 +135,47 @@ impl Service {
             require(&actor, stored.scope())?;
             if !self.policy_ready() {
                 return Err(app(
-                    "denied",
+                    "control_unavailable",
                     "A current control connection and applied policy are required",
                 ));
             }
             actor
         };
-        let record = self.store.agent(&session.id).map_err(storage)?.record;
+        if let Some(target) = &p.target {
+            if target.namespace() != stored.namespace()
+                || target.session_id != stored.session_id
+                || target.tower_session_id != stored.tower_session_id
+                || target.protocol != stored.protocol
+                || target.harness != stored.harness
+            {
+                return Err(app(
+                    "cleanup_target_conflict",
+                    "Cleanup target does not belong to this execution",
+                ));
+            }
+            let cwd = self
+                .paths
+                .display_cwd(&target.cwd)
+                .map_err(|_| invalid("Invalid cleanup directory"))?;
+            self.session_policy(
+                &actor,
+                crate::policy::Subject {
+                    id: &target.tower_session_id,
+                    harness: Some(&target.harness),
+                    cwd: Some(&cwd),
+                },
+            )?;
+        }
+        let cwd = self
+            .paths
+            .display_cwd(&stored.cwd)
+            .map_err(|_| invalid("Invalid execution directory"))?;
         self.session_policy(
             &actor,
             crate::policy::Subject {
-                id: &record.id,
-                harness: Some(&record.harness),
-                cwd: Some(&record.cwd),
+                id: &stored.tower_session_id,
+                harness: Some(&stored.harness),
+                cwd: Some(&cwd),
             },
         )
     }
@@ -155,7 +183,7 @@ impl Service {
         &self,
         request: &Request,
         epoch: u64,
-        protocols: [bool; 2],
+        protocols: crate::allgather::ExecutionProtocols,
     ) -> std::result::Result<Value, RpcError> {
         if !self.allgather_config.managed {
             return Err(app("unsupported", "Managed execution is disabled"));
@@ -170,7 +198,7 @@ impl Service {
                 .list(Some(&namespace))?
                 .iter()
                 .find(|v| v.binding.runtime_id == p.runtime_id)
-                && !protocols[usize::from(view.binding.protocol == "terminal")]
+                && !protocols.allows(&view.binding.protocol)
             {
                 return Err(app(
                     "unsupported_control",
@@ -180,6 +208,13 @@ impl Service {
             return value(host.status(&namespace, &p)?);
         }
         let c: ExecutionCommand = params(&request.params)?;
+        let force = tower_sessions::execution::force_resume(&c)?;
+        if force.is_some() && !protocols.force_resume {
+            return Err(app(
+                "unsupported_control",
+                "Force resume was not negotiated",
+            ));
+        }
         host.status(
             &namespace,
             &ExecutionStatus {
@@ -228,7 +263,7 @@ impl Service {
             .map_or(payload["protocol"] == "terminal", |b| {
                 b.protocol == "terminal"
             });
-        if !protocols[usize::from(terminal)] {
+        if !protocols.allows(if terminal { "terminal" } else { "acp" }) {
             return Err(app(
                 "unsupported_control",
                 "Runtime protocol was not negotiated",
@@ -343,10 +378,16 @@ impl Service {
                     })?;
                 let metadata: serde_json::Value = serde_json::to_value(&previous.metadata)
                     .map_err(|_| invalid("Invalid native metadata"))?;
+                if protocol == "codex-app-server" && metadata["native_resumable"] != true {
+                    return Err(app(
+                        "resume_unavailable",
+                        "Codex has not confirmed resumable conversation history; the old execution was not stopped",
+                    ));
+                }
                 if previous.binding.harness != harness
                     || previous.binding.protocol != protocol
-                    || !previous.fenced
-                    || (previous.termination != "confirmed" && payload.get("takeover").is_none())
+                    || (force.is_none()
+                        && (!previous.fenced || previous.termination != "confirmed"))
                     || resume.as_deref()
                         != metadata[if protocol == "acp" {
                             "acp_session_id"
@@ -357,7 +398,7 @@ impl Service {
                 {
                     return Err(app(
                         "resume_unavailable",
-                        "Previous runtime or native history does not permit this resume",
+                        "Stop the previous execution or use force resume; native history must match this session",
                     ));
                 }
                 previous.binding.tower_session_id.clone()
@@ -430,8 +471,74 @@ impl Service {
                 ));
             }
         }
+        if new_generation {
+            host.validate_new(&b, &c)?;
+            if let Some(targets) = &force {
+                for target in targets {
+                    let old = views
+                        .iter()
+                        .find(|v| {
+                            v.binding.runtime_id == target.runtime_id
+                                && v.binding.generation == target.generation
+                        })
+                        .ok_or_else(|| {
+                            app("cleanup_target_conflict", "Cleanup target unavailable")
+                        })?;
+                    let cwd = self
+                        .paths
+                        .display_cwd(&old.binding.cwd)
+                        .map_err(|_| invalid("Invalid cleanup directory"))?;
+                    self.session_policy(
+                        &actor,
+                        crate::policy::Subject {
+                            id: &old.binding.tower_session_id,
+                            harness: Some(&old.binding.harness),
+                            cwd: Some(&cwd),
+                        },
+                    )?;
+                }
+            }
+        }
+        let previous = if new_generation && force.is_some() {
+            Some(
+                self.store
+                    .managed_session(&b.tower_session_id)
+                    .map_err(storage)?,
+            )
+        } else {
+            None
+        };
         self.reserve_execution(&b)?;
-        let receipt = host.execute(&b, &c)?;
+        let receipt = match host.execute(&b, &c) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                if let Some(previous) = previous
+                    && host
+                        .status(
+                            &namespace,
+                            &ExecutionStatus {
+                                command_id: c.command_id.clone(),
+                                runtime_id: c.runtime_id.clone(),
+                                generation: c.generation.clone(),
+                            },
+                        )
+                        .is_ok_and(|r| r.state == "missing")
+                {
+                    self.store
+                        .replace_managed(
+                            &previous,
+                            if b.harness == "codex" {
+                                Some("app-server")
+                            } else {
+                                None
+                            },
+                            now_ms(),
+                        )
+                        .map_err(storage)?;
+                }
+                return Err(error);
+            }
+        };
         self.publish()?;
         value(receipt)
     }

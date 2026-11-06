@@ -39,6 +39,27 @@ impl Authority {
             command_id: c.command_id.clone(),
             kind: c.kind.clone(),
             cleanup: engine::cleanup_command(c),
+            target: None,
+        })
+        .await
+    }
+    pub(crate) async fn check_target(
+        &self,
+        b: &Binding,
+        c: &ExecutionCommand,
+        target: &Binding,
+    ) -> Result<()> {
+        self.check(b, c).await?;
+        let authorize = self
+            .0
+            .get()
+            .ok_or_else(|| error("authority_unavailable", "Tower authorization is not ready"))?;
+        authorize(Authorization {
+            binding: b.clone(),
+            command_id: c.command_id.clone(),
+            kind: c.kind.clone(),
+            cleanup: false,
+            target: Some(target.clone()),
         })
         .await
     }
@@ -105,7 +126,15 @@ impl Runtime {
         for binding in live {
             let (handle, normal, control) = engine::channels();
             runtime.owners()?.insert(key(&binding), handle.clone());
-            runtime.spawn(binding, handle, normal, control, engine::Start::Continue);
+            if let Some(command) = runtime.journal.force_command(&binding)? {
+                handle
+                    .normal
+                    .try_send(command.clone())
+                    .map_err(|_| error("runtime_capacity", "Recovery queue is full"))?;
+                runtime.spawn_force(binding, command, handle, normal, control, true)?;
+            } else {
+                runtime.spawn(binding, handle, normal, control, engine::Start::Continue);
+            }
         }
         let weak = Arc::downgrade(&runtime);
         runtime.tasks.spawn(async move {
@@ -166,11 +195,67 @@ impl Runtime {
         let receipt = self.journal.admit(&b, &c)?;
         handle
             .normal
-            .try_send(c)
+            .try_send(c.clone())
             .map_err(|_| error("runtime_capacity", "Runtime queue is full"))?;
         owners.insert(key(&b), handle.clone());
-        self.spawn(b, handle, normal, control, engine::Start::Launch);
+        drop(owners);
+        if tower_sessions::execution::force_resume(&c)?.is_some() {
+            if let Err(error) =
+                self.spawn_force(b.clone(), c.clone(), handle, normal, control, false)
+            {
+                self.journal.force_failed(&b, &c, &error.data.code)?;
+                return self.journal.status(
+                    &b.namespace(),
+                    &ExecutionStatus {
+                        command_id: c.command_id,
+                        runtime_id: b.runtime_id.clone(),
+                        generation: b.generation.clone(),
+                    },
+                );
+            }
+        } else {
+            self.spawn(b, handle, normal, control, engine::Start::Launch);
+        }
         Ok(receipt)
+    }
+    fn spawn_force(
+        &self,
+        b: Binding,
+        c: ExecutionCommand,
+        handle: Arc<engine::Handle>,
+        normal: tokio::sync::mpsc::Receiver<ExecutionCommand>,
+        control: tokio::sync::mpsc::Receiver<engine::Control>,
+        recover: bool,
+    ) -> Result<()> {
+        let targets = self
+            .journal
+            .force_targets(&b, &c.command_id)?
+            .into_iter()
+            .map(|target| Ok((target.clone(), self.owner(&target)?)))
+            .collect::<Result<Vec<_>>>()?;
+        for (_, owner) in &targets {
+            if let Some(owner) = owner {
+                owner.requests.retire_all()?;
+            }
+        }
+        let failed = (b.clone(), c.clone(), self.journal.clone());
+        let task = self.tasks.spawn(
+            crate::force::Work {
+                ctx: self.context(),
+                binding: b,
+                command: c,
+                targets,
+            }
+            .run(handle, normal, control, recover),
+        );
+        self.tasks.spawn(async move {
+            if task.await.is_err() {
+                let _ = failed
+                    .2
+                    .force_failed(&failed.0, &failed.1, "cleanup_unconfirmed");
+            }
+        });
+        Ok(())
     }
     fn spawn(
         &self,
@@ -238,6 +323,9 @@ impl ExecutionHost for Runtime {
             }
         })
     }
+    fn validate_new(&self, b: &Binding, c: &ExecutionCommand) -> Result<()> {
+        self.journal.validate_new(b, c)
+    }
     fn controls(&self) -> BTreeMap<String, HarnessControls> {
         let env = tower_pal::environment();
         let mut out = BTreeMap::new();
@@ -268,6 +356,7 @@ impl ExecutionHost for Runtime {
         out
     }
     fn execute(&self, b: &Binding, c: &ExecutionCommand) -> Result<ExecutionReceipt> {
+        tower_sessions::execution::force_resume(c)?;
         let terminal = b.protocol == "terminal";
         let structured = b.protocol
             == if b.harness == "codex" {
@@ -539,7 +628,22 @@ async fn recover(paths: &tower_pal::Paths, journal: &Journal) -> Result<Vec<Bind
             }
             continue;
         }
+        if journal.force_command(&binding)?.is_some() {
+            live.push(binding);
+            continue;
+        }
         let m = journal.metadata(&binding)?;
+        if journal.force_phase(&binding)?.as_deref() == Some("dispatched")
+            && !m[if binding.protocol == "acp" {
+                "acp_session_id"
+            } else {
+                "native_session_id"
+            }]
+            .is_string()
+        {
+            journal.fence(&binding, "dispatch_unknown", "unknown")?;
+            continue;
+        }
         let rebooted = m["boot_id"].as_str().is_some_and(|old| old != boot);
         if binding.protocol == "terminal" {
             if rebooted {

@@ -125,6 +125,21 @@ impl Service {
             .iter()
             .map(|p| p.canonicalize().unwrap_or_else(|_| p.clone()))
             .collect::<Vec<_>>();
+        if let Some(runtime) = self.backends.execution() {
+            for view in runtime.list(None)? {
+                if view.fenced && view.termination == "confirmed" {
+                    continue;
+                }
+                let cwd = PathBuf::from(&view.binding.cwd);
+                let cwd = cwd.canonicalize().unwrap_or(cwd);
+                if paths.iter().any(|path| cwd.starts_with(path)) {
+                    return Err(app(
+                        "checkout_in_use",
+                        "A live or unconfirmed execution uses this checkout",
+                    ));
+                }
+            }
+        }
         let checkouts = self
             .store
             .checkouts(&CheckoutFilter::default())

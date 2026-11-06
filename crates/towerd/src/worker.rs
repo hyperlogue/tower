@@ -243,7 +243,7 @@ impl ServiceWorker {
         &self,
         request: tower_protocol::Request,
         epoch: u64,
-        protocols: [bool; 2],
+        protocols: crate::allgather::ExecutionProtocols,
     ) -> std::result::Result<tower_protocol::Value, tower_protocol::RpcError> {
         let result = if request.method == "message.send" {
             let permit = self

@@ -12,6 +12,22 @@ use tokio_tungstenite::tungstenite::{
 };
 use tower_protocol::{AllgatherHelloAck, PolicyPush, Request, Response, ResponseBody, Secret};
 
+#[derive(Clone, Copy)]
+pub(crate) struct ExecutionProtocols {
+    pub managed: bool,
+    pub terminal: bool,
+    pub force_resume: bool,
+}
+impl ExecutionProtocols {
+    pub(crate) fn allows(self, protocol: &str) -> bool {
+        if protocol == "terminal" {
+            self.terminal
+        } else {
+            self.managed
+        }
+    }
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(default)]
 pub(crate) struct Config {
@@ -356,6 +372,17 @@ async fn connection(
     ]
     .iter()
     .all(|c| hello.capabilities.iter().any(|v| v == c) && ack.capabilities.iter().any(|v| v == c));
+    let protocols = ExecutionProtocols {
+        managed: managed_enabled,
+        terminal: terminal_enabled,
+        force_resume: managed_enabled
+            && ["session-resume.v1", "session-force-resume.v1"]
+                .iter()
+                .all(|c| {
+                    hello.capabilities.iter().any(|v| v == c)
+                        && ack.capabilities.iter().any(|v| v == c)
+                }),
+    };
     let mut catalog = catalog::Sync::new(&hello.capabilities, &ack.capabilities);
     if catalog.enabled() {
         let url = config.url.clone();
@@ -477,7 +504,7 @@ async fn connection(
                         if replies.len()>=32 {
                             if let Some(id)=request.id {write(&mut socket,&Response{jsonrpc:"2.0".into(),id,body:ResponseBody::Failure{error:tower_protocol::RpcError::application("rate_limited","Too many remote requests")}}).await?;}
                         }else{
-                            let worker=worker.clone();replies.spawn(async move{let id=request.id.clone();let result=worker.remote(request,epoch,[managed_enabled,terminal_enabled]).await;id.map(|id|Response{jsonrpc:"2.0".into(),id,body:match result{Ok(result)=>ResponseBody::Success{result},Err(error)=>ResponseBody::Failure{error}}})});
+                            let worker=worker.clone();replies.spawn(async move{let id=request.id.clone();let result=worker.remote(request,epoch,protocols).await;id.map(|id|Response{jsonrpc:"2.0".into(),id,body:match result{Ok(result)=>ResponseBody::Success{result},Err(error)=>ResponseBody::Failure{error}}})});
                         }
                     }
                     _=>return Err(Error::Other("Unsupported sync frame".into())),

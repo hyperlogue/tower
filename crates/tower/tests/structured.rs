@@ -1,5 +1,7 @@
 #[path = "support/structured.rs"]
 mod fixture;
+#[path = "support/force_resume.rs"]
+mod force_resume;
 #[path = "support/remote_terminal.rs"]
 mod remote_terminal;
 use futures_util::{SinkExt, StreamExt};
@@ -157,6 +159,9 @@ impl Server {
         Self::start_modes(f, retire, false).await
     }
     async fn start_modes(f: &Fixture, retire: bool, terminal: bool) -> Self {
+        Self::start_protocols(f, retire, terminal, true).await
+    }
+    async fn start_protocols(f: &Fixture, retire: bool, terminal: bool, force: bool) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let config = f.root.path().join("config/tower");
@@ -184,7 +189,7 @@ impl Server {
                     hello["params"]["harness_controls"]["codex"]["protocol"],
                     "codex-app-server"
                 );
-                let caps = if terminal {
+                let mut caps = if terminal {
                     json!([
                         "policy-sync.v1",
                         "session-status.v1",
@@ -199,9 +204,15 @@ impl Server {
                         "managed-acp.v1",
                         "command-receipts.v1",
                         "session-stream.v1",
-                        "session-resume.v1"
+                        "session-resume.v1",
+                        "session-force-resume.v1"
                     ])
                 };
+                if !force {
+                    caps.as_array_mut()
+                        .unwrap()
+                        .retain(|c| c != "session-force-resume.v1");
+                }
                 socket.send(Message::Text(json!({"jsonrpc":"2.0","id":"hello","result":{"node_name":"fixture-machine","protocol_version":{"major":1,"minor":4},"capabilities":caps}}).to_string().into())).await.unwrap();
                 socket.send(Message::Text(json!({"jsonrpc":"2.0","method":"policy.push","params":{"policy_id":"tower","revision":1,"rules":[]}}).to_string().into())).await.unwrap();
                 let mut pending = BTreeMap::new();

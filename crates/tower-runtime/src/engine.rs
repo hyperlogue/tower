@@ -884,14 +884,14 @@ async fn run_inner(
             let (state, _, _) = journal.state(b)?;
             journal.update_metadata(b, &state, &s.metadata)?;
         }
-        if terminated && s.active.is_some() {
+        if terminated && s.active.is_some() && !journal.state(b)?.1 {
             s.end_turn("cancelled")?;
         }
         journal.fence(b, &reason, if terminated { "confirmed" } else { "unknown" })?;
     }
     if let Err(e) = result {
         if let Some(command) = s.stop_command.take() {
-            if terminated {
+            if terminated && !journal.state(b)?.1 {
                 s.end_turn("cancelled")?;
                 s.done(&command, Some("stopped"), None)?;
             } else {
@@ -1661,10 +1661,10 @@ async fn native(s: &mut State<'_>, input: &mut NativeInput, v: Value) -> Result<
                     s.metadata["model"] = result["model"].clone();
                     s.metadata["effort"] = result["reasoningEffort"].clone();
                 }
-                s.metadata["native_resumable"] = json!(
-                    s.open.is_some()
-                        && result.pointer("/thread/ephemeral") != Some(&Value::Bool(true))
-                );
+                s.metadata["native_ephemeral"] =
+                    json!(result.pointer("/thread/ephemeral") == Some(&Value::Bool(true)));
+                s.metadata["native_resumable"] =
+                    json!(s.open.is_some() && s.metadata["native_ephemeral"] != true);
                 s.native = result
                     .pointer("/thread/id")
                     .and_then(Value::as_str)
@@ -1710,7 +1710,7 @@ async fn native(s: &mut State<'_>, input: &mut NativeInput, v: Value) -> Result<
             }
         }
         ResponseKind::PromptStart => {
-            s.metadata["native_resumable"] = json!(true);
+            s.metadata["native_resumable"] = json!(s.metadata["native_ephemeral"] != true);
             s.journal
                 .update_metadata(s.binding, "working", &s.metadata)?;
             s.turn = result

@@ -117,7 +117,7 @@ impl Service {
         &self,
         request: &Request,
         epoch: u64,
-        protocols: [bool; 2],
+        protocols: crate::allgather::ExecutionProtocols,
     ) -> std::result::Result<Value, RpcError> {
         let _guard = self
             .mutation
@@ -236,6 +236,7 @@ impl Service {
                     "command-receipts.v1",
                     "session-stream.v1",
                     "session-resume.v1",
+                    "session-force-resume.v1",
                 ]
                 .map(str::to_owned),
             );

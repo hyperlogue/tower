@@ -362,6 +362,9 @@ impl Publisher {
                     || r["generation"] != b.generation
                     || r["loss_id"] != loss.loss_id
                     || r["report_revision"] != loss.report_revision
+                    || r["applied_revision"]
+                        .as_u64()
+                        .is_some_and(|revision| revision < loss.report_revision)
                     || r["fenced"] != true
                 {
                     return Err(invalid("Runtime loss acknowledgement changed identity"));

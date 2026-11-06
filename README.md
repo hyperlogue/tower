@@ -566,8 +566,14 @@ Pending approvals are withdrawn and asked again. Transcript
 events use a separate bounded journal and are released after acknowledgment.
 Private permission requests, form requests, URL interactions, and replies remain
 in memory. Explicit resume keeps the Tower session ID and creates a fresh execution
-generation; an uncertain old execution blocks replacement unless its owner
-explicitly approves that overlap through Allgather.
+generation. Ordinary resume refuses an active or uncertain prior execution.
+Use Allgather's `session resume --force` to stop and clean the exact old
+executions before resuming. This requires `session-force-resume.v1` on both
+sides. If ownership or termination cannot be confirmed, cleanup fails and no
+replacement starts. Force resume preserves native history and never kills the
+shared Codex host. Codex must have confirmed resumable history; ephemeral
+threads are refused before cleanup. Terminal mode does not support resume. The former uncertain
+overlap override is no longer accepted.
 
 Both sides must advertise `policy-sync.v1` and `session-status.v1`. Policy snapshots
 atomically replace only the remote table; stale/conflicting revisions are rejected.
