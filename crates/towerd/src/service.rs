@@ -226,7 +226,7 @@ impl Service {
             startup: startup.into(),
             retention_ms,
             allgather_config: crate::allgather::Config::load(&paths)?,
-            pending_enrollments: Mutex::new(BTreeMap::new()),
+            pending_enrollments: Mutex::new(crate::allgather::enrollment::load(&paths)?),
             connected: std::sync::atomic::AtomicBool::new(false),
             remote_epoch: std::sync::atomic::AtomicU64::new(0),
             policy_epoch: std::sync::atomic::AtomicU64::new(0),

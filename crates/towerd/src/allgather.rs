@@ -160,71 +160,93 @@ pub fn configured_url(paths: &tower_pal::Paths) -> Result<String> {
 pub fn enrollment_url(input: &str) -> Result<String> {
     Ok(enrollment::socket_url(&enrollment::origin(input)?))
 }
+pub fn validate_pairing_code(input: &str) -> Result<()> {
+    if enrollment::valid_pairing_secret(input) {
+        Ok(())
+    } else {
+        Err(Error::Other(
+            "Pairing code must be an unpadded base64url encoding of 32 bytes".into(),
+        ))
+    }
+}
 pub(super) fn start(
     paths: tower_pal::Paths,
     worker: ServiceWorker,
 ) -> Result<tokio::task::JoinHandle<()>> {
     let config = Config::load(&paths)?;
     Ok(tokio::spawn(async move {
-        let mut delay = Duration::from_millis(500);
-        let mut blocked_key = None;
-        loop {
-            let _ = enrollment::recover_confirmation(&paths).await;
-            let mut config = config.clone();
-            if let Ok(binding) = tower_pal::read_private(&paths.state.join("allgather-server"))
-                && let Ok(url) = String::from_utf8(binding)
-            {
-                config.url = url;
+        let confirmation_worker = worker.clone();
+        let confirmations = async move {
+            loop {
+                let _ = confirmation_worker.recover_enrollment().await;
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
-            let key = tower_pal::read_private(&paths.state.join("allgather.key"))
-                .ok()
-                .and_then(|b| String::from_utf8(b).ok());
-            let hello = worker
-                .execute(|s| s.sync_hello())
-                .await
-                .ok()
-                .and_then(std::result::Result::ok)
-                .flatten();
-            if let (Some(key), Some(hello)) = (key, hello)
-                && blocked_key.as_ref() != Some(&key)
-                && config.validate().is_ok()
-                && tower_pal::read_private(&paths.state.join("allgather-server"))
-                    .is_ok_and(|b| b == config.url.as_bytes())
-            {
-                let outcome = connection(&paths, &config, &key, hello, worker.clone()).await;
-                let _ = worker.execute(|s| s.sync_connected(false)).await;
-                if let Err(error) = &outcome {
-                    let code = match error {
-                        Error::Rpc(e) if e.data.code == "protocol_incompatible" => {
-                            "protocol_incompatible"
-                        }
-                        Error::Rpc(e) if e.data.code == "sync_frame_too_large" => {
-                            "sync_frame_too_large"
-                        }
-                        Error::Rpc(e) if e.data.code == "sync_record_limit" => "sync_record_limit",
-                        Error::Rpc(e) if e.data.code == "sync_ack_timeout" => "sync_ack_timeout",
-                        _ => "connection_failed",
-                    };
-                    let failed_key = Secret(key.clone());
-                    let _ = worker
-                        .execute(move |s| s.sync_error(&failed_key, code))
-                        .await;
+        };
+        let connections = async move {
+            let mut delay = Duration::from_millis(500);
+            let mut blocked_key = None;
+            loop {
+                let mut config = config.clone();
+                if let Ok(binding) = tower_pal::read_private(&paths.state.join("allgather-server"))
+                    && let Ok(url) = String::from_utf8(binding)
+                {
+                    config.url = url;
                 }
-                if outcome.as_ref().is_err_and(
-                    |e| matches!(e,Error::Rpc(e) if e.data.code=="protocol_incompatible"),
-                ) {
-                    blocked_key = Some(key);
+                let key = tower_pal::read_private(&paths.state.join("allgather.key"))
+                    .ok()
+                    .and_then(|b| String::from_utf8(b).ok());
+                let hello = worker
+                    .execute(|s| s.sync_hello())
+                    .await
+                    .ok()
+                    .and_then(std::result::Result::ok)
+                    .flatten();
+                if let (Some(key), Some(hello)) = (key, hello)
+                    && blocked_key.as_ref() != Some(&key)
+                    && config.validate().is_ok()
+                    && tower_pal::read_private(&paths.state.join("allgather-server"))
+                        .is_ok_and(|b| b == config.url.as_bytes())
+                {
+                    let outcome = connection(&paths, &config, &key, hello, worker.clone()).await;
+                    let _ = worker.execute(|s| s.sync_connected(false)).await;
+                    if let Err(error) = &outcome {
+                        let code = match error {
+                            Error::Rpc(e) if e.data.code == "protocol_incompatible" => {
+                                "protocol_incompatible"
+                            }
+                            Error::Rpc(e) if e.data.code == "sync_frame_too_large" => {
+                                "sync_frame_too_large"
+                            }
+                            Error::Rpc(e) if e.data.code == "sync_record_limit" => {
+                                "sync_record_limit"
+                            }
+                            Error::Rpc(e) if e.data.code == "sync_ack_timeout" => {
+                                "sync_ack_timeout"
+                            }
+                            _ => "connection_failed",
+                        };
+                        let failed_key = Secret(key.clone());
+                        let _ = worker
+                            .execute(move |s| s.sync_error(&failed_key, code))
+                            .await;
+                    }
+                    if outcome.as_ref().is_err_and(
+                        |e| matches!(e,Error::Rpc(e) if e.data.code=="protocol_incompatible"),
+                    ) {
+                        blocked_key = Some(key);
+                    }
+                    if outcome.is_ok() {
+                        delay = Duration::from_millis(500);
+                    } else {
+                        delay = (delay * 2).min(Duration::from_secs(30));
+                    }
+                    tokio::time::sleep(delay).await;
+                    continue;
                 }
-                if outcome.is_ok() {
-                    delay = Duration::from_millis(500);
-                } else {
-                    delay = (delay * 2).min(Duration::from_secs(30));
-                }
-                tokio::time::sleep(delay).await;
-                continue;
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
+        };
+        tokio::select! { _=confirmations=>{}, _=connections=>{} }
     }))
 }
 fn encode<T: Serialize>(value: &T) -> Result<String> {

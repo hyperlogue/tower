@@ -85,11 +85,15 @@ impl Service {
         })
     }
     pub(super) fn remote_scopes(&self) -> std::result::Result<Vec<String>, RpcError> {
-        let consent = tower_pal::read_private(&self.paths.state.join("allgather-consent.json"))
-            .ok()
-            .and_then(|bytes| {
-                serde_json::from_slice::<crate::allgather::enrollment::Consent>(&bytes).ok()
-            });
+        let consent =
+            match tower_pal::read_private(&self.paths.state.join("allgather-consent.json")) {
+                Ok(bytes) => Some(
+                    serde_json::from_slice::<crate::allgather::enrollment::Consent>(&bytes)
+                        .map_err(|_| app("unauthorized", "Invalid stored pairing consent"))?,
+                ),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(_) => return Err(app("unauthorized", "Cannot read stored pairing consent")),
+            };
         if let Some(consent) = consent {
             let bound = tower_pal::read_private(&self.paths.state.join("allgather-server"))
                 .ok()
@@ -103,6 +107,10 @@ impl Service {
                     .filter(|scope| self.allgather_config.permits_scope(scope))
                     .collect());
             }
+            return Err(app(
+                "unauthorized",
+                "Stored pairing consent does not match this enrollment",
+            ));
         }
         Ok(self
             .allgather_config
@@ -434,13 +442,11 @@ impl Service {
         }
         let p: Login = params(&request.params)?;
         let url = p.url.unwrap_or_else(|| self.allgather_config.url.clone());
+        self.validate_enrollment(&p.key, &url)?;
+        self.clear_enrollment_attempts()?;
         self.save_enrollment(&p.key, &url)?;
-        self.pending_enrollments
-            .lock()
-            .map_err(|_| app("internal_error", "Enrollment state unavailable"))?
-            .clear();
-        tower_pal::remove_private(&self.paths.state.join("allgather-enrollment.json"))
-            .map_err(|_| app("internal_error", "Cannot clear pending enrollment"))?;
+        tower_pal::remove_private(&self.paths.state.join("allgather-consent.json"))
+            .map_err(|_| app("internal_error", "Cannot clear enrollment consent"))?;
         value(
             serde_json::json!({"mode":"allgather","connected":false,"policy_pending":!self.policy_ready()}),
         )
@@ -461,15 +467,19 @@ impl Service {
         }
         Ok(())
     }
+    fn validate_enrollment(&self, key: &Secret, url: &str) -> std::result::Result<(), RpcError> {
+        self.check_enrollment_origin(url)?;
+        if key.0.is_empty() || key.0.len() > 4096 || key.0.chars().any(char::is_control) {
+            return Err(invalid("Invalid machine credential"));
+        }
+        Ok(())
+    }
     pub(super) fn save_enrollment(
         &self,
         key: &Secret,
         url: &str,
     ) -> std::result::Result<(), RpcError> {
-        self.check_enrollment_origin(url)?;
-        if key.0.is_empty() || key.0.len() > 4096 || key.0.chars().any(char::is_control) {
-            return Err(invalid("Invalid machine credential"));
-        }
+        self.validate_enrollment(key, url)?;
         let standalone = self.store.host().map_err(storage)?.mode != "allgather";
         self.sync_connected(false)?;
         self.store
@@ -485,15 +495,12 @@ impl Service {
         Ok(())
     }
     pub(crate) fn sync_logout(&self) -> std::result::Result<(), RpcError> {
-        self.pending_enrollments
-            .lock()
-            .map_err(|_| app("internal_error", "Enrollment state unavailable"))?
-            .clear();
-        tower_pal::remove_private(&self.paths.state.join("allgather-enrollment.json"))
-            .map_err(|_| app("internal_error", "Cannot clear pending enrollment"))?;
+        self.clear_enrollment_attempts()?;
+        self.sync_connected(false)?;
         tower_pal::remove_private(&self.paths.state.join("allgather.key"))
             .map_err(|_| app("internal_error", "Cannot remove access key"))?;
-        self.sync_connected(false)?;
+        tower_pal::remove_private(&self.paths.state.join("allgather-consent.json"))
+            .map_err(|_| app("internal_error", "Cannot clear enrollment consent"))?;
         tower_pal::remove_private(&self.paths.state.join("allgather-connection.json"))
             .map_err(|_| app("internal_error", "Cannot clear connection status"))?;
         self.store

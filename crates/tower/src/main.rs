@@ -173,21 +173,27 @@ enum Command {
     Unregister(CredentialArgs),
     Whoami,
     Login {
+        #[arg(required_unless_present = "key_stdin")]
         url: Option<String>,
+        #[arg(
+            required_unless_present = "key_stdin",
+            conflicts_with = "key_stdin",
+            allow_hyphen_values = true,
+            help = "Short-lived code created by the owner in the private web app"
+        )]
+        pairing_code: Option<String>,
         #[arg(long, help = "Read a pre-issued machine access key from stdin")]
         key_stdin: bool,
         #[arg(
             long,
             conflicts_with = "key_stdin",
-            help = "Use browser machine enrollment (the default)"
+            help = "Suggested node display name"
         )]
-        browser: bool,
-        #[arg(long, help = "Suggested node display name; editable in the browser")]
         name: Option<String>,
         #[arg(
             long,
             conflicts_with = "key_stdin",
-            help = "Do not request remote ACP control"
+            help = "Request read-only machine access"
         )]
         read_only: bool,
     },
@@ -561,6 +567,13 @@ fn execute(cli: Cli) -> Result<()> {
     result
 }
 async fn run(cli: Cli, paths: Paths) -> Result<()> {
+    if let Command::Login {
+        pairing_code: Some(code),
+        ..
+    } = &cli.command
+    {
+        towerd::allgather::validate_pairing_code(code)?;
+    }
     if matches!(cli.command, Command::Mcp { command: None }) {
         return mcp::serve(paths, context()?, !cli.no_start).await;
     }
@@ -588,8 +601,8 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
     match cli.command {
         Command::Login {
             url,
+            pairing_code,
             key_stdin,
-            browser: _,
             name,
             read_only,
         } => {
@@ -612,33 +625,48 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
                         .await?,
                 )?;
             } else {
-                let started = serde_json::to_value(
-                    client
-                        .call(
-                            "allgather.enrollment.begin",
-                            &serde_json::json!({"url":url,"node_label":name,"read_only":read_only}),
-                        )
-                        .await?,
-                )?;
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
+                let params = serde_json::json!({"url":url,"pairing_code":pairing_code,"node_label":name,"read_only":read_only});
+                let started = loop {
+                    match client.call("allgather.enrollment.begin", &params).await {
+                        Ok(result) => break serde_json::to_value(result)?,
+                        Err(towerd::Error::Rpc(e))
+                            if matches!(
+                                e.data.code.as_str(),
+                                "enrollment_unavailable" | "rate_limited"
+                            ) => {}
+                        Err(towerd::Error::Io(_)) => {
+                            client = Client::connect(&paths, context()?, !cli.no_start).await?;
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(
+                            "Pairing attempt expired; obtain a new code from the owner".into()
+                        );
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                };
                 let id = started["id"]
                     .as_str()
                     .ok_or("Enrollment did not return an identity")?
                     .to_owned();
                 eprintln!(
-                    "Open {}\nAuthorize this machine and choose its name in the browser.",
+                    "Pairing status: {}",
                     started["authorization_url"]
                         .as_str()
-                        .ok_or("Enrollment did not return a browser URL")?
+                        .ok_or("Pairing did not return an owner status URL")?
                 );
                 if cli.json {
                     print_json(&started)?;
                 }
-                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
                 let mut interval = started["interval"].as_u64().unwrap_or(5).clamp(1, 30);
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
                     if tokio::time::Instant::now() >= deadline {
-                        return Err("Browser authorization expired; run tower login again".into());
+                        return Err(
+                            "Pairing attempt expired; obtain a new code from the owner".into()
+                        );
                     }
                     let polled = match client
                         .call("allgather.enrollment.poll", &serde_json::json!({"id":id}))
@@ -653,6 +681,10 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
                         {
                             continue;
                         }
+                        Err(towerd::Error::Io(_)) => {
+                            client = Client::connect(&paths, context()?, !cli.no_start).await?;
+                            continue;
+                        }
                         Err(error) => return Err(error.into()),
                     };
                     interval = polled["interval"].as_u64().unwrap_or(interval).clamp(1, 30);
@@ -662,13 +694,13 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
                             break;
                         }
                         Some("pending" | "authorized") => {}
-                        Some("denied") => return Err("Browser authorization was denied".into()),
+                        Some("denied") => return Err("Pairing was denied".into()),
                         Some("expired") => {
                             return Err(
-                                "Browser authorization expired; run tower login again".into()
+                                "Pairing attempt expired; obtain a new code from the owner".into(),
                             );
                         }
-                        _ => return Err("Unexpected browser enrollment state".into()),
+                        _ => return Err("Unexpected pairing state".into()),
                     }
                 }
             }
@@ -1250,6 +1282,77 @@ fn visible(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn login_requires_a_code_and_keeps_manual_keys_separate() {
+        for code in [
+            "A".repeat(43),
+            format!("-{}", "A".repeat(42)),
+            format!("--{}", "A".repeat(41)),
+        ] {
+            let cli = Cli::try_parse_from([
+                "tower-cli",
+                "login",
+                "https://allgather.example",
+                &code,
+                "--read-only",
+            ])
+            .unwrap();
+            assert!(
+                matches!(cli.command, Command::Login { pairing_code:Some(value), key_stdin:false, read_only:true, .. } if value == code)
+            );
+            let error = Cli::try_parse_from([
+                "tower-cli",
+                "login",
+                "https://allgather.example",
+                &code,
+                "--key-stdin",
+            ])
+            .err()
+            .unwrap();
+            assert!(!error.to_string().contains(&code));
+        }
+        assert!(Cli::try_parse_from(["tower-cli", "login", "https://allgather.example"]).is_err());
+        for args in [
+            vec!["tower-cli", "login", "--key-stdin"],
+            vec![
+                "tower-cli",
+                "login",
+                "https://allgather.example",
+                "--key-stdin",
+            ],
+            vec![
+                "tower-cli",
+                "login",
+                "--key-stdin",
+                "https://allgather.example",
+            ],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(matches!(
+                cli.command,
+                Command::Login {
+                    key_stdin: true,
+                    pairing_code: None,
+                    ..
+                }
+            ));
+        }
+        let old = Cli::try_parse_from([
+            "tower-cli",
+            "login",
+            "https://allgather.example",
+            "--browser",
+        ])
+        .unwrap();
+        let Command::Login {
+            pairing_code: Some(code),
+            ..
+        } = old.command
+        else {
+            panic!()
+        };
+        assert!(towerd::allgather::validate_pairing_code(&code).is_err());
+    }
     #[test]
     fn malformed_identity_environment_never_disappears_into_human_context() {
         for bad in [

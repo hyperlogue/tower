@@ -201,16 +201,21 @@ impl ServiceWorker {
                 ))
             })?;
         if request.method == "allgather.enrollment.begin" {
-            let plan = self
+            let plan = match self
                 .execute(move |s| s.enrollment_plan(&request, peer))
-                .await??;
+                .await??
+            {
+                Ok(plan) => plan,
+                Err(started) => return Ok(Ok(started)),
+            };
             let started = crate::allgather::enrollment::begin(&plan)
                 .await
-                .map_err(|_| {
-                    Error::Rpc(tower_protocol::RpcError::application(
+                .map_err(|error| match error {
+                    Error::Rpc(error) => Error::Rpc(error),
+                    _ => Error::Rpc(tower_protocol::RpcError::application(
                         "enrollment_unavailable",
-                        "Cannot start enrollment at this Allgather server",
-                    ))
+                        "Cannot start pairing at this private Allgather origin",
+                    )),
                 })?;
             return self
                 .execute(move |s| s.remember_enrollment(plan, started))
@@ -224,7 +229,10 @@ impl ServiceWorker {
             Err(result) => return Ok(Ok(result)),
         };
         let polled = crate::allgather::enrollment::poll(&pending).await;
-        let id = pending.started.enrollment_id;
+        let id = pending
+            .started
+            .ok_or_else(|| Error::Other("Pairing has not started".into()))?
+            .enrollment_id;
         let (result, confirmation) = self
             .execute(move |s| s.finish_enrollment_poll(&id, polled))
             .await??;
@@ -238,6 +246,22 @@ impl ServiceWorker {
                 .await;
         }
         Ok(Ok(result))
+    }
+    pub(crate) async fn recover_enrollment(&self) -> Result<()> {
+        let _permit = self
+            .enrollment_gate
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::Other("Enrollment workers are busy".into()))?;
+        if let Some(confirmation) = self
+            .execute(|s| s.pending_enrollment_confirmation())
+            .await??
+        {
+            crate::allgather::enrollment::confirm(&confirmation).await?;
+            self.execute(move |s| s.confirm_enrollment(&confirmation))
+                .await??;
+        }
+        Ok(())
     }
     pub async fn remote(
         &self,

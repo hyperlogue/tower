@@ -8,6 +8,217 @@ use std::{
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn pairing_retries_lost_create_and_confirm_across_cli_and_daemon_restart() {
+    use sha2::Digest;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+    const CODE: &str = "-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    const POLL: &str = "polling-secret-for-fixture";
+    const KEY: &str = "access-secret-for-fixture";
+    let f = Fixture::new();
+    let config = f.dir.path().join("config/tower");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("config.toml"),
+        "[scan]\nenabled=false\n[allgather]\nscopes=['read','send']\n",
+    )
+    .unwrap();
+    let state = f.dir.path().join("state/tower");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let creates = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+    let confirmations = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let first_create = Arc::new(tokio::sync::Notify::new());
+    let first_confirm = Arc::new(tokio::sync::Notify::new());
+    let confirmed = Arc::new(AtomicBool::new(false));
+    let allow_create = Arc::new(AtomicBool::new(false));
+    let allow_confirm = Arc::new(AtomicBool::new(false));
+    let (create_allowed, confirm_allowed) = (allow_create.clone(), allow_confirm.clone());
+    let (seen_creates, seen_confirms) = (creates.clone(), confirmations.clone());
+    let (create_signal, confirm_signal) = (first_create.clone(), first_confirm.clone());
+    let (server_origin, server_state) = (origin.clone(), state.clone());
+    let server = tokio::spawn(async move {
+        loop {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            if reader.read_line(&mut line).await.unwrap() == 0 {
+                continue;
+            }
+            let path = line.split_whitespace().nth(1).unwrap().to_owned();
+            let mut length = 0usize;
+            let mut authorization = String::new();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).await.unwrap() == 0 || line == "\r\n" {
+                    break;
+                }
+                if let Some((name, value)) = line.split_once(':') {
+                    match name.to_ascii_lowercase().as_str() {
+                        "content-length" => length = value.trim().parse().unwrap(),
+                        "authorization" => authorization = value.trim().into(),
+                        _ => {}
+                    }
+                }
+            }
+            assert!(length <= 8192);
+            let mut body = vec![0; length];
+            reader.read_exact(&mut body).await.unwrap();
+            let response = match path.as_str() {
+                "/api/tower/enrollments" => {
+                    let value: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(value["pairing_code"], CODE);
+                    assert_eq!(value["requested_scopes"], json!(["read", "send"]));
+                    let id = value["request_id"].as_str().unwrap();
+                    assert_eq!(id.len(), 43);
+                    let file = server_state.join("allgather-pairing.json");
+                    let saved: Value =
+                        serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+                    assert_eq!(saved[id]["plan"]["pairing_code"], CODE);
+                    assert_eq!(saved[id]["plan"]["host_id"], value["host_id"]);
+                    assert_eq!(saved[id]["plan"]["tower_version"], value["tower_version"]);
+                    assert_eq!(
+                        std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                        0o600
+                    );
+                    let first = {
+                        let mut requests = seen_creates.lock().unwrap();
+                        requests.push(body);
+                        requests.len() == 1
+                    };
+                    if first {
+                        create_signal.notify_one();
+                    }
+                    if !create_allowed.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    json!({"enrollment_id":"pairing-fixture","authorization_url":format!("{server_origin}/tower/enroll/pairing-fixture"),"polling_token":POLL,"expires_at":"2099-01-01T00:00:00Z","interval":1})
+                }
+                "/api/tower/enrollments/pairing-fixture/poll" => {
+                    assert_eq!(authorization, format!("Bearer {POLL}"));
+                    if confirmed.load(Ordering::SeqCst) {
+                        json!({"state":"confirmed","interval":1})
+                    } else {
+                        json!({"state":"approved","machine_id":"machine-fixture","credential_id":"credential-fixture","access_key":KEY,"node_label":"Fixture","scopes":["read","send"],"interval":1})
+                    }
+                }
+                "/api/tower/enrollments/pairing-fixture/confirm" => {
+                    assert_eq!(authorization, format!("Bearer {POLL}"));
+                    let value: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(
+                        std::fs::read(server_state.join("allgather.key")).unwrap(),
+                        KEY.as_bytes()
+                    );
+                    let expected = sha2::Sha256::digest(KEY.as_bytes())
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>();
+                    assert_eq!(value["access_key_hash"], expected);
+                    assert_eq!(value["credential_id"], "credential-fixture");
+                    let first = {
+                        let mut requests = seen_confirms.lock().unwrap();
+                        requests.push(value);
+                        requests.len() == 1
+                    };
+                    confirmed.store(true, Ordering::SeqCst);
+                    if first {
+                        confirm_signal.notify_one();
+                    }
+                    if !confirm_allowed.load(Ordering::SeqCst) {
+                        continue;
+                    }
+                    json!({"state":"confirmed","machine_id":"machine-fixture","credential_id":"credential-fixture"})
+                }
+                _ => json!({"error":{"code":"fixture_unavailable"}}),
+            };
+            let body = serde_json::to_vec(&response).unwrap();
+            let status = if path == "/tower" {
+                "503 Service Unavailable"
+            } else {
+                "200 OK"
+            };
+            let header = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let mut stream = reader.into_inner();
+            let _ = stream.write_all(header.as_bytes()).await;
+            let _ = stream.write_all(&body).await;
+        }
+    });
+    let launch = || {
+        tokio::process::Command::from(f.command(&["--json", "login", &origin, CODE]))
+            .kill_on_drop(true)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let private_output = |out: &Output| {
+        let visible = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        for secret in [CODE, POLL, KEY] {
+            assert!(!visible.contains(secret));
+        }
+    };
+    let mut first = launch();
+    tokio::time::timeout(Duration::from_secs(20), first_create.notified())
+        .await
+        .unwrap();
+    first.kill().await.unwrap();
+    private_output(&first.wait_with_output().await.unwrap());
+    f.stop();
+    allow_create.store(true, Ordering::SeqCst);
+    let mut second = launch();
+    tokio::time::timeout(Duration::from_secs(20), first_confirm.notified())
+        .await
+        .unwrap();
+    second.kill().await.unwrap();
+    private_output(&second.wait_with_output().await.unwrap());
+    f.stop();
+    let creates_before_final_restart = creates.lock().unwrap().len();
+    allow_confirm.store(true, Ordering::SeqCst);
+    let third = launch();
+    let completed = tokio::time::timeout(Duration::from_secs(25), third.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        completed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&completed.stderr)
+    );
+    private_output(&completed);
+    assert!(String::from_utf8_lossy(&completed.stdout).contains("\"complete\""));
+    let requests = creates.lock().unwrap();
+    assert!(requests.len() >= 2);
+    assert_eq!(requests.len(), creates_before_final_restart);
+    assert!(requests.iter().all(|r| r == &requests[0]));
+    drop(requests);
+    let confirms = confirmations.lock().unwrap();
+    assert!(confirms.len() >= 2);
+    assert!(confirms.iter().all(|c| c == &confirms[0]));
+    drop(confirms);
+    let persisted = std::fs::read_to_string(state.join("allgather-pairing.json")).unwrap();
+    assert!(!persisted.contains(CODE));
+    assert!(!persisted.contains(POLL));
+    assert!(!persisted.contains(KEY));
+    assert_eq!(
+        std::fs::read(state.join("allgather.key")).unwrap(),
+        KEY.as_bytes()
+    );
+    f.stop();
+    server.abort();
+}
+
 struct Fixture {
     dir: tempfile::TempDir,
     child: Option<Child>,

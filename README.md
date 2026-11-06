@@ -8,7 +8,7 @@ Managed launchers support Claude Code, Codex, Reasonix, Kimi Code, Grok Build,
 opencode, Pi, Antigravity, and omp. Codex uses one host app-server shared by its sessions.
 The public interface is Tower's JSON-RPC API; Miao clients need a Tower adapter.
 Native Claude/Codex messages, approvals, process discovery, MCP, loopback HTTP/SSE,
-and Allgather status/policy synchronization are available. Allgather supports browser enrollment, incremental state and policy synchronization,
+and Allgather status/policy synchronization are available. Allgather supports owner-initiated pairing, incremental state and policy synchronization,
 and managed sessions for Codex, Claude Code, and Antigravity. Image clipboard
 sharing uses a separate opt-in provider connection.
 
@@ -479,16 +479,27 @@ retry delivery. Webhooks require HTTPS except on loopback.
 
 ## Allgather
 
-Start enrollment from the machine that will run the agents:
+Create a pairing invitation in Allgather's private owner web app. Choose its
+maximum scopes and optional node name, then use the short-lived code on the
+machine that will run the agents:
 
 ```sh
-tower-cli login https://allgather.example
+tower-cli login https://allgather.example "$PAIRING_CODE"
 ```
 
-Open the printed URL, authorize the machine, and optionally set its name. The CLI
-waits for approval and saves the machine credential. This also works over SSH;
-the browser does not need to run on the agent machine. Use `--name NAME` to suggest
-a name or `--read-only` to request only the read scope.
+Use the private owner origin, not the public MCP/OAuth listener. The invitation
+is the owner's consent; no second browser approval is needed. Control scopes
+must be selected explicitly in the invitation and permitted by local configuration.
+The CLI saves the machine credential before confirming receipt and prints a
+private status URL containing no secrets. This also works over SSH. Use
+`--name NAME` to suggest a name or `--read-only` to request only the read scope.
+
+Tower saves each create request privately before sending it. If login is
+interrupted, repeat the same command and options: Tower reuses its saved request
+ID and body. A changed origin, host, scope selection, or name requires a new
+invitation. Pairing without a code is rejected. Pairing and polling secrets are
+removed from the saved attempt after confirmation; the machine credential
+remains in the private state directory.
 
 ```sh
 tower-cli rpc allgather.status
@@ -507,8 +518,8 @@ scopes = ["read", "send", "acp:control"]
 ```
 
 To allow Allgather to launch interactive agent terminals, add the literal
-`terminal:control` scope, restart the Tower daemon, and run browser enrollment
-again to approve it:
+`terminal:control` scope, restart the Tower daemon, and pair again with an owner
+invitation that permits it:
 
 ```toml
 [allgather]
@@ -522,7 +533,7 @@ prompt, reply, configuration, and resume are unsupported for this mode. Codex
 terminals use the configured shared app-server. No shell command, environment,
 or per-session endpoint can be supplied through this launch interface.
 
-Terminal launch requires both local configuration and browser consent; `admin`,
+Terminal launch requires both local configuration and invitation consent; `admin`,
 `send`, and `acp:control` do not grant it. `[allgather] managed = false` disables
 both remote launch modes. Terminal lifecycle events contain no PTY output or
 transcript. A surviving pool session retains its identity across daemon restart;

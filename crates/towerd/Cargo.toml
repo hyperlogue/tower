@@ -25,6 +25,8 @@ thiserror.workspace = true
 sha2.workspace = true
 subtle.workspace = true
 getrandom.workspace = true
+base64 = "0.22"
+time = { version = "0.3", features = ["parsing"] }
 
 axum = "0.8"
 async-stream = "0.3"
