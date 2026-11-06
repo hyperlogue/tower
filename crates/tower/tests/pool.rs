@@ -289,13 +289,19 @@ fn final_output_and_exit_are_delivered_and_snapshots_exclude_clipboard() {
 #[test]
 fn kill_reaps_child_and_terminates_its_process_group() {
     let p = Pool::new();
-    p.launch("group", "sleep 600 & echo $! > grandchild; wait", true);
-    wait(|| p.dir.path().join("grandchild").exists());
-    let pid: u32 = std::fs::read_to_string(p.dir.path().join("grandchild"))
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
+    p.launch(
+        "group",
+        "sleep 600 & child=$!; : > grandchild; sleep 0.05; echo $child > grandchild; wait",
+        true,
+    );
+    let mut pid = None;
+    wait(|| {
+        pid = std::fs::read_to_string(p.dir.path().join("grandchild"))
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok());
+        pid.is_some()
+    });
+    let pid = pid.unwrap();
     let identity = tower_pal::process_identity(pid).unwrap();
     p.call(Request::Kill {
         name: "group".into(),
