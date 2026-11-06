@@ -148,6 +148,30 @@ async fn force_resume_stops_exact_owners_and_preserves_native_history_and_other_
         assert_eq!(active["pid"], unrelated_pid);
         assert_ne!(active["status"], "exited");
         f.cli(&["kill", next["tower_session_id"].as_str().unwrap()]);
+        s.until(|v| {
+            v["method"] == "runtime.lost"
+                && v["params"]["runtime_id"] == new
+                && v["params"]["termination"] == "confirmed"
+        })
+        .await;
+        let stopped_resume = format!("stopped-{harness}");
+        let mut empty = resume(&f, harness, protocol, &old, &stopped_resume, native);
+        empty["payload"]["cleanup"] = json!([]);
+        let receipt = s.call("command.execute", empty.clone()).await;
+        assert_eq!(
+            receipt["result"]["acceptance"]["level"], "adapter",
+            "{receipt}"
+        );
+        let restarted = ready(&s, &stopped_resume).await;
+        complete(&s, &format!("resume-{stopped_resume}")).await;
+        assert_eq!(restarted["tower_session_id"], first["tower_session_id"]);
+        assert_eq!(restarted["native_session_id"], first["native_session_id"]);
+        assert_ne!(restarted["owner_id"], next["owner_id"]);
+        assert_eq!(
+            s.call("command.execute", empty).await["result"]["dispatch"]["state"],
+            "finished"
+        );
+        f.cli(&["kill", restarted["tower_session_id"].as_str().unwrap()]);
         let log = std::fs::read_to_string(f.root.path().join("dispatches")).unwrap();
         assert!(!log.contains("must-not-run"));
         assert!(

@@ -112,7 +112,7 @@ pub fn force_resume(
     let invalid = || {
         tower_protocol::RpcError::application(
             "invalid_params",
-            "Force resume requires a fixed list of 1 to 32 distinct cleanup targets",
+            "Force resume requires a fixed list of at most 32 distinct cleanup targets",
         )
     };
     if p.get("takeover").is_some() {
@@ -138,8 +138,7 @@ pub fn force_resume(
     let targets: Vec<Target> =
         serde_json::from_value(p["cleanup"].clone()).map_err(|_| invalid())?;
     let mut ids = std::collections::BTreeSet::new();
-    if targets.is_empty()
-        || targets.len() > 32
+    if targets.len() > 32
         || targets.iter().any(|t| {
             t.runtime_id == command.runtime_id
                 || !ids.insert(t.runtime_id.clone())

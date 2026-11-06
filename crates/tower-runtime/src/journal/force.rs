@@ -300,6 +300,52 @@ mod tests {
         (b, c)
     }
     #[test]
+    fn empty_cleanup_requires_all_previous_executions_stopped() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("runtime.db");
+        let j = Journal::open(&path, Limits::default()).unwrap();
+        let old = binding("old");
+        j.admit(&old, &command(&old, "first", "launch", json!({})))
+            .unwrap();
+        let (b, mut c) = replacement(&old);
+        let mut payload = serde_json::to_value(&c.payload).unwrap();
+        payload["cleanup"] = json!([]);
+        c.payload = serde_json::from_value(payload).unwrap();
+        for fenced in [false, true] {
+            if fenced {
+                j.fence(&old, "owner_lost", "unknown").unwrap();
+            }
+            assert_eq!(
+                j.validate_new(&b, &c).unwrap_err().data.code,
+                "cleanup_target_conflict"
+            );
+            assert_eq!(
+                j.admit(&b, &c).unwrap_err().data.code,
+                "cleanup_target_conflict"
+            );
+            assert_eq!(j.state(&old).unwrap().1, fenced);
+            assert!(
+                j.binding(&b.namespace(), &b.runtime_id, &b.generation)
+                    .is_err()
+            );
+            assert!(j.force_phase(&b).unwrap().is_none());
+        }
+        j.fence(&old, "stopped", "confirmed").unwrap();
+        j.validate_new(&b, &c).unwrap();
+        j.admit(&b, &c).unwrap();
+        drop(j);
+        let j = Journal::open(&path, Limits::default()).unwrap();
+        assert!(j.force_targets(&b, &c.command_id).unwrap().is_empty());
+        assert_eq!(
+            j.force_command(&b).unwrap().unwrap().command_id,
+            c.command_id
+        );
+        j.force_ready(&b, &c).unwrap();
+        assert!(j.begin_dispatch(&b, &c.command_id).unwrap());
+        assert!(!j.begin_dispatch(&b, &c.command_id).unwrap());
+        assert_eq!(j.state(&old).unwrap().2, "confirmed");
+    }
+    #[test]
     fn cleanup_is_atomic_recoverable_and_required_before_launch() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("runtime.db");
