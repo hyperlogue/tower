@@ -219,8 +219,12 @@ history and a `limited` flag for unsupported terminal behavior. The current boun
 are 10,000 history lines and 16 MiB of retained cells per session. The pool accepts
 up to 64 sessions, 16 clients per session, and terminal sizes up to 512 columns by
 256 rows. Stopped terminal buffers can be evicted when the pool fills; SQLite
-retains ended-session metadata for 30 days by default. Raw OSC 52 clipboard reads
-and writes are blocked, including during reattach.
+retains ended-session metadata for 30 days by default. Attached terminals receive
+only allowlisted OSC, DCS, and APC strings: titles, colors, hyperlinks,
+notifications, shell integration, and inline images (sixel, kitty, and iTerm2).
+Clipboard access, file transfer, key redefinition, and terminal remote control
+are blocked, including during reattach. Output is forwarded as UTF-8 without C1
+controls; invalid bytes become U+FFFD.
 
 Image clipboard access uses an opt-in provider connection. The provider runs on
 the computer that owns the clipboard. For example, with a local Wayland desktop:

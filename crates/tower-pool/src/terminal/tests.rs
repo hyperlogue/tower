@@ -179,6 +179,9 @@ fn clipboard_sequence_variants_never_reach_the_client_stream() {
         "\u{9d}52;c;?\x07".as_bytes(),
         "\x1b]0;x\u{9c}\u{9d}52;c;?\x07".as_bytes(),
         "\x1b[1\u{9d}52;c;?\x07".as_bytes(),
+        b"\x9d52;c;?\x07",
+        b"\x1b]0;x\x9c\x9d52;c;?\x07",
+        b"\xe2\x9d52;c;?\x07",
         b"\x1bPtmux;\x1b\x1b]52;c;?\x07\x1b\\",
         b"\x1bP\x1b]52;c;?\x07\x1b\\",
         b"\x1b]0;title\x1b]52;c;?\x07",
@@ -204,6 +207,10 @@ fn clipboard_sequence_variants_never_reach_the_client_stream() {
             });
             assert!(!clipboard, "{seq:?} forwarded {text:?}");
             assert!(
+                std::str::from_utf8(out).is_ok(),
+                "{seq:?} forwarded {text:?}"
+            );
+            assert!(
                 !text.contains("\x1b\x1b")
                     && !text.chars().any(|c| ('\u{80}'..='\u{9f}').contains(&c)),
                 "{seq:?} forwarded {text:?}"
@@ -214,15 +221,70 @@ fn clipboard_sequence_variants_never_reach_the_client_stream() {
 
 #[test]
 fn ordinary_strings_and_text_still_reach_the_client_stream() {
-    let mut t = terminal();
-    let seq = "\x1b]0;tit✜le\x07\x1b]8;;https://x\x1b\\é\x1b]520;x\x07\x1bP$q m\x1b\\";
-    assert_eq!(t.process(seq.as_bytes()).bytes, seq.as_bytes());
-    let mut t = terminal();
-    let mut out = Vec::new();
-    for byte in seq.as_bytes() {
-        out.extend(t.process(&[*byte]).bytes);
+    let data = "A".repeat(1000);
+    let images = [
+        format!("\x1bPq#0;2;0;0;0{data}\x1b\\"),
+        format!("\x1b_Gf=100,a=T;{data}\x1b\\"),
+        format!("\x1b]1337;File=name=eA==;inline=1:{data}\x07"),
+    ];
+    let mut seqs = vec![
+        "\x1b]0;tit✜le\x07\x1b]8;;https://x\x1b\\é\x1bP$q m\x1b\\\x1bP+q544e\x1b\\".into(),
+        "\x1b]133;A\x07\x1b]633;E;ls\x07\x1b]7;file://h/tmp\x1b\\\x1b]104\x07".into(),
+        "\x1b]9;done\x07\x1b]9;4;1;50\x07\x1b]99;;hi\x1b\\\x1b]777;notify;t;b\x07".into(),
+        "\x1b]1337;SetMark\x07\x1b]1337;CurrentDir=/tmp\x07\x1b]4;1;?\x07".into(),
+    ];
+    seqs.extend(images);
+    for seq in seqs {
+        let mut t = terminal();
+        assert_eq!(t.process(seq.as_bytes()).bytes, seq.as_bytes());
+        let mut t = terminal();
+        let mut out = Vec::new();
+        for byte in seq.as_bytes() {
+            out.extend(t.process(&[*byte]).bytes);
+        }
+        assert_eq!(out, seq.as_bytes());
     }
-    assert_eq!(out, seq.as_bytes());
+}
+
+#[test]
+fn strings_outside_the_allowlist_never_reach_the_client_stream() {
+    let long_params = format!("\x1b]1337;File={};inline=1:AAAA\x07", "x".repeat(600));
+    for seq in [
+        b"\x1b]1337;Copy=;aGk=\x07".as_slice(),
+        b"\x1b]1337;File=name=eA==;inline=0:AAAA\x07",
+        b"\x1b]1337;File=name=eA==:AAAA\x07",
+        b"\x1b]1337;RequestUpload=format=tgz\x07",
+        b"\x1b]5113;ac=send;id=1\x1b\\",
+        b"\x1b]50;?\x07",
+        b"\x1b]9;6;Shell(\"calc\")\x07",
+        b"\x1b]9;6\x07",
+        b"\x1b]777;preexec\x07",
+        b"\x1b]520;x\x07",
+        b"\x1b]\x07",
+        b"\x1b]P0ffffff\x07",
+        b"\x1bP@kitty-cmd{}\x1b\\",
+        b"\x1bP0;1|17/72656D6F7465\x1b\\",
+        b"\x1bPtmux;payload\x1b\\",
+        b"\x1bP1000p\x1b\\",
+        b"\x1b_Xother\x1b\\",
+        b"\x1b^privacy\x1b\\",
+        b"\x1bXstring\x1b\\",
+        b"\x1b]1337;Cop\x18",
+        long_params.as_bytes(),
+    ] {
+        let mut whole = terminal();
+        let mut split = terminal();
+        let forwarded = whole.process(seq).bytes;
+        let mut pieces = Vec::new();
+        for byte in seq {
+            pieces.extend(split.process(&[*byte]).bytes);
+        }
+        for (t, out) in [(&mut whole, forwarded), (&mut split, pieces)] {
+            let text = String::from_utf8_lossy(&out);
+            assert!(!text.contains('\x1b'), "{seq:?} forwarded {text:?}");
+            assert_eq!(t.process(b"SAFE").bytes, b"SAFE");
+        }
+    }
 }
 
 #[test]
