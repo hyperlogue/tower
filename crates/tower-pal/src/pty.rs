@@ -280,3 +280,92 @@ pub fn is_terminal() -> bool {
 pub fn terminal_resize_signal() -> io::Result<tokio::signal::unix::Signal> {
     tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
 }
+
+pub fn prompt_secret(prompt: &str, limit: usize) -> io::Result<String> {
+    use nix::poll::{PollFd, PollFlags, poll};
+    use nix::sys::signal::SigSet;
+    use std::os::fd::AsFd;
+
+    struct Restore {
+        tty: File,
+        original: Termios,
+        mask: SigSet,
+    }
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = termios::tcsetattr(&self.tty, SetArg::TCSAFLUSH, &self.original);
+            let _ = self.tty.write_all(b"\n");
+            let _ = self.mask.thread_set_mask();
+        }
+    }
+    let tty = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .map_err(|_| {
+            io::Error::other("No interactive terminal; supply the pairing code as an argument")
+        })?;
+    let original = termios::tcgetattr(&tty)?;
+    let mut hidden = original.clone();
+    hidden
+        .local_flags
+        .remove(termios::LocalFlags::ECHO | termios::LocalFlags::ECHONL);
+    let mut restore = Restore {
+        tty,
+        original,
+        mask: SigSet::thread_get_mask()?,
+    };
+    let signals = [
+        Signal::SIGINT,
+        Signal::SIGTERM,
+        Signal::SIGHUP,
+        Signal::SIGTSTP,
+    ];
+    let mut blocked = SigSet::empty();
+    for signal in signals {
+        blocked.add(signal);
+    }
+    // Call before starting worker threads. Restore the terminal before releasing
+    // pending signals, without replacing the process's signal handlers.
+    blocked.thread_block()?;
+    termios::tcsetattr(&restore.tty, SetArg::TCSANOW, &hidden)?;
+    restore.tty.write_all(prompt.as_bytes())?;
+    restore.tty.flush()?;
+    let mut bytes = Vec::new();
+    loop {
+        let mut pending: libc::sigset_t = unsafe { std::mem::zeroed() };
+        if unsafe { libc::sigpending(&mut pending) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        if signals
+            .iter()
+            .any(|signal| unsafe { libc::sigismember(&pending, *signal as i32) } == 1)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "Input cancelled",
+            ));
+        }
+        let mut fds = [PollFd::new(restore.tty.as_fd(), PollFlags::POLLIN)];
+        match poll(&mut fds, 100u16) {
+            Ok(0) | Err(nix::errno::Errno::EINTR) => continue,
+            Ok(_) => {}
+            Err(error) => return Err(error.into()),
+        }
+        let mut byte = [0];
+        if restore.tty.read(&mut byte)? == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Input cancelled",
+            ));
+        }
+        if byte[0] == b'\n' {
+            return String::from_utf8(bytes)
+                .map_err(|_| io::Error::other("Invalid input encoding"));
+        }
+        if bytes.len() == limit {
+            return Err(io::Error::other("Input exceeds limit"));
+        }
+        bytes.push(byte[0]);
+    }
+}

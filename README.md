@@ -484,8 +484,11 @@ maximum scopes and optional node name, then use the short-lived code on the
 machine that will run the agents:
 
 ```sh
-tower-cli login https://allgather.example "$PAIRING_CODE"
+tower-cli login https://allgather.example
 ```
+
+Enter the code at the hidden prompt. You can also supply it as the second
+argument when automation requires it: `tower-cli login URL "$PAIRING_CODE"`.
 
 Use the private owner origin, not the public MCP/OAuth listener. The invitation
 is the owner's consent; no second browser approval is needed. Control scopes
@@ -497,7 +500,7 @@ private status URL containing no secrets. This also works over SSH. Use
 Tower saves each create request privately before sending it. If login is
 interrupted, repeat the same command and options: Tower reuses its saved request
 ID and body. A changed origin, host, scope selection, or name requires a new
-invitation. Pairing without a code is rejected. Pairing and polling secrets are
+invitation. The server always requires a code. Pairing and polling secrets are
 removed from the saved attempt after confirmation; the machine credential
 remains in the private state directory.
 

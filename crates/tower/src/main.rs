@@ -176,10 +176,9 @@ enum Command {
         #[arg(required_unless_present = "key_stdin")]
         url: Option<String>,
         #[arg(
-            required_unless_present = "key_stdin",
             conflicts_with = "key_stdin",
             allow_hyphen_values = true,
-            help = "Short-lived code created by the owner in the private web app"
+            help = "Owner-created pairing code; prompts securely when omitted"
         )]
         pairing_code: Option<String>,
         #[arg(long, help = "Read a pre-issued machine access key from stdin")]
@@ -498,7 +497,16 @@ fn main() -> ExitCode {
         }
     }
 }
-fn execute(cli: Cli) -> Result<()> {
+fn execute(mut cli: Cli) -> Result<()> {
+    if let Command::Login {
+        pairing_code,
+        key_stdin: false,
+        ..
+    } = &mut cli.command
+        && pairing_code.is_none()
+    {
+        *pairing_code = Some(tower_pal::prompt_secret("Pairing code: ", 128)?);
+    }
     if let Command::Hook { harness, event } = &cli.command {
         if std::env::var_os("TOWER_LAUNCHER_SOCKET").is_some() {
             tower_terminal::launcher::hook(harness, event);
@@ -1283,7 +1291,7 @@ fn visible(s: &str) -> String {
 mod tests {
     use super::*;
     #[test]
-    fn login_requires_a_code_and_keeps_manual_keys_separate() {
+    fn login_accepts_an_optional_code_and_keeps_manual_keys_separate() {
         for code in [
             "A".repeat(43),
             format!("-{}", "A".repeat(42)),
@@ -1311,7 +1319,15 @@ mod tests {
             .unwrap();
             assert!(!error.to_string().contains(&code));
         }
-        assert!(Cli::try_parse_from(["tower-cli", "login", "https://allgather.example"]).is_err());
+        let cli = Cli::try_parse_from(["tower-cli", "login", "https://allgather.example"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Login {
+                pairing_code: None,
+                key_stdin: false,
+                ..
+            }
+        ));
         for args in [
             vec!["tower-cli", "login", "--key-stdin"],
             vec![

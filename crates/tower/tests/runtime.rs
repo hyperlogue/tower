@@ -8,6 +8,77 @@ use std::{
 };
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
+#[tokio::test]
+async fn login_prompt_hides_input_and_cancels_before_starting_a_daemon() {
+    for input in [
+        b"private-invalid-code\n".as_slice(),
+        b"\x03",
+        b"\x04",
+        b"\n",
+    ] {
+        let f = Fixture::new();
+        let env = f
+            .command(&[])
+            .get_envs()
+            .filter_map(|(key, value)| {
+                value.map(|v| {
+                    (
+                        key.to_string_lossy().into_owned(),
+                        v.to_string_lossy().into_owned(),
+                    )
+                })
+            })
+            .collect();
+        let mut pty = tower_pal::PtyProcess::spawn(
+            &[
+                f.binary.to_string_lossy().into_owned(),
+                "--no-start".into(),
+                "login".into(),
+                "https://allgather.example".into(),
+            ],
+            &env,
+            f.dir.path(),
+            24,
+            80,
+        )
+        .unwrap();
+        let mut output = Vec::new();
+        let mut buffer = [0; 1024];
+        while !String::from_utf8_lossy(&output).contains("Pairing code: ") {
+            let n = tokio::time::timeout(Duration::from_secs(10), pty.read(&mut buffer))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(n > 0);
+            output.extend_from_slice(&buffer[..n]);
+        }
+        assert_eq!(pty.write(input).await.unwrap(), input.len());
+        loop {
+            match tokio::time::timeout(Duration::from_secs(10), pty.read(&mut buffer))
+                .await
+                .unwrap()
+            {
+                Ok(0) | Err(_) => break,
+                Ok(n) => output.extend_from_slice(&buffer[..n]),
+            }
+        }
+        assert!(!String::from_utf8_lossy(&output).contains("private-invalid-code"));
+        if input != b"\x03" {
+            assert!(String::from_utf8_lossy(&output).contains("tower-cli:"));
+        }
+        assert!(!f.socket().exists());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(code) = pty.poll_exit().unwrap() {
+                assert_ne!(code, 0);
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn pairing_retries_lost_create_and_confirm_across_cli_and_daemon_restart() {
     use sha2::Digest;
