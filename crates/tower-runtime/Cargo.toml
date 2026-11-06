@@ -21,7 +21,6 @@ toml.workspace = true
 tokio.workspace = true
 rusqlite.workspace = true
 sha2.workspace = true
-subtle.workspace = true
 getrandom.workspace = true
 hmac = "0.13"
 jsonschema = { version = "0.60", default-features = false }
