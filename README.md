@@ -556,9 +556,10 @@ tower-cli rpc allgather.status
 tower-cli logout
 ```
 
-For automated provisioning, an Allgather owner can issue a machine key with
-`POST /api/tower/credentials`. Supply it with `tower-cli login https://allgather.example
---key-stdin`. Browser-account and CLI OAuth tokens are separate credentials.
+For automation, the owner first creates a pairing invitation in the private web
+app, then supplies its code to the target machine. `--key-stdin` can import an
+existing valid machine credential; Allgather no longer exposes a credential-mint
+endpoint. Browser-account and CLI OAuth tokens are separate credentials.
 
 Explicit configuration can restrict the scopes requested during enrollment:
 
