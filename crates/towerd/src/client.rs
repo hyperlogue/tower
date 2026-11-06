@@ -15,6 +15,30 @@ pub struct Client {
 }
 impl Client {
     pub async fn connect(paths: &Paths, context: CallerContext, autostart: bool) -> Result<Self> {
+        let mut retries = 0;
+        loop {
+            match Self::connect_once(paths, context.clone(), autostart).await {
+                Err(Error::Io(error))
+                    if autostart
+                        && retries < 2
+                        && matches!(
+                            error.kind(),
+                            io::ErrorKind::ConnectionReset
+                                | io::ErrorKind::ConnectionAborted
+                                | io::ErrorKind::BrokenPipe
+                                | io::ErrorKind::UnexpectedEof
+                        ) =>
+                {
+                    // The old listener can accept a socket while its process exits.
+                    // Only hello is retried; no application request has been sent.
+                    retries += 1;
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                result => return result,
+            }
+        }
+    }
+    async fn connect_once(paths: &Paths, context: CallerContext, autostart: bool) -> Result<Self> {
         let stream = match connect(&paths.socket).await {
             Ok(s) => s,
             Err(e)
@@ -140,7 +164,12 @@ impl Client {
             loop {
                 let frame = wire::read_response(&mut self.reader)
                     .await?
-                    .ok_or_else(|| Error::Other("daemon disconnected".into()))?;
+                    .ok_or_else(|| {
+                        Error::Io(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "daemon disconnected",
+                        ))
+                    })?;
                 let parsed: serde_json::Value = serde_json::from_slice(&frame)?;
                 if parsed.get("method").is_some() {
                     if self.events.len() >= 256 {

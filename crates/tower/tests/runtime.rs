@@ -1049,3 +1049,94 @@ fn missing_server_companion_does_not_fall_back_to_path() {
     assert!(!marker.exists());
     assert!(!f.socket().exists());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_retries_only_the_handshake_not_an_uncertain_mutation() {
+    let root = tempfile::Builder::new()
+        .prefix("tw-hello-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let paths = tower_pal::Paths {
+        state: root.path().into(),
+        run: root.path().join("run"),
+        socket: root.path().join("run/tower.sock"),
+        database: root.path().join("tower.db"),
+        tokens: root.path().join("tokens"),
+        logs: root.path().join("logs"),
+        config_home: root.path().join("config"),
+        home: root.path().into(),
+    };
+    paths.prepare().unwrap();
+    let _lock = tower_pal::SingletonLock::acquire(&paths.run.join("test.lock")).unwrap();
+    let listener = tower_pal::IpcListener::bind(&paths.socket).await.unwrap();
+    let peer = tokio::spawn(async move {
+        let (first, _) = listener.accept().await.unwrap();
+        drop(first);
+        let (second, _) = listener.accept().await.unwrap();
+        let mut second = BufReader::new(second);
+        let mut line = String::new();
+        second.read_line(&mut line).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&line).unwrap()["method"],
+            "hello"
+        );
+        drop(second);
+        let (third, _) = listener.accept().await.unwrap();
+        let mut reader = BufReader::new(third);
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        let hello: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(hello["method"], "hello");
+        reader
+            .get_mut()
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({"jsonrpc":"2.0","id":hello["id"],"result":{}})
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&line).unwrap()["method"],
+            "agent.register"
+        );
+        drop(reader);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), listener.accept())
+                .await
+                .is_err(),
+            "An application mutation must never be automatically retried"
+        );
+    });
+    let result = towerd::client::Client::connect(&paths, Default::default(), true).await;
+    if result.is_err() {
+        peer.abort();
+    }
+    let mut client = result.unwrap();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            client.call(
+                "agent.register",
+                &json!({"harness":"fixture","cwd":"/work"})
+            )
+        )
+        .await
+        .unwrap()
+        .is_err()
+    );
+    assert!(
+        client
+            .call(
+                "agent.register",
+                &json!({"harness":"fixture","cwd":"/work"})
+            )
+            .await
+            .is_err()
+    );
+    peer.await.unwrap();
+}
