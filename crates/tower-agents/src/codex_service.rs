@@ -99,10 +99,8 @@ impl Config {
         let codex = codex
             .as_table()
             .ok_or(Error::Config("Codex configuration must be a table"))?;
-        if codex.contains_key("default_mode") || codex.contains_key("override") {
-            return Err(Error::Config(
-                "Codex launch modes and directory overrides are no longer supported; configure codex.endpoint",
-            ));
+        if codex.keys().any(|key| key != "endpoint") {
+            return Err(Error::Config("Codex configuration accepts only endpoint"));
         }
         let Some(endpoint) = codex.get("endpoint") else {
             return Ok(Self::daemon(paths));
@@ -715,12 +713,8 @@ mod tests {
         }
         tower_pal::write_private(&config, b"[codex]\nendpoint=42\n").unwrap();
         assert!(Config::load(&paths).is_err());
-        for legacy in [
-            "[codex]\ndefault_mode='native'\n",
-            "[codex]\ndefault_mode='app-server'\n",
-            "[codex]\noverride=[]\n",
-        ] {
-            tower_pal::write_private(&config, legacy.as_bytes()).unwrap();
+        for unknown in ["[codex]\nmode='native'\n", "[codex]\nendpont='unix:///x'\n"] {
+            tower_pal::write_private(&config, unknown.as_bytes()).unwrap();
             assert!(matches!(Config::load(&paths), Err(Error::Config(_))));
         }
     }
