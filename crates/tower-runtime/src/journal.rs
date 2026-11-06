@@ -15,6 +15,7 @@ use tower_protocol::{
 };
 
 pub use tower_sessions::execution::RuntimeBinding as Binding;
+const SCHEMA_VERSION: i64 = 3;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Limits {
@@ -97,7 +98,7 @@ impl Journal {
         let version: i64 = conn
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .map_err(internal)?;
-        if version > 2 {
+        if version > SCHEMA_VERSION {
             return Err(error(
                 "runtime_storage",
                 "Runtime journal belongs to a newer version",
@@ -112,14 +113,16 @@ CREATE TABLE IF NOT EXISTS commands(namespace TEXT NOT NULL,command_id TEXT NOT 
 CREATE TABLE IF NOT EXISTS events(namespace TEXT NOT NULL,runtime_id TEXT NOT NULL,generation TEXT NOT NULL,sequence INTEGER NOT NULL,event_key TEXT NOT NULL,body TEXT NOT NULL,bytes INTEGER NOT NULL,control INTEGER NOT NULL,PRIMARY KEY(namespace,runtime_id,generation,sequence),UNIQUE(namespace,runtime_id,generation,event_key),FOREIGN KEY(namespace,runtime_id,generation) REFERENCES runtimes(namespace,runtime_id,generation));
 CREATE TABLE IF NOT EXISTS counters(id INTEGER PRIMARY KEY CHECK(id=1),spool_bytes INTEGER NOT NULL DEFAULT 0,control_bytes INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS journal_identity(id TEXT PRIMARY KEY);
-CREATE TABLE IF NOT EXISTS force_resumes(namespace TEXT NOT NULL,command_id TEXT NOT NULL,targets TEXT NOT NULL,phase TEXT NOT NULL,cleanup_started INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(namespace,command_id),FOREIGN KEY(namespace,command_id) REFERENCES commands(namespace,command_id));
+CREATE TABLE IF NOT EXISTS force_resumes(namespace TEXT NOT NULL,command_id TEXT NOT NULL,targets TEXT NOT NULL,phase TEXT NOT NULL,PRIMARY KEY(namespace,command_id),FOREIGN KEY(namespace,command_id) REFERENCES commands(namespace,command_id));
 CREATE INDEX IF NOT EXISTS commands_runtime ON commands(namespace,runtime_id,generation);
 CREATE INDEX IF NOT EXISTS command_outbox ON commands(namespace,created_at) WHERE receipt_revision>ack_revision;
 CREATE INDEX IF NOT EXISTS pending_payloads ON commands(namespace,runtime_id) WHERE payload IS NOT NULL;
 CREATE INDEX IF NOT EXISTS runtimes_logical ON runtimes(namespace,logical_session);
 CREATE INDEX IF NOT EXISTS runtimes_ended ON runtimes(ended_at) WHERE ended_at IS NOT NULL;
 INSERT OR IGNORE INTO counters(id) VALUES(1);
-PRAGMA user_version=2;").map_err(internal)?;
+").map_err(internal)?;
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(internal)?;
         let identity: Option<String> = conn
             .query_row("SELECT id FROM journal_identity", [], |r| r.get(0))
             .optional()
@@ -405,7 +408,7 @@ impl Journal {
                 state,
                 fenced,
                 termination,
-                pending_events: Some(pending_events),
+                pending_events,
             })
         })
         .collect()

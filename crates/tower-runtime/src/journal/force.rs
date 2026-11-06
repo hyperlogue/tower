@@ -191,7 +191,7 @@ impl Journal {
             .map(|t| self.binding(&b.namespace(), &t.runtime_id, &t.generation))
             .collect()
     }
-    pub fn force_step(&self, b: &Binding, c: &ExecutionCommand) -> Result<()> {
+    pub fn check_cleanup(&self, b: &Binding, c: &ExecutionCommand) -> Result<()> {
         let mut conn = self.lock()?;
         let tx = conn.transaction().map_err(internal)?;
         ensure_live(&tx, b)?;
@@ -201,14 +201,14 @@ impl Journal {
                 "Force resume expired before cleanup",
             ));
         }
-        let changed=tx.execute("UPDATE force_resumes SET cleanup_started=1 WHERE namespace=?1 AND command_id=?2 AND phase='cleanup'",params![b.namespace(),c.command_id]).map_err(internal)?;
-        if changed != 1 {
+        let current:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM force_resumes WHERE namespace=?1 AND command_id=?2 AND phase='cleanup')",params![b.namespace(),c.command_id],|r|r.get(0)).map_err(internal)?;
+        if !current {
             return Err(error(
                 "runtime_conflict",
                 "Cleanup phase is no longer current",
             ));
         }
-        tx.commit().map_err(internal)
+        Ok(())
     }
     pub fn force_ready(&self, b: &Binding, c: &ExecutionCommand) -> Result<()> {
         let mut conn = self.lock()?;
@@ -406,8 +406,17 @@ mod tests {
             j.begin_dispatch(&b, &c.command_id).unwrap_err().data.code,
             "cleanup_unconfirmed"
         );
+        // Extra columns in an existing journal must not affect recovery.
+        j.lock().unwrap().execute_batch("ALTER TABLE force_resumes ADD COLUMN cleanup_started INTEGER NOT NULL DEFAULT 0; PRAGMA user_version=2;").unwrap();
         drop(j);
         let j = Journal::open(&path, Limits::default()).unwrap();
+        assert_eq!(
+            j.lock()
+                .unwrap()
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
         let restored = j.force_command(&b).unwrap().unwrap();
         assert_eq!(restored.command_id, c.command_id);
         assert_eq!(
@@ -418,12 +427,16 @@ mod tests {
             j.force_targets(&b, &c.command_id).unwrap()[0].runtime_id,
             old.runtime_id
         );
-        j.force_step(&b, &c).unwrap();
+        j.check_cleanup(&b, &c).unwrap();
         let loss = j.fence(&old, "force_resume", "confirmed").unwrap();
         assert_eq!(loss.loss_id, original_loss.loss_id);
         assert_eq!(loss.report_revision, 2);
         assert_eq!(j.admit(&b, &c).unwrap(), accepted);
         j.force_ready(&b, &c).unwrap();
+        assert_eq!(
+            j.check_cleanup(&b, &c).unwrap_err().data.code,
+            "runtime_conflict"
+        );
         assert!(j.begin_dispatch(&b, &c.command_id).unwrap());
         assert!(!j.begin_dispatch(&b, &c.command_id).unwrap());
         assert_eq!(j.force_phase(&b).unwrap().as_deref(), Some("dispatched"));
@@ -513,7 +526,7 @@ mod tests {
         let second = binding("second");
         j.admit(&second, &command(&second, "second", "launch", json!({})))
             .unwrap();
-        // A retained generation from the retired overlap prototype may still be uncertain.
+        // Uncertainty in any earlier generation must block replacement.
         j.lock()
             .unwrap()
             .execute(
@@ -528,7 +541,7 @@ mod tests {
         );
         c.payload=serde_json::from_value(json!({"force":true,"cleanup":[{"runtime_id":old.runtime_id,"generation":old.generation},{"runtime_id":second.runtime_id,"generation":second.generation}]})).unwrap();
         j.admit(&b, &c).unwrap();
-        j.force_step(&b, &c).unwrap();
+        j.check_cleanup(&b, &c).unwrap();
         j.fence(&old, "force_resume", "confirmed").unwrap();
         drop(j);
         let j = Journal::open(&path, Limits::default()).unwrap();

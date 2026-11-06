@@ -158,7 +158,7 @@ impl Publisher {
                 self.insert("session.cursor",json!({"runtime_id":b.runtime_id,"generation":b.generation,"source_key":b.generation}),format!("source/{k}"),Item::Cursor(b),&mut frames)?;
                 continue;
             }
-            if v.pending_events == Some(false) {
+            if !v.pending_events {
                 continue;
             }
             if self.pending.len() >= 32

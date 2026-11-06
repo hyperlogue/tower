@@ -47,17 +47,16 @@ impl RuntimeBinding {
         })
     }
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct RuntimeView {
     pub binding: RuntimeBinding,
     pub state: String,
     pub fenced: bool,
     pub termination: String,
     pub metadata: Value,
-    #[serde(default)]
-    pub pending_events: Option<bool>,
+    pub pending_events: bool,
 }
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default)]
 pub struct RuntimeUpdates {
     pub receipts: Vec<ExecutionReceipt>,
     pub losses: Vec<RuntimeLoss>,
@@ -79,7 +78,7 @@ pub type Authorize = std::sync::Arc<dyn Fn(Authorization) -> Future<Result<()>> 
 pub trait ExecutionHost: Send + Sync {
     /// Called once at startup, before any command is executed.
     fn bind(&self, _authorize: Authorize) {}
-    /// Stops every runtime before the server exits.
+    /// Suspends runtime owners before the server exits; native sessions may remain live.
     fn shutdown(&self) -> Future<()> {
         Box::pin(async {})
     }

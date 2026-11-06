@@ -101,7 +101,9 @@ impl Work {
             if termination == "confirmed" {
                 continue;
             }
-            self.ctx.journal.force_step(&self.binding, &self.command)?;
+            self.ctx
+                .journal
+                .check_cleanup(&self.binding, &self.command)?;
             if let Some(owner) = owner {
                 owner.requests.retire_all()?;
                 if !owner.normal.is_closed() {
