@@ -361,12 +361,20 @@ pub struct Rule {
     pub from: String,
     pub to: String,
     pub action: String,
-    /// A local rule governs messages unless this is `session`, which governs
-    /// starting and controlling sessions. Allgather rules govern both.
+    /// What the rule governs. Local rules always name a kind; Allgather rules
+    /// omit it and govern every kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kind: Option<String>,
+    pub kind: Option<RuleKind>,
     pub created_by: String,
     pub created_at: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RuleKind {
+    /// Sending messages between sessions.
+    Message,
+    /// Starting and controlling sessions.
+    Session,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RulePutParams {

@@ -1208,7 +1208,7 @@ impl Service {
                         )
                     );
                 }
-                validate_rule(&p.rule)?;
+                validate_local_rule(&p.rule)?;
                 p.rule.created_by = actor.id();
                 p.rule.created_at = now;
                 self.store.put_rule(p.rule.clone()).map_err(storage)?;
@@ -1240,7 +1240,7 @@ impl Service {
                 }
                 let mut ids = HashSet::new();
                 for rule in &mut p.rules {
-                    validate_rule(rule)?;
+                    validate_local_rule(rule)?;
                     if !ids.insert(rule.id.clone()) {
                         return Err(invalid("Duplicate rule ID"));
                     }
@@ -1360,16 +1360,16 @@ fn identifier(s: &str, max: usize) -> std::result::Result<(), RpcError> {
         Ok(())
     }
 }
+fn validate_local_rule(rule: &Rule) -> std::result::Result<(), RpcError> {
+    if rule.kind.is_none() {
+        return Err(invalid("Local rules require a kind"));
+    }
+    validate_rule(rule)
+}
 fn validate_rule(rule: &Rule) -> std::result::Result<(), RpcError> {
     identifier(&rule.id, 128)?;
     if !matches!(rule.action.as_str(), "allow" | "ask" | "deny") {
         return Err(invalid("Unknown rule action"));
-    }
-    if !matches!(
-        rule.kind.as_deref(),
-        None | Some(crate::policy::MESSAGE | crate::policy::SESSION)
-    ) {
-        return Err(invalid("Unknown rule kind"));
     }
     for selector in [&rule.from, &rule.to] {
         if selector.is_empty()

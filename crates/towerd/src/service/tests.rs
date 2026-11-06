@@ -246,7 +246,7 @@ fn named_token_attribution_is_canonical_for_all_rule_mutations() {
         .unwrap()["id"],
         "token:human"
     );
-    let rule = serde_json::json!({"id":"rule","from":"human","to":"*","action":"allow","created_by":"","created_at":0});
+    let rule = serde_json::json!({"id":"rule","from":"human","to":"*","action":"allow","kind":"message","created_by":"","created_at":0});
     assert_eq!(
         call(
             &s,

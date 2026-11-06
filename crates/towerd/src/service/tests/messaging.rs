@@ -448,7 +448,7 @@ fn remote_messages_require_scopes_and_both_policy_tables() {
     store.apply_policy(1, &[]).unwrap();
     assert_eq!(send(&service).unwrap_err().data.code, "approval_required");
     assert_eq!(store.approvals().unwrap()[0].record.from, "allgather");
-    call(&service,"rules.put",serde_json::json!({"rule":{"id":"local-remote-allow","from":"allgather","to":"*","action":"allow","created_by":"human","created_at":1}}),human()).unwrap();
+    call(&service,"rules.put",serde_json::json!({"rule":{"id":"local-remote-allow","from":"allgather","to":"*","action":"allow","kind":"message","created_by":"human","created_at":1}}),human()).unwrap();
     store
         .apply_policy(
             2,
@@ -726,11 +726,7 @@ fn message_rules_do_not_authorize_session_operations() {
         harness: Some("claude"),
         cwd: Some("~/work/repo"),
     };
-    for (kind, allowed) in [
-        (serde_json::Value::Null, false),
-        ("message".into(), false),
-        ("session".into(), true),
-    ] {
+    for (kind, allowed) in [("message", false), ("session", true)] {
         call(
             &service,
             "rules.replace",
@@ -744,6 +740,8 @@ fn message_rules_do_not_authorize_session_operations() {
             assert_eq!(result.unwrap_err().data.code, "approval_required");
         }
     }
-    let invalid = serde_json::json!({"rule":{"id":"x","from":"*","to":"*","action":"allow","kind":"launch","created_by":"human","created_at":1}});
-    assert!(call(&service, "rules.put", invalid, human()).is_err());
+    for kind in [serde_json::Value::Null, "launch".into()] {
+        let invalid = serde_json::json!({"rule":{"id":"x","from":"*","to":"*","action":"allow","kind":kind,"created_by":"human","created_at":1}});
+        assert!(call(&service, "rules.put", invalid, human()).is_err());
+    }
 }

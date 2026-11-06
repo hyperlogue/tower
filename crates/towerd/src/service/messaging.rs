@@ -168,7 +168,7 @@ impl Service {
             harness: Some(&target.harness),
             cwd: Some(&target.cwd),
         };
-        self.policy_decision(policy::MESSAGE, from, to)
+        self.policy_decision(RuleKind::Message, from, to)
     }
     pub(super) fn session_policy(
         &self,
@@ -181,7 +181,7 @@ impl Service {
         let id = actor.id();
         let mut from = subject(actor);
         from.id = &id;
-        match self.policy_decision(policy::SESSION, from, to)?.0 {
+        match self.policy_decision(RuleKind::Session, from, to)?.0 {
             Decision::Allow => Ok(()),
             Decision::Ask => Err(app(
                 "approval_required",
@@ -195,16 +195,16 @@ impl Service {
     }
     fn policy_decision(
         &self,
-        kind: &str,
+        kind: RuleKind,
         from: Subject<'_>,
         to: Subject<'_>,
     ) -> std::result::Result<(Decision, Vec<String>), RpcError> {
         let rules = self.store.rules().map_err(storage)?;
-        let local = policy::evaluate(&rules.local_rules, Some(kind), from, to, Decision::Ask);
+        let local = policy::evaluate(&rules.local_rules, kind, from, to, Decision::Ask);
         let remote = if self.store.host().map_err(storage)?.mode == "allgather" {
             policy::evaluate(
                 &rules.allgather_rules,
-                None,
+                kind,
                 from,
                 to,
                 if rules.policy_revision.is_some() {
@@ -582,7 +582,7 @@ impl Service {
                 harness: Some(&target.record.harness),
                 cwd: Some(&target.record.cwd),
             };
-            let (decision, required) = self.policy_decision(policy::MESSAGE, from, to)?;
+            let (decision, required) = self.policy_decision(RuleKind::Message, from, to)?;
             approval.record.required = required;
             if decision != Decision::Ask {
                 approval.record.state = if decision == Decision::Allow {
@@ -663,7 +663,7 @@ impl Service {
             from: a.record.from.clone(),
             to: a.record.to.clone(),
             action: "allow".into(),
-            kind: None,
+            kind: Some(RuleKind::Message),
             created_by: actor.id(),
             created_at: now_ms(),
         });

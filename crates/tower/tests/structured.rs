@@ -235,7 +235,7 @@ impl Server {
                 }
             }
         });
-        f.rpc("rules.replace",json!({"rules":[{"id":"allow","from":"*","to":"*","action":"allow","created_by":"fixture","created_at":1},{"id":"sessions","from":"*","to":"*","action":"allow","kind":"session","created_by":"fixture","created_at":1}]}));
+        f.rpc("rules.replace",json!({"rules":[{"id":"allow","from":"*","to":"*","action":"allow","kind":"message","created_by":"fixture","created_at":1},{"id":"sessions","from":"*","to":"*","action":"allow","kind":"session","created_by":"fixture","created_at":1}]}));
         f.rpc(
             "allgather.login",
             json!({"key":"fixture-key","url":format!("ws://127.0.0.1:{port}/tower")}),

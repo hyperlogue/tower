@@ -1,8 +1,6 @@
 //! Rule evaluation has no I/O. Local and received rules are evaluated separately.
-use tower_protocol::Rule;
+use tower_protocol::{Rule, RuleKind};
 
-pub const MESSAGE: &str = "message";
-pub const SESSION: &str = "session";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Decision {
     Allow,
@@ -57,17 +55,17 @@ fn wildcard(pattern: &str, text: &str) -> bool {
     }
     i == p.len()
 }
-/// `kind` selects local rules by kind; `None` applies every rule.
+/// A rule without a kind applies to every kind.
 pub fn evaluate(
     rules: &[Rule],
-    kind: Option<&str>,
+    kind: RuleKind,
     from: Subject<'_>,
     to: Subject<'_>,
     fallback: Decision,
 ) -> Decision {
     rules
         .iter()
-        .filter(|r| kind.is_none_or(|k| r.kind.as_deref().unwrap_or(MESSAGE) == k))
+        .filter(|r| r.kind.is_none_or(|k| k == kind))
         .find(|r| matches(&r.from, from) && matches(&r.to, to))
         .map_or(fallback, |r| match r.action.as_str() {
             "allow" => Decision::Allow,

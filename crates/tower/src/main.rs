@@ -375,8 +375,8 @@ enum RulesCommand {
         #[arg(long, default_value = "allow")]
         action: String,
         /// `session` governs starting and controlling sessions instead of messages.
-        #[arg(long, value_parser = ["message", "session"])]
-        kind: Option<String>,
+        #[arg(long, value_parser = ["message", "session"], default_value = "message")]
+        kind: String,
         #[arg(long)]
         id: Option<String>,
     },
@@ -1081,7 +1081,11 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
                                 from,
                                 to,
                                 action,
-                                kind,
+                                kind: Some(if kind == "session" {
+                                    RuleKind::Session
+                                } else {
+                                    RuleKind::Message
+                                }),
                                 created_by: String::new(),
                                 created_at: 0,
                             },
