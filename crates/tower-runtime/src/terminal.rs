@@ -541,7 +541,7 @@ mod tests {
     #[test]
     fn recovery_uses_positive_launch_evidence_and_preserves_uncertain_stop() {
         let root = tempfile::tempdir().unwrap();
-        let journal = Journal::open(&root.path().join("runtime.db"), Limits::default()).unwrap();
+        let journal = Journal::open(&root.path().join("tower.db"), Limits::default()).unwrap();
         let b = binding();
         let launch = crate::command(
             &b,
@@ -606,7 +606,7 @@ mod tests {
     async fn stop_before_launch_never_crosses_the_dispatch_fence() {
         let root = tempfile::tempdir().unwrap();
         let journal =
-            Journal::open(&root.path().join("runtime.db"), crate::Limits::default()).unwrap();
+            Journal::open(&root.path().join("tower.db"), crate::Limits::default()).unwrap();
         let b = binding();
         let c = crate::command(
             &b,

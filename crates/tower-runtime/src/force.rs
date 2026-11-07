@@ -228,7 +228,7 @@ mod tests {
                 home: root.into(),
             },
             journal: Arc::new(
-                crate::Journal::open(&root.join("runtime.db"), crate::Limits::default()).unwrap(),
+                crate::Journal::open(&root.join("tower.db"), crate::Limits::default()).unwrap(),
             ),
             authority: Default::default(),
         }

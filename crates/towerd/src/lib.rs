@@ -38,16 +38,16 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// held, so recovery of a previous server's sessions never runs twice.
 pub async fn run<F, B>(paths: Paths, startup: &str, backends: B) -> Result<()>
 where
-    B: FnOnce() -> F,
+    B: FnOnce(Arc<tower_store::Database>) -> F,
     F: std::future::Future<Output = Result<tower_sessions::Backends>>,
 {
     paths.prepare()?;
     let _lock = SingletonLock::acquire(&paths.run.join("towerd.lock"))?;
     tower_pal::ignore_hangup()?;
-    tower_pal::private_file(&paths.database, true)?;
-    let backends = backends().await?;
+    let database = Arc::new(tower_store::Database::open(&paths.database)?);
+    let backends = backends(database.clone()).await?;
     let execution = backends.execution().cloned();
-    let store = Arc::new(tower_store::Store::open(&paths.database)?);
+    let store = Arc::new(tower_store::Store::new(database));
     let service = Service::new(paths.clone(), store, startup, backends)?;
     service.recover_registry()?;
     let service = ServiceWorker::new(service);

@@ -2300,6 +2300,7 @@ dependencies = [
  "tower-pal",
  "tower-protocol",
  "tower-sessions",
+ "tower-store",
  "url",
 ]
 
@@ -2327,6 +2328,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
+ "tower-pal",
  "tower-protocol",
  "tower-sessions",
  "url",

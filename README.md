@@ -423,6 +423,13 @@ for manual setup. `tower-cli daemon uninstall` removes future startup configurat
 it does not stop current sessions. Detached fallback processes can still belong
 to their caller's service-manager cgroup. Use the installed jobs on an SSH server.
 
+The registry and execution journal share `tower.db` in `$XDG_STATE_HOME/tower`
+(default `~/.local/state/tower`). Back up the private state directory with the
+server stopped; retain `runtime/journal.id` and `runtime/fingerprint.key` with the
+database. Existing two-database installations upgrade atomically at startup.
+After a successful upgrade, `runtime/runtime.db` is an unused recovery copy;
+Tower does not read it again or delete it automatically.
+
 Use `--json` for structured output. `tower-cli rpc METHOD JSON` calls an implemented
 method directly. Local runtime notes are in `workspace/docs/RUNTIME.md` when
 available in the checkout.

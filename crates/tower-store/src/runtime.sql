@@ -1,0 +1,12 @@
+CREATE TABLE runtimes(namespace TEXT NOT NULL,runtime_id TEXT NOT NULL,generation TEXT NOT NULL,logical_session TEXT NOT NULL,tower_id TEXT NOT NULL,owner_id TEXT NOT NULL,binding TEXT NOT NULL,state TEXT NOT NULL,metadata TEXT NOT NULL DEFAULT '{}',fenced INTEGER NOT NULL DEFAULT 0,termination TEXT NOT NULL DEFAULT 'unknown',next_sequence INTEGER NOT NULL DEFAULT 1,ack_sequence INTEGER NOT NULL DEFAULT 0,ack_key TEXT,coverage TEXT NOT NULL DEFAULT 'complete',spool_bytes INTEGER NOT NULL DEFAULT 0,control_bytes INTEGER NOT NULL DEFAULT 0,loss TEXT,loss_ack INTEGER NOT NULL DEFAULT 0,ended_at INTEGER,PRIMARY KEY(namespace,runtime_id),UNIQUE(namespace,runtime_id,generation));
+CREATE TABLE commands(namespace TEXT NOT NULL,command_id TEXT NOT NULL,runtime_id TEXT NOT NULL,generation TEXT NOT NULL,fingerprint BLOB NOT NULL,kind TEXT NOT NULL,payload TEXT,expires_at INTEGER NOT NULL,receipt TEXT NOT NULL,receipt_revision INTEGER NOT NULL,ack_revision INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,PRIMARY KEY(namespace,command_id),FOREIGN KEY(namespace,runtime_id,generation) REFERENCES runtimes(namespace,runtime_id,generation));
+CREATE TABLE events(namespace TEXT NOT NULL,runtime_id TEXT NOT NULL,generation TEXT NOT NULL,sequence INTEGER NOT NULL,event_key TEXT NOT NULL,body TEXT NOT NULL,bytes INTEGER NOT NULL,control INTEGER NOT NULL,PRIMARY KEY(namespace,runtime_id,generation,sequence),UNIQUE(namespace,runtime_id,generation,event_key),FOREIGN KEY(namespace,runtime_id,generation) REFERENCES runtimes(namespace,runtime_id,generation));
+CREATE TABLE runtime_counters(id INTEGER PRIMARY KEY CHECK(id=1),spool_bytes INTEGER NOT NULL DEFAULT 0,control_bytes INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE journal_identity(id TEXT PRIMARY KEY);
+CREATE TABLE force_resumes(namespace TEXT NOT NULL,command_id TEXT NOT NULL,targets TEXT NOT NULL,phase TEXT NOT NULL,PRIMARY KEY(namespace,command_id),FOREIGN KEY(namespace,command_id) REFERENCES commands(namespace,command_id));
+CREATE INDEX commands_runtime ON commands(namespace,runtime_id,generation);
+CREATE INDEX command_outbox ON commands(namespace,created_at) WHERE receipt_revision>ack_revision;
+CREATE INDEX pending_payloads ON commands(namespace,runtime_id) WHERE payload IS NOT NULL;
+CREATE INDEX runtimes_logical ON runtimes(namespace,logical_session);
+CREATE INDEX runtimes_ended ON runtimes(ended_at) WHERE ended_at IS NOT NULL;
+INSERT INTO runtime_counters(id) VALUES(1);

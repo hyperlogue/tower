@@ -83,6 +83,7 @@ impl Runtime {
     /// left behind. Call it while holding the server's singleton lock.
     pub async fn open(
         paths: tower_pal::Paths,
+        database: Arc<tower_store::Database>,
         terminal: Arc<dyn ManagedBackend>,
     ) -> Result<Arc<Self>> {
         #[derive(Default, serde::Deserialize)]
@@ -109,10 +110,7 @@ impl Runtime {
                 "Runtime limits must reserve bulk and control capacity",
             ));
         }
-        let journal = Arc::new(Journal::open(
-            &paths.state.join("runtime/runtime.db"),
-            limits,
-        )?);
+        let journal = Arc::new(Journal::new(database, limits)?);
         let live = recover(&paths, &journal).await?;
         journal.compact()?;
         let runtime = Arc::new(Self {
@@ -728,7 +726,7 @@ mod tests {
                 config_home: path.join("config"),
                 home: path.into(),
             },
-            journal: Arc::new(Journal::open(&path.join("runtime.db"), Limits::default()).unwrap()),
+            journal: Arc::new(Journal::open(&path.join("tower.db"), Limits::default()).unwrap()),
             owners: Mutex::new(BTreeMap::new()),
             terminal: Arc::new(NoTerminal),
             authority: Authority::default(),

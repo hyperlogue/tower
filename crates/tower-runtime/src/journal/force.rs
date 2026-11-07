@@ -310,7 +310,7 @@ mod tests {
     #[test]
     fn empty_cleanup_is_rejected_and_stopped_sessions_resume_without_force() {
         let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("runtime.db");
+        let path = root.path().join("tower.db");
         let j = Journal::open(&path, Limits::default()).unwrap();
         let old = binding("old");
         j.admit(&old, &command(&old, "first", "launch", json!({})))
@@ -352,7 +352,7 @@ mod tests {
     #[test]
     fn malformed_force_commands_cannot_admit_or_fence() {
         let root = tempfile::tempdir().unwrap();
-        let j = Journal::open(&root.path().join("runtime.db"), Limits::default()).unwrap();
+        let j = Journal::open(&root.path().join("tower.db"), Limits::default()).unwrap();
         let old = binding("old");
         j.admit(&old, &command(&old, "first", "launch", json!({})))
             .unwrap();
@@ -390,7 +390,7 @@ mod tests {
     #[test]
     fn cleanup_is_atomic_recoverable_and_required_before_launch() {
         let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("runtime.db");
+        let path = root.path().join("tower.db");
         let j = Journal::open(&path, Limits::default()).unwrap();
         let old = binding("old");
         let first = command(&old, "first", "launch", json!({}));
@@ -406,17 +406,8 @@ mod tests {
             j.begin_dispatch(&b, &c.command_id).unwrap_err().data.code,
             "cleanup_unconfirmed"
         );
-        // Extra columns in an existing journal must not affect recovery.
-        j.lock().unwrap().execute_batch("ALTER TABLE force_resumes ADD COLUMN cleanup_started INTEGER NOT NULL DEFAULT 0; PRAGMA user_version=2;").unwrap();
         drop(j);
         let j = Journal::open(&path, Limits::default()).unwrap();
-        assert_eq!(
-            j.lock()
-                .unwrap()
-                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
-                .unwrap(),
-            SCHEMA_VERSION
-        );
         let restored = j.force_command(&b).unwrap().unwrap();
         assert_eq!(restored.command_id, c.command_id);
         assert_eq!(
@@ -479,7 +470,7 @@ mod tests {
     #[test]
     fn invalid_targets_cannot_fence_or_reserve_any_execution() {
         let root = tempfile::tempdir().unwrap();
-        let j = Journal::open(&root.path().join("runtime.db"), Limits::default()).unwrap();
+        let j = Journal::open(&root.path().join("tower.db"), Limits::default()).unwrap();
         let old = binding("old");
         j.admit(&old, &command(&old, "first", "launch", json!({})))
             .unwrap();
@@ -517,7 +508,7 @@ mod tests {
     #[test]
     fn partial_cleanup_retains_history_and_blocks_replacement() {
         let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("runtime.db");
+        let path = root.path().join("tower.db");
         let j = Journal::open(&path, Limits::default()).unwrap();
         let old = binding("old");
         j.admit(&old, &command(&old, "first", "launch", json!({})))

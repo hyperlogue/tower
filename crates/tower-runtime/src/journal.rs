@@ -4,18 +4,15 @@ use hmac::{Hmac, KeyInit, Mac};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::{
-    path::Path,
-    sync::{Mutex, MutexGuard},
-};
+use std::sync::{Arc, MutexGuard};
 use tower_protocol::{
     ExecutionAcceptance, ExecutionCommand, ExecutionDispatch, ExecutionError, ExecutionReceipt,
     ExecutionResult, ExecutionStatus, RuntimeCursor, RuntimeEvent, RuntimeEvents, RuntimeLoss,
     Value,
 };
+use tower_store::Database;
 
 pub use tower_sessions::execution::RuntimeBinding as Binding;
-const SCHEMA_VERSION: i64 = 3;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Limits {
@@ -37,7 +34,7 @@ impl Default for Limits {
     }
 }
 pub struct Journal {
-    conn: Mutex<Connection>,
+    database: Arc<Database>,
     digest_key: Vec<u8>,
     limits: Limits,
 }
@@ -46,34 +43,46 @@ impl Journal {
         let conn = self.lock()?;
         let used:i64=conn.query_row("SELECT spool_bytes FROM runtimes WHERE namespace=?1 AND runtime_id=?2 AND generation=?3",params![binding.namespace(),binding.runtime_id,binding.generation],|r|r.get(0)).map_err(internal)?;
         let host: i64 = conn
-            .query_row("SELECT spool_bytes FROM counters WHERE id=1", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT spool_bytes FROM runtime_counters WHERE id=1",
+                [],
+                |r| r.get(0),
+            )
             .map_err(internal)?;
         Ok(
             (used as u64).saturating_add(bytes as u64) <= self.limits.runtime_spool_bytes
                 && (host as u64).saturating_add(bytes as u64) <= self.limits.host_spool_bytes,
         )
     }
-    pub fn open(path: &Path, limits: Limits) -> Result<Self> {
-        let parent = path
-            .parent()
-            .ok_or_else(|| error("runtime_storage", "Invalid runtime journal path"))?;
-        tower_pal::private_dir(parent).map_err(internal)?;
-        let existing = path.metadata().is_ok_and(|m| m.len() > 0);
+    #[cfg(test)]
+    pub fn open(path: &std::path::Path, limits: Limits) -> Result<Self> {
+        Self::new(Arc::new(Database::open(path).map_err(internal)?), limits)
+    }
+    pub fn new(database: Arc<Database>, limits: Limits) -> Result<Self> {
+        let parent = database.runtime_directory();
+        tower_pal::private_dir(&parent).map_err(internal)?;
+        let conn = database.lock().map_err(internal)?;
+        let identity: Option<String> = conn
+            .query_row("SELECT id FROM journal_identity", [], |r| r.get(0))
+            .optional()
+            .map_err(internal)?;
+        let existing = identity.is_some();
         let marker_path = parent.join("journal.id");
         let marker = match tower_pal::read_private(&marker_path) {
             Ok(v) => Some(v),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => return Err(internal(e)),
         };
-        if marker.is_some() && !existing {
+        let orphaned: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM runtimes) OR EXISTS(SELECT 1 FROM commands) OR EXISTS(SELECT 1 FROM events)",
+            [], |row| row.get(0),
+        ).map_err(internal)?;
+        if !existing && (marker.is_some() || orphaned) {
             return Err(error(
                 "journal_lost",
                 "Restore the runtime journal; its identity cannot be reset",
             ));
         }
-        tower_pal::private_file(path, true).map_err(internal)?;
         let key_file = parent.join("fingerprint.key");
         let key = match tower_pal::read_private(&key_file) {
             Ok(key) => key,
@@ -94,39 +103,6 @@ impl Journal {
         if key.len() != 32 {
             return Err(error("runtime_storage", "Invalid fingerprint key"));
         }
-        let conn = Connection::open(path).map_err(internal)?;
-        let version: i64 = conn
-            .pragma_query_value(None, "user_version", |r| r.get(0))
-            .map_err(internal)?;
-        if version > SCHEMA_VERSION {
-            return Err(error(
-                "runtime_storage",
-                "Runtime journal belongs to a newer version",
-            ));
-        }
-
-        conn.busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(internal)?;
-        conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
-CREATE TABLE IF NOT EXISTS runtimes(namespace TEXT NOT NULL,runtime_id TEXT NOT NULL,generation TEXT NOT NULL,logical_session TEXT NOT NULL,tower_id TEXT NOT NULL,owner_id TEXT NOT NULL,binding TEXT NOT NULL,state TEXT NOT NULL,metadata TEXT NOT NULL DEFAULT '{}',fenced INTEGER NOT NULL DEFAULT 0,termination TEXT NOT NULL DEFAULT 'unknown',next_sequence INTEGER NOT NULL DEFAULT 1,ack_sequence INTEGER NOT NULL DEFAULT 0,ack_key TEXT,coverage TEXT NOT NULL DEFAULT 'complete',spool_bytes INTEGER NOT NULL DEFAULT 0,control_bytes INTEGER NOT NULL DEFAULT 0,loss TEXT,loss_ack INTEGER NOT NULL DEFAULT 0,ended_at INTEGER,PRIMARY KEY(namespace,runtime_id),UNIQUE(namespace,runtime_id,generation));
-CREATE TABLE IF NOT EXISTS commands(namespace TEXT NOT NULL,command_id TEXT NOT NULL,runtime_id TEXT NOT NULL,generation TEXT NOT NULL,fingerprint BLOB NOT NULL,kind TEXT NOT NULL,payload TEXT,expires_at INTEGER NOT NULL,receipt TEXT NOT NULL,receipt_revision INTEGER NOT NULL,ack_revision INTEGER NOT NULL DEFAULT 0,created_at INTEGER NOT NULL,PRIMARY KEY(namespace,command_id),FOREIGN KEY(namespace,runtime_id,generation) REFERENCES runtimes(namespace,runtime_id,generation));
-CREATE TABLE IF NOT EXISTS events(namespace TEXT NOT NULL,runtime_id TEXT NOT NULL,generation TEXT NOT NULL,sequence INTEGER NOT NULL,event_key TEXT NOT NULL,body TEXT NOT NULL,bytes INTEGER NOT NULL,control INTEGER NOT NULL,PRIMARY KEY(namespace,runtime_id,generation,sequence),UNIQUE(namespace,runtime_id,generation,event_key),FOREIGN KEY(namespace,runtime_id,generation) REFERENCES runtimes(namespace,runtime_id,generation));
-CREATE TABLE IF NOT EXISTS counters(id INTEGER PRIMARY KEY CHECK(id=1),spool_bytes INTEGER NOT NULL DEFAULT 0,control_bytes INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS journal_identity(id TEXT PRIMARY KEY);
-CREATE TABLE IF NOT EXISTS force_resumes(namespace TEXT NOT NULL,command_id TEXT NOT NULL,targets TEXT NOT NULL,phase TEXT NOT NULL,PRIMARY KEY(namespace,command_id),FOREIGN KEY(namespace,command_id) REFERENCES commands(namespace,command_id));
-CREATE INDEX IF NOT EXISTS commands_runtime ON commands(namespace,runtime_id,generation);
-CREATE INDEX IF NOT EXISTS command_outbox ON commands(namespace,created_at) WHERE receipt_revision>ack_revision;
-CREATE INDEX IF NOT EXISTS pending_payloads ON commands(namespace,runtime_id) WHERE payload IS NOT NULL;
-CREATE INDEX IF NOT EXISTS runtimes_logical ON runtimes(namespace,logical_session);
-CREATE INDEX IF NOT EXISTS runtimes_ended ON runtimes(ended_at) WHERE ended_at IS NOT NULL;
-INSERT OR IGNORE INTO counters(id) VALUES(1);
-").map_err(internal)?;
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
-            .map_err(internal)?;
-        let identity: Option<String> = conn
-            .query_row("SELECT id FROM journal_identity", [], |r| r.get(0))
-            .optional()
-            .map_err(internal)?;
         match (marker, identity) {
             (Some(marker), Some(id)) if marker == id.as_bytes() => {}
             (None, None) => {
@@ -142,14 +118,15 @@ INSERT OR IGNORE INTO counters(id) VALUES(1);
                 ));
             }
         }
+        drop(conn);
         Ok(Self {
-            conn: Mutex::new(conn),
+            database,
             digest_key: key,
             limits,
         })
     }
     fn lock(&self) -> Result<MutexGuard<'_, Connection>> {
-        self.conn.lock().map_err(internal)
+        self.database.lock().map_err(internal)
     }
     fn fingerprint(&self, command: &ExecutionCommand) -> Result<Vec<u8>> {
         let value = serde_json::to_value(command).map_err(internal)?;
@@ -258,7 +235,7 @@ INSERT OR IGNORE INTO counters(id) VALUES(1);
             Some(serde_json::to_string(&command.payload).map_err(internal)?)
         };
         if let Some(body) = &payload {
-            let host:i64=tx.query_row("SELECT coalesce(sum(length(CAST(payload AS BLOB))),0)+(SELECT spool_bytes FROM counters WHERE id=1) FROM commands WHERE payload IS NOT NULL",[],|r|r.get(0)).map_err(internal)?;
+            let host:i64=tx.query_row("SELECT coalesce(sum(length(CAST(payload AS BLOB))),0)+(SELECT spool_bytes FROM runtime_counters WHERE id=1) FROM commands WHERE payload IS NOT NULL",[],|r|r.get(0)).map_err(internal)?;
             let runtime:i64=tx.query_row("SELECT coalesce(sum(length(CAST(payload AS BLOB))),0)+(SELECT spool_bytes FROM runtimes WHERE namespace=?1 AND runtime_id=?2) FROM commands WHERE namespace=?1 AND runtime_id=?2 AND payload IS NOT NULL",params![namespace,binding.runtime_id],|r|r.get(0)).map_err(internal)?;
             if (host as u64).saturating_add(body.len() as u64) > self.limits.host_spool_bytes
                 || (runtime as u64).saturating_add(body.len() as u64)
@@ -662,7 +639,7 @@ impl Journal {
         }
         let (host, host_control): (i64, i64) = tx
             .query_row(
-                "SELECT spool_bytes,control_bytes FROM counters WHERE id=1",
+                "SELECT spool_bytes,control_bytes FROM runtime_counters WHERE id=1",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
@@ -684,7 +661,7 @@ impl Journal {
         }
         tx.execute("INSERT INTO events(namespace,runtime_id,generation,sequence,event_key,body,bytes,control) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![binding.namespace(),binding.runtime_id,binding.generation,sequence,event.key,body,bytes,control]).map_err(internal)?;
         tx.execute("UPDATE runtimes SET next_sequence=next_sequence+1,spool_bytes=?1,control_bytes=?2 WHERE namespace=?3 AND runtime_id=?4",params![used+if control{0}else{bytes},controls+if control{bytes}else{0},binding.namespace(),binding.runtime_id]).map_err(internal)?;
-        tx.execute("UPDATE counters SET spool_bytes=spool_bytes+?1,control_bytes=control_bytes+?2 WHERE id=1",params![if control{0}else{bytes},if control{bytes}else{0}]).map_err(internal)?;
+        tx.execute("UPDATE runtime_counters SET spool_bytes=spool_bytes+?1,control_bytes=control_bytes+?2 WHERE id=1",params![if control{0}else{bytes},if control{bytes}else{0}]).map_err(internal)?;
         if kind == "gap" {
             tx.execute(
                 "UPDATE runtimes SET coverage='partial' WHERE namespace=?1 AND runtime_id=?2",
@@ -793,7 +770,7 @@ impl Journal {
         let (bytes,control):(i64,i64)=tx.query_row("SELECT coalesce(sum(CASE WHEN control=0 THEN bytes ELSE 0 END),0),coalesce(sum(CASE WHEN control=1 THEN bytes ELSE 0 END),0) FROM events WHERE namespace=?1 AND runtime_id=?2 AND generation=?3 AND sequence<=?4",params![binding.namespace(),binding.runtime_id,binding.generation,cursor_seq],|r|Ok((r.get(0)?,r.get(1)?))).map_err(internal)?;
         tx.execute("DELETE FROM events WHERE namespace=?1 AND runtime_id=?2 AND generation=?3 AND sequence<=?4",params![binding.namespace(),binding.runtime_id,binding.generation,cursor_seq]).map_err(internal)?;
         tx.execute("UPDATE runtimes SET ack_sequence=?1,ack_key=?2,spool_bytes=spool_bytes-?3,control_bytes=control_bytes-?4 WHERE namespace=?5 AND runtime_id=?6",params![cursor_seq,expected,bytes,control,binding.namespace(),binding.runtime_id]).map_err(internal)?;
-        tx.execute("UPDATE counters SET spool_bytes=spool_bytes-?1,control_bytes=control_bytes-?2 WHERE id=1",params![bytes,control]).map_err(internal)?;
+        tx.execute("UPDATE runtime_counters SET spool_bytes=spool_bytes-?1,control_bytes=control_bytes-?2 WHERE id=1",params![bytes,control]).map_err(internal)?;
         tx.commit().map_err(internal)?;
         Ok(())
     }
@@ -989,7 +966,7 @@ mod tests {
     #[test]
     fn receipt_identity_survives_reopen_and_dispatch_is_never_repeated() {
         let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("runtime.db");
+        let path = root.path().join("tower.db");
         let j = Journal::open(&path, Limits::default()).unwrap();
         let b = binding();
         let c = command(
@@ -1040,7 +1017,7 @@ mod tests {
     #[test]
     fn private_replies_never_enter_durable_payloads_and_missing_keys_fail_closed() {
         let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("runtime.db");
+        let path = root.path().join("tower.db");
         let j = Journal::open(&path, Limits::default()).unwrap();
         let b = binding();
         j.admit(&b, &command("launch", "launch", json!({})))
@@ -1065,13 +1042,13 @@ mod tests {
             }
         }
         drop(j);
-        std::fs::remove_file(root.path().join("fingerprint.key")).unwrap();
+        std::fs::remove_file(root.path().join("runtime/fingerprint.key")).unwrap();
         assert!(Journal::open(&path, Limits::default()).is_err());
     }
     #[test]
     fn event_ack_replay_and_receiver_rollback_preserve_sequence_evidence() {
         let root = tempfile::tempdir().unwrap();
-        let j = Journal::open(&root.path().join("runtime.db"), Limits::default()).unwrap();
+        let j = Journal::open(&root.path().join("tower.db"), Limits::default()).unwrap();
         let b = binding();
         j.admit(&b, &command("launch", "launch", json!({})))
             .unwrap();
@@ -1129,7 +1106,7 @@ mod tests {
     fn bulk_capacity_does_not_consume_control_capacity_or_allocate_a_sequence() {
         let root = tempfile::tempdir().unwrap();
         let j = Journal::open(
-            &root.path().join("runtime.db"),
+            &root.path().join("tower.db"),
             Limits {
                 runtime_spool_bytes: 3,
                 host_spool_bytes: 3,
@@ -1163,7 +1140,7 @@ mod tests {
     fn receipt_capacity_and_uncertain_overlap_fail_before_acceptance() {
         let root = tempfile::tempdir().unwrap();
         let j = Journal::open(
-            &root.path().join("runtime.db"),
+            &root.path().join("tower.db"),
             Limits {
                 receipt_count: 1,
                 ..Default::default()
@@ -1185,7 +1162,7 @@ mod tests {
     #[test]
     fn takeover_payload_is_rejected_without_admission() {
         let root = tempfile::tempdir().unwrap();
-        let j = Journal::open(&root.path().join("runtime.db"), Limits::default()).unwrap();
+        let j = Journal::open(&root.path().join("tower.db"), Limits::default()).unwrap();
         let b = binding();
         let c = command(
             "resume",
@@ -1201,7 +1178,7 @@ mod tests {
     #[test]
     fn expired_full_receipts_compact_without_losing_deduplication_or_outcome() {
         let root = tempfile::tempdir().unwrap();
-        let j = Journal::open(&root.path().join("runtime.db"), Limits::default()).unwrap();
+        let j = Journal::open(&root.path().join("tower.db"), Limits::default()).unwrap();
         let b = binding();
         let c = command("launch", "first", json!({}));
         j.admit(&b, &c).unwrap();
@@ -1242,12 +1219,95 @@ mod tests {
     #[test]
     fn a_missing_journal_cannot_reset_existing_command_identity() {
         let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("runtime.db");
+        let path = root.path().join("tower.db");
         let j = Journal::open(&path, Limits::default()).unwrap();
         j.admit(&binding(), &command("launch", "identity", json!({})))
             .unwrap();
         drop(j);
         std::fs::remove_file(&path).unwrap();
+        assert!(Journal::open(&path, Limits::default()).is_err());
+    }
+    #[test]
+    fn registry_and_event_writes_share_one_database_and_make_progress() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("tower.db");
+        let database = Arc::new(Database::open(&path).unwrap());
+        let store = Arc::new(tower_store::Store::new(database.clone()));
+        store.initialize("host", "node").unwrap();
+        let journal = Arc::new(Journal::new(database.clone(), Limits::default()).unwrap());
+        let b = binding();
+        let c = command("launch", "shared", json!({}));
+        let receipt = journal.admit(&b, &c).unwrap();
+        let (done, completed) = std::sync::mpsc::channel();
+        let writer = journal.clone();
+        let writer_done = done.clone();
+        let events = std::thread::spawn(move || {
+            for i in 0..250 {
+                writer
+                    .append(
+                        &binding(),
+                        "agent_message_chunk",
+                        serde_json::from_value(json!({"text":i.to_string()})).unwrap(),
+                        None,
+                        false,
+                    )
+                    .unwrap();
+            }
+            writer_done.send(()).unwrap();
+        });
+        let registry = std::thread::spawn(move || {
+            for i in 0..250 {
+                let node = format!("node-{i}");
+                store.set_enrollment("allgather", Some(&node)).unwrap();
+                assert_eq!(store.host().unwrap().node_name, node);
+            }
+            done.send(()).unwrap();
+        });
+        for _ in 0..2 {
+            completed
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap();
+        }
+        events.join().unwrap();
+        registry.join().unwrap();
+        assert_eq!(
+            database
+                .lock()
+                .unwrap()
+                .query_row("SELECT count(*) FROM events", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            250
+        );
+        assert!(!root.path().join("runtime/runtime.db").exists());
+        drop(journal);
+        drop(database);
+        let reopened = Journal::open(&path, Limits::default()).unwrap();
+        assert_eq!(reopened.admit(&b, &c).unwrap(), receipt);
+        assert_eq!(
+            reopened
+                .lock()
+                .unwrap()
+                .query_row("SELECT node_name FROM host", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "node-249"
+        );
+    }
+
+    #[test]
+    fn lost_identity_does_not_reinitialize_existing_execution_records() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("tower.db");
+        let journal = Journal::open(&path, Limits::default()).unwrap();
+        journal
+            .admit(&binding(), &command("launch", "existing", json!({})))
+            .unwrap();
+        journal
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM journal_identity", [])
+            .unwrap();
+        std::fs::remove_file(root.path().join("runtime/journal.id")).unwrap();
+        drop(journal);
         assert!(Journal::open(&path, Limits::default()).is_err());
     }
 }

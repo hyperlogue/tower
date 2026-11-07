@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 tower-pal.workspace = true
+tower-store.workspace = true
 tower-protocol.workspace = true
 tower-sessions.workspace = true
 tower-agents.workspace = true

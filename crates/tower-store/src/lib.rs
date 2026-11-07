@@ -1,5 +1,7 @@
-//! Transactional local persistence. Runtime observations never contain message bodies.
+//! Shared SQLite storage with separate registry and execution persistence APIs.
 
+mod database;
+pub use database::Database;
 mod messaging;
 mod vcs;
 pub use messaging::{DeliveryState, StoredApproval};
@@ -9,8 +11,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
 use std::{
     path::Path,
-    sync::{Mutex, MutexGuard},
-    time::Duration,
+    sync::{Arc, MutexGuard},
 };
 use tower_protocol::{
     AgentFilter, AgentRecord, Patch, Rule, RulesView, TokenInfo, UpdateParams, UpdateResult, Value,
@@ -19,6 +20,8 @@ use tower_sessions::{ManagedSession, Observation};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("storage I/O failure: {0}")]
+    Io(#[from] std::io::Error),
     #[error("storage failure: {0}")]
     Sql(#[from] rusqlite::Error),
     #[error("invalid stored data: {0}")]
@@ -61,9 +64,8 @@ pub struct StoredToken {
 /// Each mutation commits its identity, revision and metadata together.
 /// Callers never receive a raw database connection.
 pub struct Store {
-    conn: Mutex<Connection>,
+    database: Arc<Database>,
 }
-const SCHEMA: &str = include_str!("schema.sql");
 
 fn observe_status(tx: &Transaction<'_>, record: &mut AgentRecord, status: &str) -> Result<()> {
     let (previous, stopping): (Option<String>, bool) = tx.query_row(
@@ -106,28 +108,13 @@ fn new_error(before: &AgentRecord, after: &AgentRecord) -> bool {
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
-        let mut conn = Connection::open(path)?;
-        conn.busy_timeout(Duration::from_secs(5))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.pragma_update(None, "synchronous", "FULL")?;
-        let version: u32 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        match version {
-            0 => {
-                let tx = conn.transaction()?;
-                tx.execute_batch(SCHEMA)?;
-                tx.pragma_update(None, "user_version", 1)?;
-                tx.commit()?;
-            }
-            1 => {}
-            _ => return Err(Error::Schema),
-        }
-        Ok(Self {
-            conn: Mutex::new(conn),
-        })
+        Ok(Self::new(Arc::new(Database::open(path)?)))
+    }
+    pub fn new(database: Arc<Database>) -> Self {
+        Self { database }
     }
     fn lock(&self) -> Result<MutexGuard<'_, Connection>> {
-        self.conn.lock().map_err(|_| Error::Poisoned)
+        self.database.lock()
     }
 
     /// Internal enrollment seam. Not exposed as an unauthenticated RPC.

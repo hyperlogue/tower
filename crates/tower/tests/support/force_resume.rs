@@ -473,8 +473,7 @@ async fn failed_cleanup_keeps_the_old_directory_protected_after_registry_replace
     .await
     .unwrap();
     crash_server(&f).await;
-    let db =
-        rusqlite::Connection::open(f.root.path().join("state/tower/runtime/runtime.db")).unwrap();
+    let db = rusqlite::Connection::open(f.root.path().join("state/tower/tower.db")).unwrap();
     db.execute("UPDATE runtimes SET metadata=json_remove(metadata,'$.pid','$.pid_start_time') WHERE runtime_id='old'",[]).unwrap();
     drop(db);
     std::fs::remove_file(f.root.path().join("force-hold")).unwrap();

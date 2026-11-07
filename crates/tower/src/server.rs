@@ -37,9 +37,10 @@ fn execute(command: Command) -> Result<()> {
             } else {
                 "foreground"
             };
-            runtime()?.block_on(towerd::run(paths.clone(), startup, || async move {
+            runtime()?.block_on(towerd::run(paths.clone(), startup, |database| async move {
                 let terminal = Arc::new(tower_terminal::TerminalBackend::new(paths.clone()));
-                let execution = tower_runtime::Runtime::open(paths, terminal.clone()).await?;
+                let execution =
+                    tower_runtime::Runtime::open(paths, database, terminal.clone()).await?;
                 Ok(tower_sessions::Backends::new(
                     "terminal",
                     vec![

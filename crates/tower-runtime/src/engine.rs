@@ -1889,7 +1889,7 @@ mod tests {
     #[test]
     fn text_fragments_are_batched_without_changing_content_or_event_order() {
         let root = tempfile::tempdir().unwrap();
-        let journal = Journal::open(&root.path().join("runtime.db"), Default::default()).unwrap();
+        let journal = Journal::open(&root.path().join("tower.db"), Default::default()).unwrap();
         let binding = binding();
         journal
             .admit(
@@ -1928,7 +1928,7 @@ mod tests {
     fn full_bulk_storage_coalesces_loss_without_exhausting_control_reserve() {
         let root = tempfile::tempdir().unwrap();
         let journal = Journal::open(
-            &root.path().join("runtime.db"),
+            &root.path().join("tower.db"),
             crate::Limits {
                 runtime_spool_bytes: 8,
                 host_spool_bytes: 8,
