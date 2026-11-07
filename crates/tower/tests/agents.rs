@@ -135,7 +135,7 @@ fn all_nine_harnesses_report_state_survive_daemon_restart_and_resume() {
     for h in [
         "claude", "codex", "reasonix", "kimi", "grok", "opencode", "pi", "agy", "omp",
     ] {
-        let args = vec!["open", h, "--headless"];
+        let args = vec!["launch", h, "--headless"];
         let opened = f.call(&args);
         let id = opened["id"].as_str().unwrap().to_owned();
         let row = f.wait(&id, "idle");
@@ -194,7 +194,7 @@ fn all_nine_harnesses_report_state_survive_daemon_restart_and_resume() {
 #[test]
 fn bad_hook_credentials_and_child_reports_do_not_change_the_root() {
     let f = Fixture::new();
-    let opened = f.call(&["open", "claude", "--headless"]);
+    let opened = f.call(&["launch", "claude", "--headless"]);
     let id = opened["id"].as_str().unwrap();
     f.wait(id, "idle");
     let root = f.root.path().join("s/tower/sessions").join(id);
@@ -253,7 +253,7 @@ fn an_unapproved_project_environment_cannot_run_the_agent() {
     .unwrap();
     tower_pal::make_executable(&direnv).unwrap();
     std::fs::write(f.root.path().join(".envrc"), "export SOMETHING=anything\n").unwrap();
-    let opened = f.call(&["open", "claude", "--headless"]);
+    let opened = f.call(&["launch", "claude", "--headless"]);
     let id = opened["id"].as_str().unwrap();
     let row = f.wait(id, "exited");
     assert_eq!(row["status_detail"]["error"], "environment_not_approved");
@@ -263,7 +263,7 @@ fn an_unapproved_project_environment_cannot_run_the_agent() {
 #[test]
 fn pool_crash_recovers_native_conversations_but_never_reopens_killed_sessions() {
     let f = Fixture::new();
-    let opened = f.call(&["open", "claude", "--headless"]);
+    let opened = f.call(&["launch", "claude", "--headless"]);
     let id = opened["id"].as_str().unwrap();
     let before = f.wait(id, "idle");
     let root = f.root.path().join("s/tower/sessions").join(id);
@@ -326,7 +326,7 @@ fn pool_crash_recovers_native_conversations_but_never_reopens_killed_sessions() 
 #[test]
 fn pool_upgrade_replaces_the_pool_and_resumes_its_sessions() {
     let f = Fixture::new();
-    let opened = f.call(&["open", "claude", "--headless"]);
+    let opened = f.call(&["launch", "claude", "--headless"]);
     let id = opened["id"].as_str().unwrap();
     let before = f.wait(id, "idle");
     let launcher = |row: &Value| {
@@ -360,7 +360,7 @@ fn missing_native_identity_fails_recovery_without_creating_a_new_conversation() 
         "#!/bin/sh\nprintf started >> starts\nwhile :; do sleep 0.1; done\n",
     )
     .unwrap();
-    let opened = f.call(&["open", "claude", "--headless"]);
+    let opened = f.call(&["launch", "claude", "--headless"]);
     let id = opened["id"].as_str().unwrap();
     f.wait(id, "unknown");
     let root = f.root.path().join("s/tower/sessions").join(id);
@@ -448,14 +448,20 @@ fn native_discovery_reserves_identity_before_start_and_keeps_history_external() 
         json!([]),
         "discovery must not allocate registry IDs"
     );
-    let opened = f.call(&["open", "claude", "--resume", "native-claude-code"]);
+    let opened = f.call(&["launch", "claude", "--resume", "native-claude-code"]);
     let id = opened["id"].as_str().unwrap();
     assert_eq!(
         f.call(&["get", id])["native_session_id"],
         "native-claude-code"
     );
     let again = f
-        .command(&["--json", "open", "claude", "--resume", "native-claude-code"])
+        .command(&[
+            "--json",
+            "launch",
+            "claude",
+            "--resume",
+            "native-claude-code",
+        ])
         .output()
         .unwrap();
     assert!(!again.status.success());
@@ -529,7 +535,7 @@ fn a_project_cannot_redirect_resume_into_another_native_store() {
     )
     .unwrap();
     let opened = f.call(&[
-        "open",
+        "launch",
         "claude",
         "--resume",
         "native-claude-code",
@@ -565,7 +571,7 @@ fn a_fork_gets_a_new_identity_and_cannot_adopt_its_parent() {
     )
     .unwrap();
     let parent = f.call(&[
-        "open",
+        "launch",
         "claude",
         "--resume",
         "native-claude-code",
@@ -574,7 +580,7 @@ fn a_fork_gets_a_new_identity_and_cannot_adopt_its_parent() {
     let program=FAKE.replace("report SessionStart\nlast=","report SessionStart\npayload='{\"session_id\":\"forked\",\"root_confirmed\":true}'\nreport SessionStart\nlast=");
     std::fs::write(f.root.path().join("bin/claude"), program).unwrap();
     let fork = f.call(&[
-        "open",
+        "launch",
         "claude",
         "--resume",
         "native-claude-code",
@@ -599,7 +605,7 @@ fn a_fork_gets_a_new_identity_and_cannot_adopt_its_parent() {
 fn restart_never_silently_discards_an_unknown_policy_option() {
     let f = Fixture::new();
     let opened = f.call(&[
-        "open",
+        "launch",
         "claude",
         "--headless",
         "--",
@@ -651,7 +657,7 @@ fn scanner_does_not_allocate_an_id_for_a_managed_process() {
     let config = f.root.path().join("c/tower");
     std::fs::create_dir_all(&config).unwrap();
     std::fs::write(config.join("config.toml"), "[scan]\ninterval_s=1\n").unwrap();
-    let opened = f.call(&["open", "claude", "--headless"]);
+    let opened = f.call(&["launch", "claude", "--headless"]);
     let id = opened["id"].as_str().unwrap();
     f.wait(id, "idle");
     thread::sleep(Duration::from_millis(2200));
@@ -686,7 +692,7 @@ printf '{"session_id":"pty-native","root_confirmed":true}' | "$TOWER_TEST_BIN" h
 printf READY
 cat
 "#).unwrap();
-    let opened = f.call(&["open", "opencode", "--headless"]);
+    let opened = f.call(&["launch", "opencode", "--headless"]);
     let id = opened["id"].as_str().unwrap();
     let row = f.wait(id, "idle");
     assert_eq!(row["caps"]["message"], "pty");
@@ -735,7 +741,7 @@ esac
 printf READY
 cat
 "#).unwrap();
-    let opened = f.call(&["open", "opencode", "--headless"]);
+    let opened = f.call(&["launch", "opencode", "--headless"]);
     let id = opened["id"].as_str().unwrap();
     let before = f.wait(id, "working");
     f.call(&["pool", "upgrade"]);
@@ -763,7 +769,7 @@ fn codex_launch_explains_a_daemon_that_cannot_start() {
     )
     .unwrap();
     tower_pal::make_executable(&codex).unwrap();
-    let opened = f.call(&["open", "codex", "--headless"]);
+    let opened = f.call(&["launch", "codex", "--headless"]);
     let id = opened["id"].as_str().unwrap();
     let until = Instant::now() + Duration::from_secs(20);
     loop {
@@ -777,17 +783,17 @@ fn codex_launch_explains_a_daemon_that_cannot_start() {
 }
 
 #[test]
-fn terminal_open_starts_by_default_and_defer_is_explicit() {
+fn terminal_launch_starts_by_default_and_defer_is_explicit() {
     let f = Fixture::new();
     let opened = f.call(&[
-        "open", "pi", "--term", "xterm", "--rows", "31", "--cols", "101",
+        "launch", "pi", "--term", "xterm", "--rows", "31", "--cols", "101",
     ]);
     let id = opened["id"].as_str().unwrap();
     f.wait(id, "idle");
     let snapshot = f.call(&["snapshot", id]);
     assert_eq!(snapshot["rows"], 31);
     assert_eq!(snapshot["cols"], 101);
-    let deferred = f.call(&["open", "opencode", "--defer"]);
+    let deferred = f.call(&["launch", "opencode", "--defer"]);
     let id = deferred["id"].as_str().unwrap();
     let row = f.call(&["get", id]);
     assert_eq!(row["status"], "starting");
@@ -795,7 +801,7 @@ fn terminal_open_starts_by_default_and_defer_is_explicit() {
     assert!(!f.root.path().join("opencode.starts").exists());
     let unsupported = f
         .command(&[
-            "open",
+            "launch",
             "codex",
             "--protocol",
             "codex-app-server",
@@ -810,8 +816,8 @@ fn terminal_open_starts_by_default_and_defer_is_explicit() {
             .contains("Terminal options require a terminal session")
     );
     for args in [
-        vec!["open", "pi", "--term", "bad/term"],
-        vec!["open", "pi", "--rows", "0", "--cols", "80"],
+        vec!["launch", "pi", "--term", "bad/term"],
+        vec!["launch", "pi", "--rows", "0", "--cols", "80"],
     ] {
         assert!(!f.command(&args).output().unwrap().status.success());
     }

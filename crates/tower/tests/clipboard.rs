@@ -290,7 +290,7 @@ async fn clipboard_two_clients_paste_sources_shims_detach_and_restart() {
     let a_image = image_size(32, 256, 128);
     assert!(a_image.len() > 64 * 1024);
     let b_image = image(224);
-    let codex = f.call(&["open", "codex", "--headless"])["id"]
+    let codex = f.call(&["launch", "codex", "--headless"])["id"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -300,7 +300,7 @@ async fn clipboard_two_clients_paste_sources_shims_detach_and_restart() {
         ("codex", codex),
         (
             "claude",
-            f.call(&["open", "claude", "--headless"])["id"]
+            f.call(&["launch", "claude", "--headless"])["id"]
                 .as_str()
                 .unwrap()
                 .to_owned(),
@@ -385,7 +385,7 @@ async fn clipboard_two_clients_paste_sources_shims_detach_and_restart() {
         );
         f.call(&["kill", &id]);
     }
-    let codex = f.call(&["open", "codex", "--headless"])["id"]
+    let codex = f.call(&["launch", "codex", "--headless"])["id"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -558,10 +558,10 @@ trust_level="trusted"
         std::fs::write(home.join(".claude.json"),serde_json::to_vec(&json!({"hasCompletedOnboarding":true,"theme":"dark","customApiKeyResponses":{"approved":["fixture-key"]},"projects":{path.to_str().unwrap():{"hasTrustDialogAccepted":true,"hasCompletedProjectOnboarding":true}}})).unwrap()).unwrap();
     }
     let args = if harness == "codex" {
-        vec!["open", "codex", "--headless", "--", "Reply with ready."]
+        vec!["launch", "codex", "--headless", "--", "Reply with ready."]
     } else {
         vec![
-            "open",
+            "launch",
             "claude",
             "--headless",
             "--",
@@ -644,7 +644,7 @@ trust_level="trusted"
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn attach_binds_stdin_credentials_without_echo_and_rejects_agent_providers() {
     let f = Fixture::new();
-    let id = f.call(&["open", "codex", "--headless"])["id"]
+    let id = f.call(&["launch", "codex", "--headless"])["id"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -724,7 +724,7 @@ async fn attach_binds_stdin_credentials_without_echo_and_rejects_agent_providers
 async fn stalled_provider_does_not_block_other_clients_and_revocation_discards_queued_submit() {
     use tokio::io::{AsyncBufReadExt, BufReader};
     let f = Fixture::new();
-    let id = f.call(&["open", "codex", "--headless"])["id"]
+    let id = f.call(&["launch", "codex", "--headless"])["id"]
         .as_str()
         .unwrap()
         .to_owned();

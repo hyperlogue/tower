@@ -14,7 +14,9 @@ pub async fn run(
         .await?;
     let harness = Harness::parse(&name).ok_or("Unknown harness")?;
     if harness == Harness::Codex {
-        return Err("Codex requires a managed app-server session; use tower-cli open codex".into());
+        return Err(
+            "Codex requires a managed app-server session; use tower-cli launch codex".into(),
+        );
     }
     let cwd = std::env::current_dir()?;
     let exe = tower_pal::Program::Cli.path()?;

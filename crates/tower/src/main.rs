@@ -43,7 +43,7 @@ enum Command {
         #[arg(last = true)]
         args: Vec<String>,
     },
-    Open {
+    Launch {
         harness: String,
         #[arg(long)]
         checkout: Option<String>,
@@ -793,7 +793,7 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
         Command::Checkout { command } => vcs::checkout(&mut client, command).await?,
         Command::Vcs { command } => vcs::vcs(&mut client, command).await?,
         Command::Catalog => print_json(&client.call("catalog.get", &serde_json::json!({})).await?)?,
-        Command::Open {
+        Command::Launch {
             harness,
             checkout,
             protocol,

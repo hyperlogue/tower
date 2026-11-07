@@ -103,7 +103,7 @@ Register an existing working copy or bare repository, then use checkout IDs:
 tower-cli checkout register "$PWD"
 tower-cli checkout list
 tower-cli vcs status CHECKOUT_ID
-tower-cli open codex --checkout CHECKOUT_ID
+tower-cli launch codex --checkout CHECKOUT_ID
 ```
 
 Registration discovers linked worktrees too. Bare storage is not a checkout; it
@@ -233,22 +233,22 @@ Install the desired agent CLIs on `PATH`:
 
 ```sh
 ./target/debug/tower-cli agents supported
-./target/debug/tower-cli open claude --cwd "$PWD"
-./target/debug/tower-cli open codex --cwd "$PWD"
+./target/debug/tower-cli launch claude --cwd "$PWD"
+./target/debug/tower-cli launch codex --cwd "$PWD"
 ./target/debug/tower-cli attach SESSION_ID
 ./target/debug/tower-cli snapshot SESSION_ID --json
 ./target/debug/tower-cli restart SESSION_ID
 ./target/debug/tower-cli kill SESSION_ID
 ./target/debug/tower-cli agents resumable
 ./target/debug/tower-cli agents conversations --harness claude
-./target/debug/tower-cli open claude --resume NATIVE_SESSION_ID
-./target/debug/tower-cli open codex --resume NATIVE_SESSION_ID --fork
+./target/debug/tower-cli launch claude --resume NATIVE_SESSION_ID
+./target/debug/tower-cli launch codex --resume NATIVE_SESSION_ID --fork
 ./target/debug/tower-cli resume SESSION_ID
 ./target/debug/tower-cli events
 ```
 
 Terminal sessions start immediately by default, including launches without an
-attached terminal. Interactive `open` also attaches; `--headless` suppresses that
+attached terminal. Interactive `launch` also attaches; `--headless` suppresses that
 automatic attach. Use `--defer` to reserve a session until an explicit attach.
 Optional `--term TERM --rows ROWS --cols COLS` sets launch parameters. Otherwise
 the pool uses the last successful attach's terminal type and dimensions, saved in
@@ -365,7 +365,7 @@ Omit `codex.endpoint` to use the Codex daemon. The app-server must run with a
 Bash or Zsh `SHELL`; when Tower starts the daemon it supplies Bash if needed. Approved project environment values and Tower MCP
 credentials are stored in private per-session files; they are not placed in
 native configuration values or applied to the shared server environment.
-Per-launch model and permission options remain available through `open -- …`.
+Per-launch model and permission options remain available through `launch -- …`.
 Restart and resume keep the Tower ID. They require a native conversation ID.
 Recovery after pool or host loss resumes previously active conversations; it
 reports failure instead of starting a different conversation when the native ID
@@ -500,7 +500,7 @@ The scanner skips managed-process ownership markers. Scan-only records cannot
 receive messages until registration establishes a delivery channel. Installed
 hooks report external Claude/Codex state. Codex requires native hook trust review.
 `tower-cli run` uses the current terminal and registers the process without starting a
-pool. Codex requires `tower-cli open codex`, which uses the shared app-server.
+pool. Codex requires `tower-cli launch codex`, which uses the shared app-server.
 
 `tower-cli mcp` serves the seven agent tools over stdio. Managed Claude/Codex sessions
 receive its configuration automatically. External installations can be removed

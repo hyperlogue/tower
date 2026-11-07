@@ -183,7 +183,7 @@ async fn exercise_claude(native_delivery: bool) {
         .unwrap();
     }
     let opened = f.call(&[
-        "open",
+        "launch",
         "claude",
         "--headless",
         "--",

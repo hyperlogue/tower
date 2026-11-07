@@ -257,7 +257,7 @@ trust_level = "trusted"
     )
     .unwrap();
     let opened = f.call(&[
-        "open",
+        "launch",
         "codex",
         "--headless",
         "--cwd",

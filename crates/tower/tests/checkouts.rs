@@ -277,7 +277,7 @@ fn selected_checkout_cannot_launch_into_a_replaced_directory() {
     let output = f
         .command(&[
             "--json",
-            "open",
+            "launch",
             "codex",
             "--headless",
             "--checkout",
