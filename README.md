@@ -1,5 +1,7 @@
 # tower
 
+<img src="assets/tower.svg" alt="Tower icon" width="160" height="160">
+
 Tower manages and monitors agent sessions on one development server. It provides
 shared terminal attachment, a local registry, scoped tokens, and live status events.
 The pool and terminal parser are implemented in Rust, without libshpool or libghostty.

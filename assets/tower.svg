@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-labelledby="tower-title tower-desc">
+  <title id="tower-title">Tower</title>
+  <desc id="tower-desc">Minimal control tower in low-angle perspective, in deep ink and jade on a white rounded tile.</desc>
+  <rect x="2" y="2" width="1020" height="1020" rx="192" fill="#FFFFFF" stroke="#E1E5E9" stroke-width="3"/>
+  <!-- Perspective slopes: -0.36 and +0.64. Roof: 22-unit normal thickness.
+       Roof/cab gap: 18 units normal to each edge. Cab/shaft gap: 20 units.
+       Optical horizontal correction: -12 units. Solid vector fills only. -->
+  <path id="roof" fill="#102F46" d="M258.000,270.207 564.978,159.695 746.000,275.549 746.000,301.669 562.240,184.063 258.000,293.589Z"/>
+  <path id="cab-front" fill="#299C97" d="M288.000,301.920 560.000,204.000 560.000,350.000 332.000,432.080Z"/>
+  <path id="cab-side" fill="#102F46" d="M560.000,204.000 722.000,307.680 682.000,428.080 560.000,350.000Z"/>
+  <path id="shaft-front" fill="#299C97" d="M426.000,419.497 557.511,372.152 557.511,864.000 370.000,826.000Z"/>
+  <path id="shaft-side" fill="#102F46" d="M557.511,372.152 628.000,417.265 674.000,826.000 557.511,864.000Z"/>
+</svg>
