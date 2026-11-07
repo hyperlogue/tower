@@ -684,6 +684,7 @@ fn relocated_bundle_preserves_owned_session_and_attach_streams_on_restart() {
         pool::write_sync(
             &mut s,
             &Request::Attach {
+                term: "xterm-256color".into(),
                 name: id.into(),
                 size: Size::default(),
                 clipboard: None,
@@ -893,7 +894,7 @@ async fn a_cancelled_partial_response_requires_a_fresh_client_connection() {
             .unwrap();
         std::future::pending::<()>().await;
     });
-    let mut client = towerd::client::Client::connect(&paths, Default::default(), false)
+    let mut client = tower_server::client::Client::connect(&paths, Default::default(), false)
         .await
         .unwrap();
     assert!(
@@ -910,7 +911,9 @@ async fn a_cancelled_partial_response_requires_a_fresh_client_connection() {
     )
     .await
     .unwrap();
-    assert!(matches!(retry,Err(towerd::Error::Other(message)) if message.contains("reconnect")));
+    assert!(
+        matches!(retry,Err(tower_server::Error::Other(message)) if message.contains("reconnect"))
+    );
     peer.abort();
 }
 
@@ -1394,7 +1397,7 @@ async fn startup_retries_only_the_handshake_not_an_uncertain_mutation() {
             "An application mutation must never be automatically retried"
         );
     });
-    let result = towerd::client::Client::connect(&paths, Default::default(), true).await;
+    let result = tower_server::client::Client::connect(&paths, Default::default(), true).await;
     if result.is_err() {
         peer.abort();
     }

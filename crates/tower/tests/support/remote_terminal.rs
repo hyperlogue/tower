@@ -103,6 +103,7 @@ async fn terminal_launch_attaches_and_recovers_without_replay_or_structured_cont
     pool::write(
         &mut stream,
         &Request::Attach {
+            term: "xterm-256color".into(),
             name: info["pool_session"].as_str().unwrap().into(),
             size: Size::default(),
             clipboard: None,

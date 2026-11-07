@@ -3,7 +3,7 @@ use clap::{Args, Parser, Subcommand};
 use std::process::ExitCode;
 use tower_pal::Paths;
 use tower_protocol::*;
-use towerd::client::Client;
+use tower_server::client::Client;
 mod attach;
 mod clipboard;
 mod hooks;
@@ -53,6 +53,14 @@ enum Command {
         cwd: Option<String>,
         #[arg(long)]
         headless: bool,
+        #[arg(long, help = "Reserve the session until an explicit attach")]
+        defer: bool,
+        #[arg(long, help = "TERM for the new terminal session")]
+        term: Option<String>,
+        #[arg(long, requires = "cols")]
+        rows: Option<u16>,
+        #[arg(long, requires = "rows")]
+        cols: Option<u16>,
         #[arg(long)]
         resume: Option<String>,
         #[arg(long, requires = "resume")]
@@ -477,7 +485,7 @@ fn main() -> ExitCode {
     match execute(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            if let Some(towerd::Error::Rpc(error)) = e.downcast_ref::<towerd::Error>() {
+            if let Some(tower_server::Error::Rpc(error)) = e.downcast_ref::<tower_server::Error>() {
                 if json {
                     println!("{}", serde_json::json!({"error":error}));
                 } else {
@@ -580,7 +588,7 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
         ..
     } = &cli.command
     {
-        towerd::allgather::validate_pairing_code(code)?;
+        tower_server::allgather::validate_pairing_code(code)?;
     }
     if matches!(cli.command, Command::Mcp { command: None }) {
         return mcp::serve(paths, context()?, !cli.no_start).await;
@@ -594,7 +602,7 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
     );
     let mut client = match Client::connect(&paths, context()?, !cli.no_start && !stopping).await {
         Ok(c) => c,
-        Err(towerd::Error::Io(e))
+        Err(tower_server::Error::Io(e))
             if stopping
                 && matches!(
                     e.kind(),
@@ -624,8 +632,8 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
                 .await??;
                 let key = Secret(String::from_utf8(bytes)?.trim_end().into());
                 let url = match url {
-                    Some(url) => towerd::allgather::enrollment_url(&url)?,
-                    None => towerd::allgather::configured_url(&paths)?,
+                    Some(url) => tower_server::allgather::enrollment_url(&url)?,
+                    None => tower_server::allgather::configured_url(&paths)?,
                 };
                 print_json(
                     &client
@@ -638,12 +646,12 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
                 let started = loop {
                     match client.call("allgather.enrollment.begin", &params).await {
                         Ok(result) => break serde_json::to_value(result)?,
-                        Err(towerd::Error::Rpc(e))
+                        Err(tower_server::Error::Rpc(e))
                             if matches!(
                                 e.data.code.as_str(),
                                 "enrollment_unavailable" | "rate_limited"
                             ) => {}
-                        Err(towerd::Error::Io(_)) => {
+                        Err(tower_server::Error::Io(_)) => {
                             client = Client::connect(&paths, context()?, !cli.no_start).await?;
                         }
                         Err(error) => return Err(error.into()),
@@ -681,7 +689,7 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
                         .await
                     {
                         Ok(value) => serde_json::to_value(value)?,
-                        Err(towerd::Error::Rpc(e))
+                        Err(tower_server::Error::Rpc(e))
                             if matches!(
                                 e.data.code.as_str(),
                                 "enrollment_unavailable" | "rate_limited"
@@ -689,7 +697,7 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
                         {
                             continue;
                         }
-                        Err(towerd::Error::Io(_)) => {
+                        Err(tower_server::Error::Io(_)) => {
                             client = Client::connect(&paths, context()?, !cli.no_start).await?;
                             continue;
                         }
@@ -791,11 +799,23 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
             protocol,
             cwd,
             headless,
+            defer,
+            term,
+            rows,
+            cols,
             resume,
             fork,
             args,
         } => {
+            let terminal = (defer || term.is_some() || rows.is_some()).then(|| TerminalOptions {
+                term,
+                size: rows
+                    .zip(cols)
+                    .map(|(rows, cols)| TerminalSize { rows, cols }),
+                defer,
+            });
             let params = SessionOpenParams {
+                terminal,
                 checkout_id: checkout.clone(),
                 harness,
                 protocol,
@@ -816,7 +836,7 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
             let opened: SessionOpenResult = serde_json::from_value(serde_json::to_value(&r)?)?;
             if cli.json {
                 print_json(&r)?;
-            } else if !headless && tower_pal::is_terminal() {
+            } else if !headless && !defer && tower_pal::is_terminal() {
                 if opened.caps.is_some_and(|caps| caps.attach) {
                     attach::run(&mut client, &opened.id).await?;
                 } else {
@@ -894,7 +914,9 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
             let mut waiting = false;
             let r = loop {
                 match client.call("pool.upgrade", &params).await {
-                    Err(towerd::Error::Rpc(e)) if wait_idle && e.data.code == "sessions_busy" => {
+                    Err(tower_server::Error::Rpc(e))
+                        if wait_idle && e.data.code == "sessions_busy" =>
+                    {
                         if !std::mem::replace(&mut waiting, true) {
                             eprintln!("tower-cli: waiting for terminal sessions to become idle");
                         }
@@ -1367,7 +1389,7 @@ mod tests {
         else {
             panic!()
         };
-        assert!(towerd::allgather::validate_pairing_code(&code).is_err());
+        assert!(tower_server::allgather::validate_pairing_code(&code).is_err());
     }
     #[test]
     fn malformed_identity_environment_never_disappears_into_human_context() {

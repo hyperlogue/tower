@@ -60,7 +60,7 @@ pub(super) fn start(
                 let event = match events.recv().await {
                     Ok(v) => v,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        eprintln!("towerd: event sink lagged; transient events were dropped");
+                        eprintln!("tower: event sink lagged; transient events were dropped");
                         continue;
                     }
                     Err(_) => break,
@@ -109,7 +109,7 @@ pub(super) fn start(
                     .is_ok()
                 };
                 if !ok {
-                    eprintln!("towerd: event sink delivery failed");
+                    eprintln!("tower: event sink delivery failed");
                 }
             }
         }));

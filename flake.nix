@@ -78,7 +78,7 @@
           core = craneLib.cargoClippy (commonArgs
             // {
               inherit cargoArtifacts;
-              cargoExtraArgs = "-p towerd --locked";
+              cargoExtraArgs = "-p tower-server --locked";
               cargoClippyExtraArgs = "--all-targets -- -D warnings";
             });
           clippy = craneLib.cargoClippy (commonArgs

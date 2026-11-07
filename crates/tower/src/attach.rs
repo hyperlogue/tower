@@ -1,7 +1,7 @@
 use crate::Result;
 use std::{path::PathBuf, time::Duration};
 use tower_protocol::{AttachInfo, ClipboardClient, ClipboardTicket, IdParams};
-use towerd::client::Client;
+use tower_server::client::Client;
 
 pub async fn run(client: &mut Client, id: &str) -> Result<()> {
     with_clipboard(client, id, None, false).await

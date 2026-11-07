@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Internal control and attach protocol between towerd and tower-pool."
+description = "Internal control and attach protocol between the Tower server and terminal pool."
 
 [lints]
 workspace = true

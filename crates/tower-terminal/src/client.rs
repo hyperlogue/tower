@@ -25,6 +25,10 @@ pub async fn attach_with_terminal(info: AttachInfo, terminal: LocalTerminal) -> 
     wire::write(
         &mut socket,
         &Request::Attach {
+            term: tower_pal::environment()
+                .get("TERM")
+                .cloned()
+                .unwrap_or_else(|| "xterm-256color".into()),
             name: info.pool_session,
             size,
             clipboard: info.clipboard,

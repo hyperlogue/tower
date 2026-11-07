@@ -420,6 +420,8 @@ pub struct NameParams {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionOpenParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<TerminalOptions>,
     #[serde(default)]
     pub checkout_id: Option<String>,
     #[serde(default)]
@@ -430,11 +432,26 @@ pub struct SessionOpenParams {
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default)]
+    // Retained for older clients; startup timing is controlled by terminal.defer.
     pub headless: bool,
     #[serde(default)]
     pub mode: Option<String>,
     #[serde(default)]
     pub resume: Option<ConversationSeed>,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct TerminalOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub term: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<TerminalSize>,
+    #[serde(default)]
+    pub defer: bool,
+}
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct TerminalSize {
+    pub rows: u16,
+    pub cols: u16,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConversationSeed {

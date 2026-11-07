@@ -62,7 +62,7 @@ jobs:
         run: nix develop --command cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Check daemon without terminal support
-        run: nix develop --command cargo check -p towerd --locked
+        run: nix develop --command cargo check -p tower-server --locked
 
       - name: Check Nix flake
         run: nix flake check --print-build-logs

@@ -564,7 +564,13 @@ fn a_fork_gets_a_new_identity_and_cannot_adopt_its_parent() {
         ),
     )
     .unwrap();
-    let parent = f.call(&["open", "claude", "--resume", "native-claude-code"]);
+    let parent = f.call(&[
+        "open",
+        "claude",
+        "--resume",
+        "native-claude-code",
+        "--defer",
+    ]);
     let program=FAKE.replace("report SessionStart\nlast=","report SessionStart\npayload='{\"session_id\":\"forked\",\"root_confirmed\":true}'\nreport SessionStart\nlast=");
     std::fs::write(f.root.path().join("bin/claude"), program).unwrap();
     let fork = f.call(&[
@@ -767,5 +773,46 @@ fn codex_launch_explains_a_daemon_that_cannot_start() {
         }
         assert!(Instant::now() < until, "no daemon start error: {snapshot}");
         thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn terminal_open_starts_by_default_and_defer_is_explicit() {
+    let f = Fixture::new();
+    let opened = f.call(&[
+        "open", "pi", "--term", "xterm", "--rows", "31", "--cols", "101",
+    ]);
+    let id = opened["id"].as_str().unwrap();
+    f.wait(id, "idle");
+    let snapshot = f.call(&["snapshot", id]);
+    assert_eq!(snapshot["rows"], 31);
+    assert_eq!(snapshot["cols"], 101);
+    let deferred = f.call(&["open", "opencode", "--defer"]);
+    let id = deferred["id"].as_str().unwrap();
+    let row = f.call(&["get", id]);
+    assert_eq!(row["status"], "starting");
+    assert!(row["pid"].is_null());
+    assert!(!f.root.path().join("opencode.starts").exists());
+    let unsupported = f
+        .command(&[
+            "open",
+            "codex",
+            "--protocol",
+            "codex-app-server",
+            "--term",
+            "xterm",
+        ])
+        .output()
+        .unwrap();
+    assert!(!unsupported.status.success());
+    assert!(
+        String::from_utf8_lossy(&unsupported.stderr)
+            .contains("Terminal options require a terminal session")
+    );
+    for args in [
+        vec!["open", "pi", "--term", "bad/term"],
+        vec!["open", "pi", "--rows", "0", "--cols", "80"],
+    ] {
+        assert!(!f.command(&args).output().unwrap().status.success());
     }
 }

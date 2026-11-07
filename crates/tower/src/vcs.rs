@@ -1,7 +1,7 @@
 use crate::{Result, print_json};
 use clap::{Subcommand, ValueEnum};
 use serde_json::{Value, json};
-use towerd::client::Client;
+use tower_server::client::Client;
 
 #[derive(Clone, Copy, ValueEnum)]
 pub enum Auth {

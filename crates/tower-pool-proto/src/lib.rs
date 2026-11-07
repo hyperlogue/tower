@@ -14,7 +14,7 @@ use std::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 pub const MAX_FRAME: usize = 256 * 1024;
 pub const DATA_CHUNK: usize = 32 * 1024;
 pub const MAX_SNAPSHOT: usize = 64 * 1024 * 1024;
@@ -43,8 +43,20 @@ impl Size {
         })
     }
 }
+pub fn valid_term(term: &str) -> bool {
+    !term.is_empty()
+        && term.len() <= 64
+        && term
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_+.".contains(&b))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Launch {
+    #[serde(default)]
+    pub term: Option<String>,
+    #[serde(default)]
+    pub defer: bool,
     pub name: String,
     pub argv: Vec<String>,
     pub cwd: String,
@@ -84,6 +96,7 @@ pub enum Request {
     },
     Attach {
         name: String,
+        term: String,
         size: Size,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         clipboard: Option<tower_protocol::ClipboardTicket>,

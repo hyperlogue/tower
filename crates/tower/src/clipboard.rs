@@ -28,7 +28,7 @@ pub enum Command {
 pub async fn run(
     command: Command,
     paths: &tower_pal::Paths,
-    client: &mut towerd::client::Client,
+    client: &mut tower_server::client::Client,
 ) -> Result<()> {
     match command {
         Command::Provide {

@@ -358,6 +358,7 @@ async fn run_inner(
         let prepare_backend = backend.clone();
         let id = b.tower_session_id.clone();
         let request = SessionOpenParams {
+            terminal: None,
             protocol: Some("terminal".into()),
             harness: b.harness.clone(),
             cwd: b.cwd.clone(),

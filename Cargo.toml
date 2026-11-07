@@ -12,7 +12,7 @@ members = [
     "crates/tower-clipboard",
     "crates/tower-vcs",
     "crates/tower-agents",
-    "crates/towerd",
+    "crates/tower-server",
     "crates/tower",
 ]
 
@@ -39,7 +39,7 @@ tempfile = "3"
 tower-protocol = { path = "crates/tower-protocol" }
 tower-pal = { path = "crates/tower-pal" }
 tower-store = { path = "crates/tower-store" }
-towerd = { path = "crates/towerd" }
+tower-server = { path = "crates/tower-server" }
 tower-pool-proto = { path = "crates/tower-pool-proto" }
 tower-pool = { path = "crates/tower-pool" }
 tower-agents = { path = "crates/tower-agents" }

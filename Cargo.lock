@@ -2158,9 +2158,9 @@ dependencies = [
  "tower-pool-proto",
  "tower-protocol",
  "tower-runtime",
+ "tower-server",
  "tower-sessions",
  "tower-terminal",
- "towerd",
 ]
 
 [[package]]
@@ -2254,6 +2254,7 @@ dependencies = [
 name = "tower-pool"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "serde_json",
  "tokio",
  "tower-clipboard",
@@ -2302,6 +2303,34 @@ dependencies = [
  "tower-sessions",
  "tower-store",
  "url",
+]
+
+[[package]]
+name = "tower-server"
+version = "0.1.0"
+dependencies = [
+ "async-stream",
+ "axum",
+ "base64 0.22.1",
+ "futures-util",
+ "getrandom 0.4.3",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "tempfile",
+ "thiserror",
+ "time",
+ "tokio",
+ "tokio-tungstenite",
+ "toml",
+ "tower-clipboard",
+ "tower-pal",
+ "tower-protocol",
+ "tower-sessions",
+ "tower-store",
+ "tower-vcs",
 ]
 
 [[package]]
@@ -2365,34 +2394,6 @@ dependencies = [
  "tokio",
  "tower-pal",
  "url",
-]
-
-[[package]]
-name = "towerd"
-version = "0.1.0"
-dependencies = [
- "async-stream",
- "axum",
- "base64 0.22.1",
- "futures-util",
- "getrandom 0.4.3",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "subtle",
- "tempfile",
- "thiserror",
- "time",
- "tokio",
- "tokio-tungstenite",
- "toml",
- "tower-clipboard",
- "tower-pal",
- "tower-protocol",
- "tower-sessions",
- "tower-store",
- "tower-vcs",
 ]
 
 [[package]]

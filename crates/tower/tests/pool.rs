@@ -58,6 +58,8 @@ impl Pool {
         assert!(matches!(
             self.call(Request::Create {
                 launch: Launch {
+                    term: None,
+                    defer: !headless,
                     name: name.into(),
                     argv: vec!["sh".into(), "-c".into(), script.into()],
                     env: BTreeMap::new(),
@@ -76,10 +78,14 @@ impl Pool {
         sessions
     }
     fn attach(&self, name: &str, size: Size) -> tower_pal::BlockingIpcStream {
+        self.attach_term(name, size, "xterm-256color")
+    }
+    fn attach_term(&self, name: &str, size: Size, term: &str) -> tower_pal::BlockingIpcStream {
         let mut s = self.connect();
         wire::write_sync(
             &mut s,
             &Request::Attach {
+                term: term.into(),
                 name: name.into(),
                 size,
                 clipboard: None,
@@ -170,7 +176,7 @@ fn until(s: &mut impl Read, needle: &[u8]) -> Vec<u8> {
     out
 }
 #[test]
-fn lazy_spawn_two_clients_size_and_disconnect_are_independent() {
+fn deferred_spawn_two_clients_size_and_disconnect_are_independent() {
     let p = Pool::new();
     p.launch("shared", "stty raw -echo; printf READY; exec cat", false);
     assert_eq!(p.list()[0].state, "reserved");
@@ -501,4 +507,144 @@ fn injection_requires_fresh_idle_evidence_and_cannot_replace_user_input() {
     wait(|| String::from_utf8_lossy(&pool.snapshot("injection").1).contains("draft"));
     assert!(matches!(submit(proof(),"BLOCKED"),Reply::Error{code,..} if code=="user_typing"));
     assert!(!String::from_utf8_lossy(&pool.snapshot("injection").1).contains("BLOCKED"));
+}
+
+fn terminal_launch(p: &Pool, name: &str) -> Launch {
+    Launch {
+        name: name.into(),
+        argv: vec![
+            "sh".into(),
+            "-c".into(),
+            "stty raw -echo; printf 'TERM=%s ' \"$TERM\"; stty size; printf READY; exec cat".into(),
+        ],
+        cwd: p.dir.path().to_string_lossy().into_owned(),
+        env: BTreeMap::new(),
+        size: None,
+        term: None,
+        defer: false,
+        clipboard: None,
+    }
+}
+#[test]
+fn immediate_launch_uses_last_attach_preferences_and_explicit_overrides() {
+    let p = Pool::new();
+    let first = terminal_launch(&p, "first");
+    p.call(Request::Create {
+        launch: first.clone(),
+    });
+    wait(|| p.snapshot("first").1.windows(5).any(|v| v == b"READY"));
+    let text = String::from_utf8_lossy(&p.snapshot("first").1).into_owned();
+    assert!(text.contains("TERM=xterm-256color 24 80"), "{text}");
+    let pid = p.list()[0].pid;
+    let mut attached = p.attach_term(
+        "first",
+        Size {
+            rows: 36,
+            cols: 120,
+        },
+        "screen-256color",
+    );
+    until(&mut attached, b"READY");
+    wire::write_sync(&mut attached, &Request::Detach).unwrap();
+    drop(attached);
+    wait(|| p.list()[0].attach_count == 0);
+    // A changed host preference must not turn an exact create retry into a conflict.
+    let Reply::Created { session } = p.call(Request::Create { launch: first }) else {
+        panic!()
+    };
+    assert_eq!(session.pid, pid);
+    p.call(Request::Create {
+        launch: terminal_launch(&p, "cached"),
+    });
+    wait(|| p.snapshot("cached").1.windows(5).any(|v| v == b"READY"));
+    let text = String::from_utf8_lossy(&p.snapshot("cached").1).into_owned();
+    assert!(text.contains("TERM=screen-256color 36 120"), "{text}");
+    let mut explicit = terminal_launch(&p, "explicit");
+    explicit.term = Some("xterm".into());
+    explicit.size = Some(Size { rows: 20, cols: 90 });
+    p.call(Request::Create { launch: explicit });
+    wait(|| p.snapshot("explicit").1.windows(5).any(|v| v == b"READY"));
+    let text = String::from_utf8_lossy(&p.snapshot("explicit").1).into_owned();
+    assert!(text.contains("TERM=xterm 20 90"), "{text}");
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(p.dir.path().join("tower/terminal.json")).unwrap())
+            .unwrap();
+    assert_eq!(saved["term"], "screen-256color");
+    assert_eq!(saved["size"]["cols"], 120);
+}
+#[test]
+fn deferred_launch_takes_the_first_attach_term_and_preferences_survive_pool_restart() {
+    let mut p = Pool::new();
+    let mut deferred = terminal_launch(&p, "deferred");
+    deferred.defer = true;
+    p.call(Request::Create { launch: deferred });
+    assert_eq!(p.list()[0].state, "reserved");
+    assert!(p.list()[0].pid.is_none());
+    let mut attached = p.attach_term("deferred", Size { rows: 29, cols: 99 }, "xterm-kitty");
+    let bytes = until(&mut attached, b"READY");
+    assert!(String::from_utf8_lossy(&bytes).contains("TERM=xterm-kitty 29 99"));
+    drop(attached);
+    p.call(Request::Shutdown);
+    p.child.wait().unwrap();
+    p.child = Command::new(env!("CARGO_BIN_EXE_tower-terminal-pool"))
+        .arg("run")
+        .env("HOME", p.dir.path())
+        .env("XDG_STATE_HOME", p.dir.path())
+        .env("TOKIO_WORKER_THREADS", "2")
+        .env_remove("TOWER_SOCKET")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait(|| {
+        tower_pal::connect_blocking(&p.socket()).is_ok_and(|mut s| wire::hello_sync(&mut s).is_ok())
+    });
+    p.call(Request::Create {
+        launch: terminal_launch(&p, "restored"),
+    });
+    wait(|| p.snapshot("restored").1.windows(5).any(|v| v == b"READY"));
+    let text = String::from_utf8_lossy(&p.snapshot("restored").1).into_owned();
+    assert!(text.contains("TERM=xterm-kitty 29 99"), "{text}");
+}
+#[test]
+fn keyboard_negotiation_before_first_attach_survives_late_attach_and_reattach() {
+    let p = Pool::new();
+    let mut launch = terminal_launch(&p, "keyboard");
+    launch.argv[2] = "stty raw -echo; printf '\\033[>1u\\033[>7u\\033[?u'; dd bs=1 count=5 >/dev/null 2>&1; printf QUERY_REPLIED; exec cat".into();
+    p.call(Request::Create { launch });
+    wait(|| {
+        p.snapshot("keyboard")
+            .1
+            .windows(13)
+            .any(|v| v == b"QUERY_REPLIED")
+    });
+    let pid = p.list()[0].pid;
+    let mut first = p.attach("keyboard", Size::default());
+    let bytes = until(&mut first, b"QUERY_REPLIED");
+    assert!(bytes.windows(5).any(|v| v == b"\x1b[>7u"));
+    assert!(!bytes.windows(4).any(|v| v == b"\x1b[?u"));
+    send(&mut first, b"\x1b[<uPOPPED");
+    until(&mut first, b"POPPED");
+    wire::write_sync(&mut first, &Request::Detach).unwrap();
+    drop(first);
+    wait(|| p.list()[0].attach_count == 0);
+    let mut second = p.attach(
+        "keyboard",
+        Size {
+            rows: 30,
+            cols: 100,
+        },
+    );
+    let bytes = until(&mut second, b"POPPED");
+    assert!(bytes.windows(5).any(|v| v == b"\x1b[>1u"));
+    assert!(!bytes.windows(5).any(|v| v == b"\x1b[>7u"));
+    assert_eq!(p.list()[0].pid, pid);
+    p.call(Request::Create {
+        launch: terminal_launch(&p, "fresh-keyboard"),
+    });
+    let mut fresh = p.attach("fresh-keyboard", Size::default());
+    let bytes = until(&mut fresh, b"READY");
+    assert!(bytes.windows(5).any(|v| v == b"\x1b[=0u"));
+    assert!(!bytes.windows(5).any(|v| v == b"\x1b[>1u"));
 }

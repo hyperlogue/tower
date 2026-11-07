@@ -238,6 +238,12 @@ impl Service {
                 "Cannot allocate a unique session identity",
             )
         })?;
+        if p.terminal.is_some() && backend.terminal().is_none() {
+            return Err(app(
+                "unsupported_control",
+                "Terminal options require a terminal session",
+            ));
+        }
         let prepared = backend.prepare(&id, &p)?;
         if let Some(native) = &prepared.native_session_id {
             match self.store.agent_by_native_id(&prepared.harness, native) {

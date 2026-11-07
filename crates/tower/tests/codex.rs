@@ -503,6 +503,8 @@ trust_level="trusted"
     };
     let (created, _) = pool(&Request::Create {
         launch: Launch {
+            term: None,
+            defer: false,
             name: "external-ui".into(),
             argv: vec![
                 "codex".into(),

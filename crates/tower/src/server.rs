@@ -37,27 +37,31 @@ fn execute(command: Command) -> Result<()> {
             } else {
                 "foreground"
             };
-            runtime()?.block_on(towerd::run(paths.clone(), startup, |database| async move {
-                let terminal = Arc::new(tower_terminal::TerminalBackend::new(paths.clone()));
-                let execution =
-                    tower_runtime::Runtime::open(paths, database, terminal.clone()).await?;
-                Ok(tower_sessions::Backends::new(
-                    "terminal",
-                    vec![
-                        Arc::new(tower_runtime::TerminalBackend::new(
-                            terminal,
-                            execution.clone(),
-                        )),
-                        Arc::new(tower_runtime::Backend::new(
-                            execution.clone(),
-                            "codex-app-server",
-                        )),
-                        Arc::new(tower_runtime::Backend::new(execution.clone(), "acp")),
-                    ],
-                )?
-                .with_execution(execution)
-                .with_delivery(Arc::new(tower_agents::delivery::NativeDelivery)))
-            }))?;
+            runtime()?.block_on(tower_server::run(
+                paths.clone(),
+                startup,
+                |database| async move {
+                    let terminal = Arc::new(tower_terminal::TerminalBackend::new(paths.clone()));
+                    let execution =
+                        tower_runtime::Runtime::open(paths, database, terminal.clone()).await?;
+                    Ok(tower_sessions::Backends::new(
+                        "terminal",
+                        vec![
+                            Arc::new(tower_runtime::TerminalBackend::new(
+                                terminal,
+                                execution.clone(),
+                            )),
+                            Arc::new(tower_runtime::Backend::new(
+                                execution.clone(),
+                                "codex-app-server",
+                            )),
+                            Arc::new(tower_runtime::Backend::new(execution.clone(), "acp")),
+                        ],
+                    )?
+                    .with_execution(execution)
+                    .with_delivery(Arc::new(tower_agents::delivery::NativeDelivery)))
+                },
+            ))?;
         }
         Command::Acp { harness } => runtime()?.block_on(tower_runtime::bridge::run(&harness))?,
     }

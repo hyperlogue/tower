@@ -115,6 +115,7 @@ impl Fixture {
         wire::write(
             &mut stream,
             &Request::Attach {
+                term: "xterm-256color".into(),
                 name: info.pool_session,
                 size: Size::default(),
                 clipboard: info.clipboard,

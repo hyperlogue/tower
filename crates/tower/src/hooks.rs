@@ -92,7 +92,8 @@ pub fn report(harness: &str, event: &str) -> Result<()> {
         .build()?
         .block_on(async {
             tokio::time::timeout(Duration::from_secs(1), async {
-                let mut client = towerd::client::Client::connect(&paths, caller, true).await?;
+                let mut client =
+                    tower_server::client::Client::connect(&paths, caller, true).await?;
                 let identity =
                     serde_json::to_value(client.call("identity.whoami", &json!({})).await?)?;
                 if let Some(id) = identity["id"].as_str()

@@ -84,7 +84,7 @@ where
                 maintenance_service.execute(Service::maintain).await,
                 Ok(Ok(()))
             ) {
-                eprintln!("towerd: registry maintenance failed");
+                eprintln!("tower: registry maintenance failed");
             }
         }
     });
@@ -104,7 +104,7 @@ where
             _=shutdown.notified()=>break Ok(()),
             result=&mut signals=>break result.map_err(Error::from),
             Some(result)=tasks.join_next(),if !tasks.is_empty()=>{
-                if result.is_err() { eprintln!("towerd: client task failed"); }
+                if result.is_err() { eprintln!("tower: client task failed"); }
             },
             connection=listener.accept(),if tasks.len()<128=>{
                 match connection {

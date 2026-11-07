@@ -97,7 +97,7 @@ impl Client {
                         }
                         stream.ok_or_else(|| {
                             Error::Other(
-                                "daemon did not become ready; inspect the private towerd log"
+                                "daemon did not become ready; inspect the private server log"
                                     .into(),
                             )
                         })?

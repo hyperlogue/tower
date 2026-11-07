@@ -94,7 +94,9 @@ async fn call(paths: Paths, context: CallerContext, autostart: bool, request: Va
     let (body, is_error) = match result {
         Ok(v) => (v, false),
         Err(e) => {
-            let data = if let Some(towerd::Error::Rpc(error)) = e.downcast_ref::<towerd::Error>() {
+            let data = if let Some(tower_server::Error::Rpc(error)) =
+                e.downcast_ref::<tower_server::Error>()
+            {
                 json!({"error":error})
             } else {
                 json!({"error":{"code":"tool_failed","message":e.to_string()}})

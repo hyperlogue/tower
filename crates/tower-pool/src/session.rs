@@ -37,6 +37,7 @@ pub enum Command {
     },
     Attach {
         size: Size,
+        term: String,
         out: mpsc::Sender<Out>,
         reply: oneshot::Sender<Result<u64, String>>,
     },
@@ -86,6 +87,7 @@ impl InputUnit {
     }
 }
 struct Actor {
+    defaults: crate::preferences::Profile,
     clipboard: crate::clipboard::Clipboard,
     launch: Launch,
     pty: Option<PtyProcess>,
@@ -106,8 +108,8 @@ struct Actor {
     last_input: Option<u64>,
     consumed_idle: Option<u64>,
 }
-pub fn reserve(launch: Launch) -> Handle {
-    let size = launch.size.unwrap_or_default();
+pub fn reserve(launch: Launch, defaults: crate::preferences::Profile) -> Handle {
+    let size = launch.size.unwrap_or(defaults.size);
     let info = Session {
         name: launch.name.clone(),
         state: "reserved".into(),
@@ -120,6 +122,7 @@ pub fn reserve(launch: Launch) -> Handle {
     let (state, receiver) = watch::channel(info.clone());
     let (tx, rx) = mpsc::channel(64);
     let actor = Actor {
+        defaults,
         clipboard: crate::clipboard::Clipboard::new(launch.name.clone(), launch.clipboard.clone()),
         launch: launch.clone(),
         pty: None,
@@ -190,14 +193,21 @@ impl Actor {
             crate::clipboard::Action::Ignore => {}
         }
     }
-    async fn start(&mut self, size: Size) -> io::Result<()> {
+    async fn start(&mut self, size: Size, attached_term: Option<&str>) -> io::Result<()> {
         if self.pty.is_some() {
             return Ok(());
         }
         if self.info.state == "exited" {
             return Err(io::Error::other("session has exited"));
         }
-        let launch = self.launch.clone();
+        let mut launch = self.launch.clone();
+        let term = launch
+            .term
+            .as_deref()
+            .or(attached_term)
+            .unwrap_or(&self.defaults.term);
+        launch.env.insert("TERM".into(), term.into());
+        launch.env.insert("COLORTERM".into(), "truecolor".into());
         let pty = tokio::task::spawn_blocking(move || {
             PtyProcess::spawn(
                 &launch.argv,
@@ -521,17 +531,24 @@ impl Actor {
                 }
             }
             Command::Start { size, reply } => {
-                let result = self.start(size).await.map_err(|e| e.to_string());
+                let result = self.start(size, None).await.map_err(|e| e.to_string());
                 let _ = reply.send(result);
             }
-            Command::Attach { size, out, reply } => {
+            Command::Attach {
+                size,
+                term,
+                out,
+                reply,
+            } => {
                 if self.clients.len() >= 16 || self.info.state == "exited" || self.killing.is_some()
                 {
                     let _ = reply.send(Err("session is unavailable".into()));
                     return true;
                 }
                 if self.pty.is_none()
-                    && let Err(error) = self.start(size).await
+                    && let Err(error) = self
+                        .start(self.launch.size.unwrap_or(size), Some(&term))
+                        .await
                 {
                     let _ = reply.send(Err(error.to_string()));
                     return true;

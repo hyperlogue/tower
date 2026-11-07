@@ -247,9 +247,15 @@ Install the desired agent CLIs on `PATH`:
 ./target/debug/tower-cli events
 ```
 
-Interactive `open` attaches immediately. Use `--headless` to start at 80 columns
-and 24 rows without attaching. Without a terminal, `open` reserves the session
-until its first attach. Use `--` before arguments intended for the agent. Aliases include `claude`,
+Terminal sessions start immediately by default, including launches without an
+attached terminal. Interactive `open` also attaches; `--headless` suppresses that
+automatic attach. Use `--defer` to reserve a session until an explicit attach.
+Optional `--term TERM --rows ROWS --cols COLS` sets launch parameters. Otherwise
+the pool uses the last successful attach's terminal type and dimensions, saved in
+`terminal.json`, or `xterm-256color` and 80×24 before the first attach. A deferred
+session uses its first attach for unspecified parameters. A running session keeps
+its original `TERM`; connected clients still determine its current PTY size.
+The JSON-RPC equivalent is `terminal: {term?, size?: {rows, cols}, defer?: false}`. Use `--` before arguments intended for the agent. Aliases include `claude`,
 `kimi-code`, `grok-build`, `agy`, and `oh-my-pi`.
 
 Press Ctrl-Space, then Ctrl-Q to detach. Kitty keyboard encodings are supported.
@@ -709,7 +715,7 @@ Run inside the development shell:
 bash scripts/check-toolchain.sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo check -p towerd --locked
+cargo check -p tower-server --locked
 cargo build --workspace --all-targets --locked
 cargo test --workspace --locked
 alejandra --check .
@@ -780,7 +786,7 @@ CLIs or the unpublished Tracetape checkout.
 | `tower-terminal` | Terminal backend, launcher supervision, Codex relay, and attach client |
 | `tower-agents` | Launchers, hooks, and resume adapters for nine harnesses |
 | `tower-runtime` | Structured execution, native adapters, receipts, and transcript journal |
-| `towerd` | Registry, managed backends, authorization, rules, and events |
+| `tower-server` | Registry, managed backends, authorization, rules, and events |
 | `tower-clipboard` | Image provider, transfer broker, and native helper shims |
 | `tower-vcs` | Checked Git/worktree discovery and operations |
 | `tower` | Separate tower, tower-cli, and tower-terminal-pool executable entrypoints |

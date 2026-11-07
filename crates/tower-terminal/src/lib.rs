@@ -245,7 +245,8 @@ struct Binding {
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 struct Plan {
     spec: tower_agents::runtime::AgentSpec,
-    headless: bool,
+    #[serde(default)]
+    terminal: tower_protocol::TerminalOptions,
 }
 fn binding(session: &ManagedSession) -> Result<Binding> {
     decode(&session.binding)
@@ -683,6 +684,24 @@ impl ManagedBackend for TerminalBackend {
             resume: selected.map(|c| c.native),
             fork: request.resume.as_ref().is_some_and(|s| s.fork),
         };
+        if let Some(options) = &request.terminal {
+            if options
+                .term
+                .as_deref()
+                .is_some_and(|term| !tower_pool_proto::valid_term(term))
+            {
+                return Err(error("invalid_params", "Invalid terminal type"));
+            }
+            if options
+                .size
+                .is_some_and(|s| s.rows == 0 || s.cols == 0 || s.rows > 256 || s.cols > 512)
+            {
+                return Err(error(
+                    "invalid_params",
+                    "Terminal size must be 1–256 rows and 1–512 columns",
+                ));
+            }
+        }
         tower_agents::config::validate(&spec)
             .map_err(|e| error("invalid_params", &e.to_string()))?;
         pool::ensure(&self.paths)
@@ -721,7 +740,7 @@ impl ManagedBackend for TerminalBackend {
             binding: encode(&binding)?,
             launch: encode(Plan {
                 spec,
-                headless: request.headless,
+                terminal: request.terminal.clone().unwrap_or_default(),
             })?,
             mode,
             caps: Capabilities {
@@ -782,7 +801,12 @@ impl ManagedBackend for TerminalBackend {
                 ),
             ]
             .into(),
-            size: plan.headless.then(Default::default),
+            term: plan.terminal.term,
+            defer: plan.terminal.defer,
+            size: plan.terminal.size.map(|s| tower_pool_proto::Size {
+                rows: s.rows,
+                cols: s.cols,
+            }),
         };
         pool::ensure(&self.paths)
             .map_err(|_| error("pool_unavailable", "Cannot start terminal pool"))?;
@@ -900,6 +924,14 @@ impl ManagedBackend for TerminalBackend {
         mode: Option<&str>,
         args: Option<&[String]>,
     ) -> Result<PreparedSession> {
+        let mut terminal = session
+            .launch
+            .as_ref()
+            .map(decode::<Plan>)
+            .transpose()?
+            .map(|p| p.terminal)
+            .unwrap_or_default();
+        terminal.defer = false;
         let old = binding(session)?;
         let mut spec = old.plan.spec;
         match launcher::read_state(&std::path::Path::new(&old.plan.state_dir).join("state.json")) {
@@ -959,15 +991,13 @@ impl ManagedBackend for TerminalBackend {
             mode: spec.mode.clone(),
             args: spec.args.clone(),
             headless: true,
+            terminal: Some(terminal.clone()),
         };
         let mut prepared = self.prepare(&session.id, &request)?;
         let mut binding: Binding = decode(&prepared.binding)?;
         binding.plan.spec = spec.clone();
         prepared.binding = encode(binding)?;
-        prepared.launch = encode(Plan {
-            spec,
-            headless: true,
-        })?;
+        prepared.launch = encode(Plan { spec, terminal })?;
         Ok(prepared)
     }
     fn recover(&self, session: &ManagedSession) -> Result<Option<PreparedSession>> {
@@ -1018,7 +1048,8 @@ impl ManagedBackend for TerminalBackend {
                         cwd: plan.spec.cwd,
                         mode: plan.spec.mode,
                         args: plan.spec.args,
-                        headless: plan.headless,
+                        headless: false,
+                        terminal: Some(plan.terminal),
                     },
                 )
                 .map(Some)

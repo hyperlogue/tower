@@ -1,5 +1,6 @@
 mod clipboard;
 mod input;
+mod preferences;
 mod session;
 mod terminal;
 use session::{Command, Handle, Out};
@@ -21,6 +22,9 @@ pub async fn run(paths: Paths) -> io::Result<()> {
     let listener = tower_pal::IpcListener::bind(&paths.pool_socket()).await?;
     let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
     let shutdown = Arc::new(Notify::new());
+    let preferences = Arc::new(Mutex::new(preferences::Preferences::open(
+        paths.state.join("terminal.json"),
+    )?));
     let mut clients = tokio::task::JoinSet::new();
     let signals = tower_pal::shutdown_signal();
     tokio::pin!(signals);
@@ -29,7 +33,7 @@ pub async fn run(paths: Paths) -> io::Result<()> {
          _=shutdown.notified()=>break Ok(()),r=&mut signals=>break r,
          Some(_)=clients.join_next(),if !clients.is_empty()=>{},
          accepted=listener.accept(),if clients.len()<128=>match accepted {
-          Ok((stream,_))=>{let sessions=Arc::clone(&sessions);let shutdown=Arc::clone(&shutdown);clients.spawn(async move {let _=connection(stream,sessions,shutdown).await;});},
+          Ok((stream,_))=>{let sessions=Arc::clone(&sessions);let shutdown=Arc::clone(&shutdown);let preferences=Arc::clone(&preferences);clients.spawn(async move {let _=connection(stream,sessions,shutdown,preferences).await;});},
           Err(e) if e.kind()==io::ErrorKind::PermissionDenied=>{},Err(e)=>break Err(e)
          }
         }
@@ -68,8 +72,13 @@ fn validate(launch: &mut Launch) -> io::Result<()> {
     if let Some(size) = launch.size {
         launch.size = Some(size.bounded()?);
     }
-    launch.env.insert("TERM".into(), "xterm-256color".into());
-    launch.env.insert("COLORTERM".into(), "truecolor".into());
+    if launch
+        .term
+        .as_deref()
+        .is_some_and(|term| !wire::valid_term(term))
+    {
+        return Err(io::Error::other("invalid terminal type"));
+    }
     Ok(())
 }
 async fn reply(stream: &mut IpcStream, response: &Reply) -> io::Result<()> {
@@ -81,6 +90,7 @@ async fn connection(
     mut stream: IpcStream,
     sessions: Sessions,
     shutdown: Arc<Notify>,
+    preferences: Arc<Mutex<preferences::Preferences>>,
 ) -> io::Result<()> {
     let first = tokio::time::timeout(Duration::from_secs(5), wire::read(&mut stream))
         .await
@@ -186,7 +196,8 @@ async fn connection(
                     if map.len() >= 64 {
                         Err(Reply::error("limit", "session limit reached"))
                     } else {
-                        let handle = session::reserve(launch.clone());
+                        let handle =
+                            session::reserve(launch.clone(), preferences.lock().unwrap().current());
                         map.insert(launch.name.clone(), handle.clone());
                         Ok(handle)
                     }
@@ -196,7 +207,8 @@ async fn connection(
                 Ok(handle) => handle,
                 Err(response) => return reply(&mut stream, &response).await,
             };
-            if let Some(size) = launch.size {
+            if !launch.defer {
+                let size = handle.info.borrow().size;
                 let (answer, wait) = oneshot::channel();
                 handle
                     .tx
@@ -241,10 +253,18 @@ async fn connection(
         }
         Request::Attach {
             name,
+            term,
             size,
             clipboard,
         } => {
             let size = size.bounded()?;
+            if !wire::valid_term(&term) {
+                return reply(
+                    &mut stream,
+                    &Reply::error("invalid_params", "Invalid terminal type"),
+                )
+                .await;
+            }
             let Some(handle) = find(&sessions, &name) else {
                 return reply(&mut stream, &Reply::error("not_found", "session not found")).await;
             };
@@ -254,6 +274,7 @@ async fn connection(
                 .tx
                 .send(Command::Attach {
                     size,
+                    term: term.clone(),
                     out: tx,
                     reply: answer,
                 })
@@ -299,6 +320,15 @@ async fn connection(
                         return reply(&mut stream, &Reply::error(&e.data.code, e.message)).await;
                     }
                 }
+            }
+            let remembered = preferences.lock().unwrap().remember(term, size);
+            if let Err(error) = remembered {
+                let _ = handle.tx.send(Command::Detach { id }).await;
+                return reply(
+                    &mut stream,
+                    &Reply::error("preferences_unavailable", error.to_string()),
+                )
+                .await;
             }
             let (read, mut write) = stream.split();
             let mut read = read;
