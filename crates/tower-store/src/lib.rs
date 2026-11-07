@@ -538,8 +538,10 @@ impl Store {
                 record.native_session_id = Some(native);
             }
         }
-        if let Some(name) = o.metadata.display_name {
-            record.display_name = Some(name);
+        match o.metadata.display_name {
+            Patch::Missing => {}
+            Patch::Clear => record.display_name = None,
+            Patch::Set(name) => record.display_name = Some(name),
         }
         if let Some(cwd) = o.metadata.cwd {
             record.cwd = cwd;

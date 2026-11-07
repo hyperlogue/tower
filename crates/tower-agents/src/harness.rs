@@ -14,31 +14,6 @@ pub enum Harness {
     Omp,
 }
 impl Harness {
-    pub fn can_fork(self) -> bool {
-        !matches!(self, Self::Kimi | Self::Antigravity)
-    }
-    pub fn fork_args(self, id: &str) -> Option<Vec<String>> {
-        Some(match self {
-            Self::Codex => vec!["fork".into(), id.into()],
-            Self::Pi | Self::Omp => vec!["--fork".into(), id.into()],
-            Self::ClaudeCode | Self::Grok => {
-                let mut args = self.resume_args(id);
-                args.push("--fork-session".into());
-                args
-            }
-            Self::Reasonix => {
-                let mut args = self.resume_args(id);
-                args.push("--copy".into());
-                args
-            }
-            Self::Opencode => {
-                let mut args = self.resume_args(id);
-                args.push("--fork".into());
-                args
-            }
-            _ => return None,
-        })
-    }
     pub const ALL: [Self; 9] = [
         Self::ClaudeCode,
         Self::Codex,
@@ -50,62 +25,41 @@ impl Harness {
         Self::Antigravity,
         Self::Omp,
     ];
+    pub fn definition(self) -> &'static dyn crate::definition::AgentDefinition {
+        match self {
+            Self::ClaudeCode => &crate::agents::claude::Definition,
+            Self::Codex => &crate::agents::codex::Definition,
+            Self::Reasonix => &crate::agents::reasonix::Definition,
+            Self::Kimi => &crate::agents::kimi::Definition,
+            Self::Grok => &crate::agents::grok::Definition,
+            Self::Opencode => &crate::agents::opencode::Definition,
+            Self::Pi => &crate::agents::pi::Definition,
+            Self::Antigravity => &crate::agents::antigravity::Definition,
+            Self::Omp => &crate::agents::omp::Definition,
+        }
+    }
     pub fn parse(name: &str) -> Option<Self> {
-        Some(match name.to_ascii_lowercase().as_str() {
-            "claude" | "claude-code" | "claudecode" => Self::ClaudeCode,
-            "codex" => Self::Codex,
-            "reasonix" => Self::Reasonix,
-            "kimi" | "kimi-code" => Self::Kimi,
-            "grok" | "grok-build" => Self::Grok,
-            "opencode" => Self::Opencode,
-            "pi" => Self::Pi,
-            "antigravity" | "agy" => Self::Antigravity,
-            "omp" | "oh-my-pi" => Self::Omp,
-            _ => return None,
-        })
+        let name = name.to_ascii_lowercase();
+        Self::ALL
+            .into_iter()
+            .find(|h| h.definition().info().aliases.contains(&name.as_str()))
     }
     pub fn id(self) -> &'static str {
-        match self {
-            Self::ClaudeCode => "claude-code",
-            Self::Codex => "codex",
-            Self::Reasonix => "reasonix",
-            Self::Kimi => "kimi",
-            Self::Grok => "grok",
-            Self::Opencode => "opencode",
-            Self::Pi => "pi",
-            Self::Antigravity => "antigravity",
-            Self::Omp => "omp",
-        }
+        self.definition().info().id
     }
     pub fn program(self) -> &'static str {
-        match self {
-            Self::ClaudeCode => "claude",
-            Self::Antigravity => "agy",
-            _ => self.id(),
-        }
+        self.definition().info().program
     }
     pub fn label(self) -> &'static str {
-        match self {
-            Self::ClaudeCode => "Claude Code",
-            Self::Codex => "Codex",
-            Self::Reasonix => "Reasonix",
-            Self::Kimi => "Kimi Code",
-            Self::Grok => "Grok Build",
-            Self::Opencode => "opencode",
-            Self::Pi => "Pi",
-            Self::Antigravity => "Antigravity",
-            Self::Omp => "oh-my-pi",
-        }
+        self.definition().info().label
+    }
+    pub fn can_fork(self) -> bool {
+        self.definition().supports_fork()
+    }
+    pub fn fork_args(self, id: &str) -> Option<Vec<String>> {
+        self.definition().resume_args(id, true)
     }
     pub fn resume_args(self, id: &str) -> Vec<String> {
-        let selector = match self {
-            Self::ClaudeCode | Self::Grok | Self::Omp => "--resume",
-            Self::Codex => "resume",
-            Self::Reasonix => "-r",
-            Self::Kimi | Self::Pi => "--session",
-            Self::Opencode => "-s",
-            Self::Antigravity => "--conversation",
-        };
-        vec![selector.into(), id.into()]
+        self.definition().resume_args(id, false).unwrap_or_default()
     }
 }

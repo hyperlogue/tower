@@ -822,3 +822,55 @@ fn terminal_launch_starts_by_default_and_defer_is_explicit() {
         assert!(!f.command(&args).output().unwrap().status.success());
     }
 }
+
+#[test]
+fn non_codex_launch_does_not_load_codex_adapter_settings() {
+    let f = Fixture::new();
+    std::fs::create_dir_all(f.root.path().join("c/tower")).unwrap();
+    std::fs::write(
+        f.root.path().join("c/tower/config.toml"),
+        "[codex]\nendpoint=42\n",
+    )
+    .unwrap();
+    let opened = f.call(&["launch", "pi", "--headless"]);
+    f.wait(opened["id"].as_str().unwrap(), "idle");
+}
+
+#[test]
+fn failed_state_writes_do_not_drop_the_native_process_or_replay_its_launch() {
+    let f = Fixture::new();
+    let opened = f.call(&["launch", "pi", "--headless"]);
+    let id = opened["id"].as_str().unwrap();
+    let before = f.wait(id, "idle");
+    let root = f.root.path().join("s/tower/sessions").join(id);
+    let generation = std::fs::read_dir(root)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let path = generation.join("state.json");
+    let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let pid = saved["agent_pid"].as_u64().unwrap() as u32;
+    let identity = tower_pal::process_identity(pid).unwrap();
+    std::fs::rename(&path, generation.join("state.backup")).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    f.phase("work");
+    thread::sleep(Duration::from_millis(700));
+    assert_eq!(
+        tower_pal::process_identity(pid).unwrap().start_time,
+        identity.start_time
+    );
+    std::fs::remove_dir(&path).unwrap();
+    let after = f.wait(id, "working");
+    assert_eq!(after["pid"], before["pid"]);
+    assert_eq!(
+        std::fs::read_to_string(f.root.path().join("pi.starts"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    f.call(&["kill", id]);
+    f.wait(id, "exited");
+}

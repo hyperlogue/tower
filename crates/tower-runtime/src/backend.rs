@@ -45,7 +45,7 @@ pub(crate) fn observation(v: &RuntimeView) -> Result<Observation> {
         &v.state
     };
     let mut detail = serde_json::Map::new();
-    for key in ["model", "context_tokens", "last_tool", "error"] {
+    for key in ["model", "effort", "context_tokens", "last_tool", "error"] {
         if let Some(value) = m.get(key).filter(|v| !v.is_null()) {
             detail.insert(key.into(), value.clone());
         }
@@ -70,11 +70,9 @@ pub(crate) fn observation(v: &RuntimeView) -> Result<Observation> {
         metadata: SessionMetadata {
             shared_process: Some(v.binding.protocol == "codex-app-server"),
             native_session_id: native,
-            display_name: None,
+            display_name: tower_protocol::Patch::Missing,
             cwd: Some(v.binding.cwd.clone()),
-            detail: (!detail.is_empty())
-                .then(|| public(serde_json::Value::Object(detail)))
-                .transpose()?,
+            detail: Some(public(serde_json::Value::Object(detail))?),
         },
     })
 }

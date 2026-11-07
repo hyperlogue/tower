@@ -10,6 +10,8 @@ pub use program::Program;
 mod unix;
 #[cfg(unix)]
 pub use unix::*;
+mod watch;
+pub use watch::FileWatch;
 mod metrics;
 pub use metrics::{HostSample, HostSampler};
 mod command;

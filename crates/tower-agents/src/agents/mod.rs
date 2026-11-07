@@ -1,0 +1,9 @@
+pub(crate) mod antigravity;
+pub(crate) mod claude;
+pub(crate) mod codex;
+pub(crate) mod grok;
+pub(crate) mod kimi;
+pub(crate) mod omp;
+pub(crate) mod opencode;
+pub(crate) mod pi;
+pub(crate) mod reasonix;

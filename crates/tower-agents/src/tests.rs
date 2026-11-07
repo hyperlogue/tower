@@ -288,7 +288,15 @@ fn generated_extensions_execute_native_callbacks_in_order_without_prompt_data() 
         let source = if h == Harness::Opencode {
             extensions::opencode(&receiver)
         } else {
-            extensions::extension(&receiver, h)
+            extensions::extension(
+                &receiver,
+                h,
+                if h == Harness::Pi {
+                    agents::pi::EVENTS
+                } else {
+                    agents::omp::EVENTS
+                },
+            )
         };
         std::fs::write(&module, source).unwrap();
         let module = serde_json::to_string(&format!("file://{}", module.display())).unwrap();
@@ -360,7 +368,7 @@ fn claude_native_activity_corrects_queued_turns_but_preserves_approval_waits() {
     let mut s = state();
     let env =
         tower_pal::Environment::from([("HOME".into(), root.path().to_string_lossy().into_owned())]);
-    let mut activity = activity::Activity::new(Harness::ClaudeCode, &env);
+    let mut activity = agents::claude::activity::Activity::new(&env);
     let path = home.join("sessions/2.json");
     std::fs::write(
         &path,
@@ -465,4 +473,228 @@ fn native_store_identity_is_stable_when_its_directory_is_created() {
     let before = inventory::namespace(Harness::Codex, &env);
     std::fs::create_dir_all(root.path().join(".codex/sessions")).unwrap();
     assert_eq!(before, inventory::namespace(Harness::Codex, &env));
+}
+
+#[test]
+fn native_effort_and_session_switch_metadata_follow_the_selected_root() {
+    let mut state = state();
+    for (payload, effort) in [
+        (json!({"effort":{"level":"high"}}), Some("high")),
+        (
+            json!({"effort":{"level":"low"},"agent_id":"child"}),
+            Some("high"),
+        ),
+        (json!({"effort":{"level":"  "}}), Some("high")),
+        (json!({"effort":{"level":"max"}}), Some("max")),
+    ] {
+        let event = events::parse(
+            Harness::ClaudeCode,
+            "PreToolUse",
+            &serde_json::to_vec(&payload).unwrap(),
+        )
+        .unwrap();
+        events::apply(&mut state, event, 1);
+        assert_eq!(state.detail.effort.as_deref(), effort);
+    }
+    for id in ["first", "second"] {
+        let payload = if id == "first" {
+            json!({"session_id":id,"model":"model","effort":"high","context_tokens":123,"session_title":"old"})
+        } else {
+            json!({"session_id":id})
+        };
+        let event = events::parse(
+            Harness::Pi,
+            "SessionStart",
+            &serde_json::to_vec(&payload).unwrap(),
+        )
+        .unwrap();
+        events::apply(&mut state, event, 2);
+    }
+    assert_eq!(state.native.unwrap().id, "second");
+    assert!(state.detail.model.is_none());
+    assert!(state.detail.effort.is_none());
+    assert!(state.detail.context_tokens.is_none());
+    assert!(state.display_name.is_none());
+}
+#[test]
+fn compaction_withholds_stale_usage_and_coarse_status_cannot_clear_a_question() {
+    let mut state = state();
+    state.detail.context_tokens = Some(900);
+    for (event, expected, phase) in [
+        ("PreCompact", "working", "compacting"),
+        ("PostCompact", "idle", "compacted"),
+    ] {
+        events::apply(
+            &mut state,
+            events::parse(Harness::Pi, event, b"{}").unwrap(),
+            1,
+        );
+        assert_eq!(state.status, expected);
+        assert_eq!(state.detail.phase.as_deref(), Some(phase));
+        assert_eq!(state.detail.context_tokens, None);
+    }
+    events::apply(
+        &mut state,
+        events::parse(Harness::Antigravity, "Elicitation", b"{}").unwrap(),
+        2,
+    );
+    events::apply(
+        &mut state,
+        events::parse(
+            Harness::Antigravity,
+            "status-update",
+            br#"{"agent_state":"working","tool_confirmation_pending":false}"#,
+        )
+        .unwrap(),
+        3,
+    );
+    assert_eq!(state.status, "waiting_input");
+}
+
+#[tokio::test]
+async fn claude_observer_owns_incremental_metadata_and_respects_explicit_model_changes() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join(".claude/projects/project");
+    std::fs::create_dir_all(&project).unwrap();
+    let path = project.join("root.jsonl");
+    let row = r#"{"type":"assistant","cwd":"/work","message":{"model":"before-switch","usage":{"input_tokens":50}}}"#;
+    std::fs::write(&path, format!("{row}\n")).unwrap();
+    let env =
+        tower_pal::Environment::from([("HOME".into(), dir.path().to_string_lossy().into_owned())]);
+    let mut observer = Harness::ClaudeCode.definition().hook_session(&env);
+    let mut s = state();
+    observer.start();
+    observer.apply(
+        &mut s,
+        events::parse(
+            Harness::ClaudeCode,
+            "SessionStart",
+            &serde_json::to_vec(&json!({"session_id":"root","transcript_path":path})).unwrap(),
+        )
+        .unwrap(),
+        1,
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while s.detail.context_tokens != Some(50) {
+            observer.changed().await;
+            observer.refresh(&mut s, 2);
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(s.detail.model.as_deref(), Some("before-switch"));
+    observer.apply(
+        &mut s,
+        events::parse(
+            Harness::ClaudeCode,
+            "PostModelSwitch",
+            br#"{"session_id":"root","to_model":"after-switch"}"#,
+        )
+        .unwrap(),
+        3,
+    );
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .unwrap();
+    writeln!(file, "{{\"type\":\"local-command-stdout\"}}").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), observer.changed())
+        .await
+        .unwrap();
+    observer.refresh(&mut s, 4);
+    assert_eq!(s.detail.model.as_deref(), Some("after-switch"));
+    observer.apply(
+        &mut s,
+        events::parse(
+            Harness::ClaudeCode,
+            "PreCompact",
+            br#"{"session_id":"root"}"#,
+        )
+        .unwrap(),
+        5,
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), observer.changed())
+        .await
+        .unwrap();
+    observer.refresh(&mut s, 6);
+    assert_eq!(s.detail.context_tokens, None);
+    s.stop_requested = true;
+    writeln!(file, "{row}").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), observer.changed())
+        .await
+        .unwrap();
+    observer.refresh(&mut s, 7);
+    assert_eq!(s.detail.context_tokens, None);
+    assert_eq!(s.detail.model.as_deref(), Some("after-switch"));
+}
+
+#[tokio::test]
+async fn antigravity_observer_tracks_native_background_completion_without_clearing_questions() {
+    let dir = tempfile::tempdir().unwrap();
+    let native = dir.path().join(".gemini/antigravity-cli");
+    std::fs::create_dir_all(native.join("conversations")).unwrap();
+    let db = rusqlite::Connection::open(native.join("conversations/root.db")).unwrap();
+    db.execute_batch("PRAGMA journal_mode=WAL;CREATE TABLE steps(idx INTEGER PRIMARY KEY,status INTEGER,task_details BLOB);INSERT INTO steps VALUES(0,1,x'01');").unwrap();
+    let env =
+        tower_pal::Environment::from([("HOME".into(), dir.path().to_string_lossy().into_owned())]);
+    let mut observer = Harness::Antigravity.definition().hook_session(&env);
+    let mut s = state();
+    observer.start();
+    observer.apply(
+        &mut s,
+        events::parse(
+            Harness::Antigravity,
+            "SessionStart",
+            br#"{"conversation_id":"root"}"#,
+        )
+        .unwrap(),
+        1,
+    );
+    observer.apply(
+        &mut s,
+        events::parse(
+            Harness::Antigravity,
+            "Stop",
+            br#"{"conversation_id":"root","fullyIdle":false}"#,
+        )
+        .unwrap(),
+        2,
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while s.detail.background_jobs != Some(1) {
+            observer.changed().await;
+            observer.refresh(&mut s, 3);
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(s.status, "working");
+    assert_eq!(s.detail.phase.as_deref(), Some("background"));
+    observer.apply(&mut s,events::parse(Harness::Antigravity,"PreToolUse",br#"{"conversation_id":"root","tool_name":"ask_user_question","tool_call_id":"question"}"#).unwrap(),4);
+    db.execute("UPDATE steps SET status=3", []).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), observer.changed())
+        .await
+        .unwrap();
+    observer.refresh(&mut s, 5);
+    assert_eq!(s.status, "waiting_input");
+    observer.apply(
+        &mut s,
+        events::parse(
+            Harness::Antigravity,
+            "Stop",
+            br#"{"conversation_id":"root","fullyIdle":false}"#,
+        )
+        .unwrap(),
+        6,
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while s.status != "idle" {
+            observer.changed().await;
+            observer.refresh(&mut s, 7);
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(s.detail.background_jobs, Some(0));
 }

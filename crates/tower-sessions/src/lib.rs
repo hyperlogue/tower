@@ -45,7 +45,8 @@ pub struct Observation {
 pub struct SessionMetadata {
     pub shared_process: Option<bool>,
     pub native_session_id: Option<String>,
-    pub display_name: Option<String>,
+    #[serde(default, skip_serializing_if = "tower_protocol::Patch::is_missing")]
+    pub display_name: tower_protocol::Patch<String>,
     pub cwd: Option<String>,
     pub detail: Option<Value>,
 }

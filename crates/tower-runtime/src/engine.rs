@@ -1455,6 +1455,24 @@ async fn native(s: &mut State<'_>, input: &mut NativeInput, v: Value) -> Result<
                 return Ok(());
             }
             match method {
+                "thread/settings/updated" => {
+                    if let Some(model) = p
+                        .pointer("/threadSettings/model")
+                        .and_then(Value::as_str)
+                        .filter(|s| s.len() <= 200)
+                    {
+                        s.metadata["model"] = json!(model);
+                    }
+                    if let Some(effort) = p.pointer("/threadSettings/effort").filter(|v| {
+                        v.is_null()
+                            || v.as_str()
+                                .is_some_and(|s| s.len() <= 64 && !s.chars().any(char::is_control))
+                    }) {
+                        s.metadata["effort"] = effort.clone();
+                    }
+                    let (state, _, _) = s.journal.state(s.binding)?;
+                    s.journal.update_metadata(s.binding, &state, &s.metadata)?;
+                }
                 "thread/closed" => {
                     return Err(error("native_thread_closed", "Native thread was unloaded"));
                 }
@@ -1545,11 +1563,18 @@ async fn native(s: &mut State<'_>, input: &mut NativeInput, v: Value) -> Result<
             {
                 s.metadata["model"] = json!(model);
             }
+            if let Some(effort) = p.pointer("/metadata/effort").filter(|v| {
+                v.is_null()
+                    || v.as_str()
+                        .is_some_and(|s| s.len() <= 64 && !s.chars().any(char::is_control))
+            }) {
+                s.metadata["effort"] = effort.clone();
+            }
             if let Some(tokens) = p
                 .pointer("/metadata/context_tokens")
-                .and_then(Value::as_u64)
+                .filter(|v| v.is_null() || v.as_u64().is_some())
             {
-                s.metadata["context_tokens"] = json!(tokens);
+                s.metadata["context_tokens"] = tokens.clone();
             }
             let (state, _, _) = s.journal.state(s.binding)?;
             if identity_learned {

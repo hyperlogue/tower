@@ -837,7 +837,7 @@ impl Service {
             }
         }
         let mut detail = serde_json::Map::new();
-        for key in ["last_tool", "model"] {
+        for key in ["last_tool", "model", "effort", "phase"] {
             if let Some(s) = p.detail[key].as_str()
                 && s.len() <= 128
                 && s.bytes()
@@ -845,6 +845,14 @@ impl Service {
             {
                 detail.insert(key.into(), s.into());
             }
+        }
+        for key in ["effort", "phase"] {
+            if p.detail.get(key).is_some_and(serde_json::Value::is_null) {
+                detail.insert(key.into(), serde_json::Value::Null);
+            }
+        }
+        if matches!(p.kind.as_str(), "compacting" | "compacted") {
+            detail.insert("context_tokens".into(), serde_json::Value::Null);
         }
         if let Some(n) = p.detail["context_tokens"].as_u64() {
             detail.insert("context_tokens".into(), n.into());

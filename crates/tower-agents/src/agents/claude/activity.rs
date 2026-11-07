@@ -1,5 +1,4 @@
 use crate::{
-    Harness,
     events::native_id,
     runtime::{NativeSession, RuntimeState},
 };
@@ -26,18 +25,14 @@ pub struct Activity {
     cached: Option<ClaudeState>,
 }
 impl Activity {
-    pub fn new(harness: Harness, env: &tower_pal::Environment) -> Self {
+    pub(crate) fn new(env: &tower_pal::Environment) -> Self {
         let home = env
             .get("CLAUDE_CONFIG_DIR")
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .or_else(|| env.get("HOME").map(|s| PathBuf::from(s).join(".claude")));
         Self {
-            directory: if harness == Harness::ClaudeCode {
-                home.map(|p| p.join("sessions"))
-            } else {
-                None
-            },
+            directory: home.map(|p| p.join("sessions")),
             next: Instant::now(),
             started: SystemTime::now(),
             version: None,
@@ -91,6 +86,7 @@ impl Activity {
             state.native.as_ref().map(|n| n.id.clone()),
             state.display_name.clone(),
             state.detail.background_jobs,
+            state.detail.phase.clone(),
         );
         if let Some(id) = file.session_id.as_ref().filter(|id| native_id(id)) {
             state.native = Some(NativeSession {
@@ -109,17 +105,28 @@ impl Activity {
             "waiting_input" | "waiting_approval" | "exited" | "lost"
         ) {
             match file.status.as_deref() {
-                Some("busy") => {
+                Some("busy")
+                    if state.detail.phase.as_deref().is_none_or(|p| {
+                        !matches!(p, "background" | "compacted" | "compacting")
+                    }) =>
+                {
                     state.status = "working".into();
                     state.detail.background_jobs = None;
                 }
-                Some("shell") => {
+                Some("shell")
+                    if state.detail.phase.as_deref().is_none_or(|p| {
+                        !matches!(p, "background" | "compacted" | "compacting")
+                    }) =>
+                {
                     state.status = "working".into();
                     state.detail.background_jobs = None;
                 }
                 Some("idle") => {
                     state.status = "idle".into();
                     state.detail.background_jobs = Some(0);
+                    if state.detail.phase.as_deref() == Some("background") {
+                        state.detail.phase = None;
+                    }
                 }
                 _ => {}
             }
@@ -130,11 +137,21 @@ impl Activity {
                 state.native.as_ref().map(|n| n.id.clone()),
                 state.display_name.clone(),
                 state.detail.background_jobs,
+                state.detail.phase.clone(),
             );
         if changed {
             state.seq = state.seq.saturating_add(1);
             state.updated_at = now;
         }
         changed
+    }
+}
+
+impl crate::hook::HookSession for Activity {
+    fn apply(&mut self, state: &mut RuntimeState, event: crate::events::AgentEvent, now: u64) {
+        crate::events::apply(state, event, now);
+    }
+    fn refresh(&mut self, state: &mut RuntimeState, now: u64) -> bool {
+        self.refresh(state, now)
     }
 }

@@ -2,36 +2,34 @@ use serde::{Deserialize, Serialize};
 use std::{
     io,
     path::{Path, PathBuf},
-    sync::{Arc, atomic::Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::{Semaphore, mpsc},
+    sync::mpsc,
 };
 use tower_agents::{
     Harness,
     events::{self, AgentEvent},
     runtime::{AgentDetail, LauncherPlan, RuntimeState},
 };
-use tower_pal::{IpcListener, SingletonLock};
+use tower_pal::SingletonLock;
 
 #[derive(Serialize, Deserialize)]
-struct Report {
-    token: String,
-    harness: Harness,
-    event: Option<AgentEvent>,
+pub(crate) struct Report {
+    pub(crate) token: String,
+    pub(crate) harness: Harness,
+    pub(crate) event: Option<AgentEvent>,
     #[serde(default)]
-    stop: bool,
+    pub(crate) stop: bool,
     #[serde(default)]
-    delivery: Option<tower_protocol::DeliveryEndpoint>,
+    pub(crate) delivery: Option<tower_protocol::DeliveryEndpoint>,
     #[serde(default)]
-    message: Option<String>,
+    pub(crate) message: Option<String>,
     #[serde(default)]
-    pty_only: bool,
+    pub(crate) pty_only: bool,
 }
-fn now() -> u64 {
+pub(crate) fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -46,12 +44,6 @@ pub fn read_state(path: &Path) -> io::Result<RuntimeState> {
 }
 fn save(plan: &LauncherPlan, state: &RuntimeState) -> io::Result<()> {
     tower_pal::write_private(&file(plan), &serde_json::to_vec(state)?)
-}
-
-fn drain_observations(observed: &mut mpsc::Receiver<AgentEvent>, state: &mut RuntimeState) {
-    while let Ok(event) = observed.try_recv() {
-        events::apply(state, event, now());
-    }
 }
 
 pub fn hook(harness: &str, event: &str) {
@@ -118,41 +110,6 @@ fn report(path: &Path, report: &Report) -> io::Result<()> {
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "launcher report timed out"))?
         })
-}
-/// Asks a resumed agent to continue the turn its previous incarnation was
-/// running, once, as soon as it accepts input.
-fn continue_turn(paths: &tower_pal::Paths, plan: &LauncherPlan, state: &mut RuntimeState) {
-    if !plan.continue_turn
-        || state.private.contains_key("continued")
-        || !super::injection::allowed(paths, plan.spec.harness)
-    {
-        return;
-    }
-    let Ok(proof) = super::injection::proof(state) else {
-        return;
-    };
-    state.private.insert("continued".into(), true.into());
-    let (paths, name) = (paths.clone(), plan.id.clone());
-    tokio::spawn(async move {
-        // A just-started agent can report readiness before the pool has seen
-        // it enable bracketed paste.
-        for _ in 0..40 {
-            let mut proof = proof.clone();
-            proof.checked_at = tower_pal::monotonic_ms();
-            let text = tower_agents::runtime::CONTINUE.to_owned();
-            match super::injection::send(paths.clone(), name.clone(), proof, text).await {
-                Err(e)
-                    if matches!(
-                        e.data.details.get("reason"),
-                        Some(tower_protocol::Value::String(r)) if r == "target_busy_pty"
-                    ) =>
-                {
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                }
-                _ => return,
-            }
-        }
-    });
 }
 pub fn stop(plan: &LauncherPlan, token: &str) -> io::Result<()> {
     report(
@@ -221,304 +178,23 @@ pub async fn run(path: &Path) -> io::Result<i32> {
             .insert("native_resumable".into(), false.into());
     }
     save(&plan, &state)?;
-    let result = serve(&plan, &mut state, terminated).await;
-    let code = match result {
-        Ok(code) => code,
-        Err(error) => {
-            state.detail.error = Some(
-                match error.kind() {
-                    io::ErrorKind::NotFound => "agent_not_found",
-                    io::ErrorKind::PermissionDenied => "environment_not_approved",
-                    _ => "launch_failed",
-                }
-                .into(),
-            );
-            eprintln!(
-                "tower: {}",
-                state.detail.error.as_deref().unwrap_or("launch_failed")
-            );
-            1
-        }
+    let (publisher, updates) = super::session::SessionPublisher::channel();
+    let (commands, receiver) = mpsc::channel(1);
+    let context = super::session::SessionContext {
+        plan: plan.clone(),
+        state: state.clone(),
+        publisher,
+        commands: super::session::SessionCommands(receiver),
     };
-    state.status = "exited".into();
-    state.exit_code = Some(code);
-    state.seq = state.seq.saturating_add(1);
-    state.updated_at = now();
-    save(&plan, &state)?;
-    Ok(code)
-}
-async fn serve(
-    plan: &LauncherPlan,
-    state: &mut RuntimeState,
-    terminated: Arc<std::sync::atomic::AtomicBool>,
-) -> io::Result<i32> {
-    let token = std::env::var("TOWER_AGENT_TOKEN")
-        .map_err(|_| io::Error::other("missing session credential"))?;
-    if token.is_empty() {
-        return Err(io::Error::other("empty credential"));
-    }
-    let exe = tower_pal::Program::Cli.path()?;
-    let mut env =
-        project_environment(Path::new(&plan.spec.cwd), &exe, tower_pal::environment()).await?;
-    let native_home = if plan.spec.harness == Harness::Codex {
-        Some(
-            tower_agents::codex_host::namespace(&tower_pal::Paths::discover()?)
-                .map_err(io::Error::other)?,
-        )
-    } else {
-        tower_agents::inventory::namespace(plan.spec.harness, &env)
-    };
-    if plan.spec.resume.is_some()
-        && plan
-            .spec
-            .native_home
-            .as_ref()
-            .is_some_and(|expected| Some(expected) != native_home.as_ref())
-    {
-        state.detail.error = Some("native_home_changed".into());
-        return Ok(1);
-    }
-    if let Some(home) = native_home {
-        state.private.insert("native_home".into(), home.into());
-    }
-    for key in [
-        "TOWER_AGENT_ID",
-        "TOWER_AGENT_TOKEN",
-        "TOWER_BEARER_TOKEN",
-        "TOWER_LAUNCHER_SOCKET",
-        "CLAUDE_CODE_SESSION_ID",
-        "CLAUDE_CODE_CHILD_SESSION",
-        "CLAUDE_CODE_MESSAGING_SOCKET",
-        "CLAUDE_CODE_MESSAGING_TOKEN",
-        "CLAUDE_PID",
-        "CODEX_THREAD_ID",
-        "CODEX_SESSION_ID",
-    ] {
-        env.remove(key);
-    }
-    env.insert("TOWER_AGENT_ID".into(), plan.id.clone());
-    env.insert("TOWER_AGENT_TOKEN".into(), token.clone());
-    env.insert("TOWER_SOCKET".into(), plan.tower_socket.clone());
-    env.insert("TOWER_LAUNCHER_SOCKET".into(), plan.control_socket.clone());
-    let mut invocation = tower_agents::config::prepare(
-        &plan.spec,
-        &Path::new(&plan.state_dir).join("config"),
-        &exe,
-        env,
-    )?;
-    if super::clipboard_mode(plan.spec.harness).is_some() {
-        tower_clipboard::shim::install(
-            Path::new(&plan.state_dir),
-            &exe,
-            &mut invocation.env,
-            &plan.generation,
-        )?;
-    }
-    let paths = tower_pal::Paths::discover()?;
-    state.private.insert(
-        "pty_supported".into(),
-        super::injection::supported(&paths).await.into(),
-    );
-    let listener = IpcListener::bind(Path::new(&plan.control_socket)).await?;
-    let (observations, mut observed) = mpsc::channel(128);
-    let mut server = if plan.spec.mode.as_deref() == Some("app-server") {
-        match super::app_server::start(plan, &mut invocation, observations).await {
-            Ok(server) => Some(server),
-            Err(e) => {
-                // The session's terminal is where the person launching it looks.
-                eprintln!("tower: {e}");
-                state.detail.error = Some("app_server_unavailable".into());
-                return Ok(1);
-            }
-        }
-    } else {
-        None
-    };
-    if let Some(identity) = server.as_ref().and_then(|server| server.process) {
-        state
-            .private
-            .insert("server_pid".into(), serde_json::json!(identity.pid));
-        state.private.insert(
-            "server_start_time".into(),
-            serde_json::json!(identity.start_time),
-        );
-        save(plan, state)?;
-    }
-    if terminated.load(Ordering::Relaxed) {
-        state.stop_requested = true;
-        return Ok(143);
-    }
-    let mut child =
-        tower_pal::spawn_inherited(&invocation.argv, &invocation.env, Path::new(&plan.spec.cwd))?;
-    let mut activity = tower_agents::activity::Activity::new(plan.spec.harness, &invocation.env);
-    state.agent_pid = child.id();
-    state.agent_start_time = child
-        .id()
-        .and_then(|p| tower_pal::process_identity(p).ok())
-        .map(|p| p.start_time);
-    state.status = "unknown".into();
-    state.updated_at = now();
-    save(plan, state)?;
-    let (tx, mut rx) = mpsc::channel::<(
-        Report,
-        tokio::sync::oneshot::Sender<
-            tower_sessions::Result<Option<tower_protocol::DeliveryReceipt>>,
-        >,
-    )>(64);
-    let permits = Arc::new(Semaphore::new(32));
-    let mut tick = tokio::time::interval(Duration::from_millis(100));
-    let mut child_exit = None;
-    let mut stop_confirmed = false;
-    loop {
-        tokio::select! {
-            result=child.wait(), if child_exit.is_none()=>{
-                child_exit = Some(result?.code().unwrap_or(128));
-                if stop_confirmed || server.is_none() { return Ok(child_exit.unwrap()); }
-                state.stop_requested = true;
-                let cleaned = server.as_mut().unwrap().shutdown().await.is_ok();
-                drain_observations(&mut observed,state);
-                if cleaned {
-                    state.private.insert("codex_cleanup_confirmed".into(), true.into());
-                    return Ok(child_exit.unwrap());
-                }
-                state.status = "unknown".into();
-                state.detail.error = Some("codex_cleanup_unconfirmed".into());
-                state.seq = state.seq.saturating_add(1);
-                state.updated_at = now();
-                save(plan, state)?;
-            }
-            accepted=listener.accept()=>{
-                if let Ok((mut stream,_))=accepted && let Ok(permit)=permits.clone().try_acquire_owned() {
-                    let tx=tx.clone();
-                    tokio::spawn(async move {
-                        let _permit=permit;
-                        let _=tokio::time::timeout(Duration::from_secs(40),async {
-                            let n=stream.read_u32().await? as usize;
-                            if n>65536 {return Err(io::Error::other("report too large"));}
-                            let mut bytes=vec![0;n];stream.read_exact(&mut bytes).await?;
-                            let report:Report=serde_json::from_slice(&bytes)?;
-                            let (ack,rx)=tokio::sync::oneshot::channel();
-                            let message=report.message.is_some();
-                            tx.try_send((report,ack)).map_err(io::Error::other)?;
-                            let result=rx.await.unwrap_or_else(|_|Err(tower_protocol::RpcError::application("delivery_unknown","Launcher stopped during submission")));
-                            if message {
-                                let bytes=serde_json::to_vec(&result)?;
-                                stream.write_u32(bytes.len() as u32).await?;
-                                stream.write_all(&bytes).await
-                            }else{stream.write_u8(u8::from(result.is_ok())).await}
-                        }).await;
-                    });
-                }
-            }
-            Some((report,ack))=rx.recv()=>{
-                if report.harness!=plan.spec.harness || !bool::from(report.token.as_bytes().ct_eq(token.as_bytes())) {let _=ack.send(Err(tower_protocol::RpcError::application("unauthorized","Invalid launcher credential")));continue;}
-                if let Some(text)=report.message {
-                    if text.len()>40*1024 || state.stop_requested {
-                        let _=ack.send(Err(tower_protocol::RpcError::application("delivery_failed","Target session is unavailable"))); continue;
-                    }
-                    if report.pty_only {
-                        if !super::injection::allowed(&paths,plan.spec.harness){let _=ack.send(Err(tower_protocol::RpcError::application("unsupported","PTY injection is disabled")));continue;}
-                        match super::injection::proof(state) {
-                            Ok(proof)=>{let paths=paths.clone();let name=plan.id.clone();tokio::spawn(async move{let _=ack.send(super::injection::send(paths,name,proof,text).await.map(Some));});}
-                            Err(e)=>{let _=ack.send(Err(e));}
-                        }
-                        continue;
-                    }
-                    let thread=state.native.as_ref().map(|n|n.id.clone());
-                    let relay=server.as_ref().map(|s|s.messages.clone());
-                    let mut endpoint=state.private.get("delivery").cloned().and_then(|v|serde_json::from_value(v).ok()).unwrap_or_default();
-                    let endpoint: &mut tower_protocol::DeliveryEndpoint=&mut endpoint;
-                    endpoint.thread_id=thread.clone();
-                    let endpoint=endpoint.clone();
-                    let env=invocation.env.clone();let cwd=plan.spec.cwd.clone();let harness=plan.spec.harness;
-                    tokio::spawn(async move {
-                        let result=if let (Some(relay),Some(thread))=(relay,thread) {
-                            let (sender,receiver)=tokio::sync::oneshot::channel();
-                            if relay.try_send(super::app_server::Submission{thread,text,result:sender}).is_err(){Err(tower_protocol::RpcError::application("delivery_failed","Relay is unavailable or busy"))}else{
-                                match tokio::time::timeout(Duration::from_secs(10),receiver).await {Ok(Ok(result))=>result,_=>Err(tower_protocol::RpcError::application("delivery_unknown","Relay submission outcome is unknown; do not automatically retry"))}
-                            }
-                        }else{tower_agents::delivery::send(harness.id(),&endpoint,&text,&env,Path::new(&cwd)).await};
-                        let _=ack.send(result.map(Some));
-                    });
-                    continue;
-                }
-                if report.stop {
-                    state.stop_requested = true;
-                    state.updated_at = now();
-                    save(plan,state)?;
-                    let cleaned=match &mut server {Some(server)=>server.shutdown().await.is_ok(),None=>true};
-                    drain_observations(&mut observed,state);
-                    if !cleaned {
-                        state.status = "unknown".into();
-                        state.detail.error = Some("codex_cleanup_unconfirmed".into());
-                        state.seq = state.seq.saturating_add(1);
-                        save(plan,state)?;
-                        let _=ack.send(Err(tower_protocol::RpcError::application("stop_unconfirmed","Codex thread cleanup is unconfirmed")));
-                        continue;
-                    }
-                    stop_confirmed = true;
-                    state.private.insert("codex_cleanup_confirmed".into(), true.into());
-                    save(plan,state)?;
-                    let _=ack.send(Ok(None));
-                    if let Some(code)=child_exit {return Ok(code);}
-                    tower_pal::terminate_own_group()?;
-                    continue;
-                }else if plan.spec.mode.as_deref()!=Some("app-server") && let Some(event)=report.event
-                    && !(plan.spec.fork && plan.spec.resume.as_ref().is_some_and(|parent|event.native_id.as_ref()==Some(&parent.id))) {
-                    let kind=event.kind;let before=state.seq;let was_idle=state.status=="idle";events::apply(state,event,now());
-                    if state.seq!=before {
-                        super::injection::observe_idle(state,kind,was_idle);
-                        continue_turn(&paths,plan,state);
-                        if let Some(endpoint)=report.delivery && tower_agents::delivery::validate(&endpoint).is_ok() && endpoint.messaging_socket.is_some() && endpoint.messaging_token.is_some() {
-                            state.private.insert("delivery".into(),serde_json::to_value(endpoint)?);
-                        }
-                    }
-                }
-                save(plan,state)?; let _=ack.send(Ok(None));
-            }
-            Some(event)=observed.recv(), if server.is_some()=>{
-                let kind=event.kind;let before=state.seq;let was_idle=state.status=="idle";events::apply(state,event,now());if state.seq!=before{super::injection::observe_idle(state,kind,was_idle);}save(plan,state)?;
-            }
-            _=tick.tick()=>{}
-        }
-        if server.is_none() && activity.refresh(state, now()) {
-            save(plan, state)?;
-        }
-        if terminated.swap(false, Ordering::Relaxed) && !stop_confirmed {
-            state.stop_requested = true;
-            state.updated_at = now();
-            save(plan, state)?;
-            let cleaned = match &mut server {
-                Some(server) => server.shutdown().await.is_ok(),
-                None => true,
-            };
-            drain_observations(&mut observed, state);
-            if !cleaned {
-                state.status = "unknown".into();
-                state.detail.error = Some("codex_cleanup_unconfirmed".into());
-                state.seq = state.seq.saturating_add(1);
-                save(plan, state)?;
-                continue;
-            }
-            stop_confirmed = true;
-            state
-                .private
-                .insert("codex_cleanup_confirmed".into(), true.into());
-            save(plan, state)?;
-            if let Some(code) = child_exit {
-                return Ok(code);
-            }
-            tower_pal::terminate_own_group()?;
-        }
-        if server.as_ref().is_some_and(|server| !server.available()) && !state.stop_requested {
-            state.stop_requested = true;
-            state.status = "unknown".into();
-            state.detail.error = Some("codex_relay_unavailable".into());
-            state.seq = state.seq.saturating_add(1);
-            state.updated_at = now();
-            save(plan, state)?;
-        }
-    }
+    super::session::drive(
+        super::agent::task(context),
+        updates,
+        commands,
+        state,
+        terminated,
+        |state| save(&plan, state),
+    )
+    .await
 }
 
 pub fn send_message(

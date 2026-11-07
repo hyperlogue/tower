@@ -11,7 +11,10 @@ pub struct Host {
 }
 
 pub async fn ensure(paths: &Paths) -> Result<Host> {
-    let config = Config::load(paths)?;
+    ensure_configured(paths, Config::load(paths)?).await
+}
+
+pub async fn ensure_configured(paths: &Paths, config: Config) -> Result<Host> {
     let mut client = match Client::connect(&config.endpoint).await {
         Ok(client) => client,
         Err(Error::Unavailable) if config.managed => {

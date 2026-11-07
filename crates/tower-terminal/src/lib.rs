@@ -1,8 +1,10 @@
+mod agent;
 mod app_server;
 mod client;
 mod injection;
 pub mod launcher;
 mod pool;
+mod session;
 pub use client::{attach, attach_with_terminal};
 use serde::{Serialize, de::DeserializeOwned};
 use tower_pal::Paths;
@@ -426,7 +428,9 @@ impl TerminalBackend {
                 result.metadata = tower_sessions::SessionMetadata {
                     shared_process: Some(state.harness == tower_agents::Harness::Codex),
                     native_session_id: state.native.map(|n| n.id),
-                    display_name: state.display_name,
+                    display_name: state
+                        .display_name
+                        .map_or(tower_protocol::Patch::Clear, tower_protocol::Patch::Set),
                     cwd: self.paths.display_cwd(&state.cwd).ok(),
                     detail: Some(encode(&state.detail)?),
                 };

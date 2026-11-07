@@ -32,31 +32,7 @@ function safely(read) {{ try {{ return read(); }} catch {{ return undefined; }} 
         h = h.id()
     )
 }
-pub fn extension(exe: &Path, h: Harness) -> String {
-    let mut events = vec![
-        ("session_start", "SessionStart"),
-        ("before_agent_start", "UserPromptSubmit"),
-        ("tool_execution_start", "PreToolUse"),
-        ("tool_execution_end", "PostToolUse"),
-        ("session_before_compact", "PreCompact"),
-        ("session_compact", "PostCompact"),
-    ];
-    if h == Harness::Omp {
-        events.extend([
-            ("session_switch", "SessionStart"),
-            ("tool_approval_requested", "PermissionRequest"),
-            ("tool_approval_resolved", "PermissionResult"),
-            ("agent_end", "Stop"),
-        ]);
-    } else {
-        events.extend([
-            ("session_info_changed", "metadata"),
-            ("model_select", "metadata"),
-            ("session_tree", "metadata"),
-            ("agent_settled", "Stop"),
-            ("session_compact_failed", "StopFailure"),
-        ]);
-    }
+pub fn extension(exe: &Path, h: Harness, events: &[(&str, &str)]) -> String {
     let table = serde_json::to_string(&events).expect("static event names");
     format!(
         r#"{}
@@ -74,6 +50,7 @@ export default function (api) {{
         will_continue: event?.willContinue, will_retry: event?.willRetry, aborted: event?.aborted,
         background_jobs: Array.isArray(running) ? running.length : undefined,
         context_tokens: Number.isFinite(tokens) && tokens >= 0 ? Math.round(tokens) : undefined,
+        effort: safely(() => api.getThinkingLevel?.()),
         model: ctx?.model?.provider && ctx?.model?.id ? `${{ctx.model.provider}}/${{ctx.model.id}}` : ctx?.model?.id,
       }});
     }}); }} catch {{}}

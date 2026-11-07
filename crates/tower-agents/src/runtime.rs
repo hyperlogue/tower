@@ -45,6 +45,10 @@ pub struct AgentDetail {
     pub last_tool: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]

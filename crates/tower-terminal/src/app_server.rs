@@ -143,8 +143,9 @@ pub async fn start(
     plan: &LauncherPlan,
     invocation: &mut Invocation,
     events: mpsc::Sender<AgentEvent>,
+    config: Config,
 ) -> io::Result<Server> {
-    let host = tower_agents::codex_host::ensure(&tower_pal::Paths::discover()?)
+    let host = tower_agents::codex_host::ensure_configured(&tower_pal::Paths::discover()?, config)
         .await
         .map_err(io::Error::other)?;
     if host.process.is_none() {
@@ -673,7 +674,11 @@ impl Monitor {
             }
             self.thread = Some(id.into());
             self.ephemeral = thread["ephemeral"] == true;
-            let mut event=self.event("SessionStart",json!({"model":value["result"]["model"],"session_title":thread["name"],"cwd":thread["cwd"]}))?;
+            let mut payload = json!({"model":value["result"]["model"],"session_title":thread["name"],"cwd":thread["cwd"]});
+            if let Some(effort) = value["result"].get("reasoningEffort") {
+                payload["effort"] = effort.clone();
+            }
+            let mut event = self.event("SessionStart", payload)?;
             event.authoritative_status = status(&thread["status"]);
             event.resumable = Some(
                 !self.ephemeral
@@ -705,7 +710,11 @@ impl Monitor {
                 self.event("metadata", json!({"session_title":p["threadName"]}))
             }
             "thread/settings/updated" => {
-                self.event("metadata", json!({"model":p["threadSettings"]["model"]}))
+                let mut payload = json!({"model":p["threadSettings"]["model"]});
+                if let Some(effort) = p["threadSettings"].get("effort") {
+                    payload["effort"] = effort.clone();
+                }
+                self.event("metadata", payload)
             }
             "thread/tokenUsage/updated" => self.event(
                 "metadata",
@@ -889,6 +898,24 @@ mod tests {
                 .observe(&json!({"id":6,"result":{"turn":{"id":"turn"}}}), true)
                 .is_none()
         );
+    }
+    #[test]
+    fn reasoning_effort_is_thread_scoped_and_explicit_null_clears_it() {
+        let mut monitor = Monitor::default();
+        monitor.observe(&json!({"id":1,"method":"thread/resume"}), false);
+        let selected = monitor
+            .observe(
+                &json!({"id":1,"result":{"reasoningEffort":"high","thread":{"id":"root"}}}),
+                true,
+            )
+            .unwrap();
+        assert_eq!(selected.effort.as_deref(), Some("high"));
+        assert!(monitor.observe(&json!({"method":"thread/settings/updated","params":{"threadId":"other","threadSettings":{"effort":"low"}}}),true).is_none());
+        let update = monitor.observe(&json!({"method":"thread/settings/updated","params":{"threadId":"root","threadSettings":{"model":"new"}}}),true).unwrap();
+        assert!(!update.clear_effort);
+        let update = monitor.observe(&json!({"method":"thread/settings/updated","params":{"threadId":"root","threadSettings":{"effort":null}}}),true).unwrap();
+        assert!(update.clear_effort);
+        assert!(update.effort.is_none());
     }
     struct Directory(PathBuf);
     impl Directory {

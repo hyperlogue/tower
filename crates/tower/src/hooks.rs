@@ -57,11 +57,12 @@ pub fn report(harness: &str, event: &str) -> Result<()> {
             {
                 "working"
             }
-            EventKind::Ready | EventKind::Idle => "idle",
+            EventKind::Ready | EventKind::Idle | EventKind::Compacted => "idle",
             EventKind::ToolStart if parsed.tool.as_deref() == Some("AskUserQuestion") => {
                 "waiting_input"
             }
             EventKind::Working
+            | EventKind::Compacting
             | EventKind::ToolStart
             | EventKind::ToolEnd
             | EventKind::ApprovalResolved => "working",
@@ -86,7 +87,23 @@ pub fn report(harness: &str, event: &str) -> Result<()> {
             .ok()
             .filter(|_| h == Harness::Codex),
     };
-    let mut report = json!({"harness":h.id(),"native_session_id":native,"pid":found,"cwd":cwd,"display_name":parsed.title,"kind":parsed.kind,"status":status,"detail":{"last_tool":parsed.tool,"model":parsed.model,"context_tokens":parsed.context_tokens},"delivery":endpoint});
+    let phase = match parsed.kind {
+        EventKind::Compacting => Some("compacting"),
+        EventKind::Compacted => Some("compacted"),
+        _ => None,
+    };
+    let mut report = json!({"harness":h.id(),"native_session_id":native,"pid":found,"cwd":cwd,"display_name":parsed.title,"kind":parsed.kind,"status":status,"detail":{"last_tool":parsed.tool,"model":parsed.model,"effort":parsed.effort,"phase":phase,"context_tokens":parsed.context_tokens},"delivery":endpoint});
+    if parsed.effort.is_none() && !parsed.clear_effort {
+        report["detail"].as_object_mut().unwrap().remove("effort");
+    }
+    if phase.is_none()
+        && !matches!(
+            parsed.kind,
+            EventKind::Working | EventKind::Idle | EventKind::Failure | EventKind::ApprovalResolved
+        )
+    {
+        report["detail"].as_object_mut().unwrap().remove("phase");
+    }
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?

@@ -404,3 +404,47 @@ fn expected_stop_does_not_raise_attention_but_lost_process_does() {
     assert!(!s.agent("expected").unwrap().record.needs_attention);
     assert!(s.agent("unexpected").unwrap().record.needs_attention);
 }
+
+#[test]
+fn managed_metadata_distinguishes_no_title_observation_from_cleared_title() {
+    let (_dir, store) = setup();
+    let mut original = record("managed", None, None);
+    original.ownership = "owned".into();
+    original.protocol = Some("terminal".into());
+    original.display_name = Some("Previous native session".into());
+    let session = ManagedSession {
+        id: original.id.clone(),
+        protocol: "terminal".into(),
+        binding: tower_protocol::Value::Null,
+        launch: None,
+        auto_resume: false,
+    };
+    store.create_managed(original, b"hash", &session).unwrap();
+    let mut observation = Observation {
+        id: "managed".into(),
+        binding: None,
+        status: "idle".into(),
+        pid: None,
+        pid_start_time: None,
+        caps: Capabilities::unavailable("fixture"),
+        terminal: None,
+        recovery_pending: false,
+        metadata: Default::default(),
+    };
+    store
+        .observe_managed("terminal", observation.clone(), 200)
+        .unwrap();
+    assert_eq!(
+        store
+            .agent("managed")
+            .unwrap()
+            .record
+            .display_name
+            .as_deref(),
+        Some("Previous native session")
+    );
+    observation.metadata.display_name = Patch::Clear;
+    observation.metadata.detail = Some(tower_protocol::Value::Object(Default::default()));
+    store.observe_managed("terminal", observation, 201).unwrap();
+    assert_eq!(store.agent("managed").unwrap().record.display_name, None);
+}
