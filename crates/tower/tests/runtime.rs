@@ -673,7 +673,13 @@ fn relocated_bundle_preserves_owned_session_and_attach_streams_on_restart() {
         PathBuf::from(&process.argv[0]),
         f.binary.with_file_name("tower")
     );
-    let opened = f.run(&["launch", "claude", "--cwd", f.dir.path().to_str().unwrap()]);
+    let opened = f.run(&[
+        "launch",
+        "claude",
+        "--defer",
+        "--cwd",
+        f.dir.path().to_str().unwrap(),
+    ]);
     let id = opened["id"].as_str().unwrap();
     assert_eq!(f.run(&["get", id])["status"], "starting");
     let info = f.run(&["rpc", "session.attach_info", &json!({"id":id}).to_string()]);
