@@ -701,6 +701,11 @@ impl Monitor {
                 },
                 json!({}),
             ),
+            "thread/closed" => {
+                let mut event = self.event("metadata", json!({}))?;
+                event.authoritative_status = Some("unknown".into());
+                Some(event)
+            }
             "thread/status/changed" => {
                 let mut e = self.event("metadata", json!({}))?;
                 e.authoritative_status = status(&p["status"]);
@@ -781,7 +786,7 @@ fn status(value: &Value) -> Option<String> {
                 "working"
             }
         }
-        "systemError" => "unknown",
+        "systemError" | "notLoaded" => "unknown",
         _ => return None,
     };
     Some(status.into())
@@ -807,6 +812,24 @@ mod tests {
             &json!({"method":"configWarning","params":{"message":"fixture"}}),
             None
         ));
+    }
+    #[test]
+    fn rewind_unload_and_reload_follow_only_the_selected_thread() {
+        for method in ["thread/closed", "thread/status/changed"] {
+            for (loaded, expected) in [("idle", "idle"), ("active", "working")] {
+                let mut monitor = Monitor::default();
+                monitor.observe(&json!({"id":1,"method":"thread/resume"}), false);
+                monitor
+                    .observe(&json!({"id":1,"result":{"thread":{"id":"root"}}}), true)
+                    .unwrap();
+                let unload = monitor.observe(&json!({"method":method,"params":{"threadId":"root","status":{"type":"notLoaded"}}}), true).unwrap();
+                assert_eq!(unload.authoritative_status.as_deref(), Some("unknown"));
+                assert!(monitor.observe(&json!({"method":"thread/status/changed","params":{"threadId":"foreign","status":{"type":loaded}}}), true).is_none());
+                let reload = monitor.observe(&json!({"method":"thread/status/changed","params":{"threadId":"root","status":{"type":loaded,"activeFlags":[]}}}), true).unwrap();
+                assert_eq!(reload.authoritative_status.as_deref(), Some(expected));
+                assert_eq!(reload.native_id.as_deref(), Some("root"));
+            }
+        }
     }
     #[test]
     fn native_controls_stay_bound_to_the_selected_thread() {
