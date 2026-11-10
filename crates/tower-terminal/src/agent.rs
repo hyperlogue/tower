@@ -332,8 +332,8 @@ async fn serve(
                     continue;
                 }else if server.is_none() && let Some(event)=report.event
                     && !(plan.spec.fork && plan.spec.resume.as_ref().is_some_and(|parent|event.native_id.as_ref()==Some(&parent.id))) {
-                    let kind=event.kind;let before=state.seq;let was_idle=state.status=="idle";activity.apply(state,event,now());
-                    if state.seq!=before {
+                    let kind=event.kind;let child=event.child;let before=state.seq;let was_idle=state.status=="idle";activity.apply(state,event,now());
+                    if state.seq!=before && !child {
                         super::injection::observe_idle(state,kind,was_idle);
                         continue_turn(&paths,plan,state);
                         if let Some(endpoint)=report.delivery && tower_agents::delivery::validate(&endpoint).is_ok() && endpoint.messaging_socket.is_some() && endpoint.messaging_token.is_some() {

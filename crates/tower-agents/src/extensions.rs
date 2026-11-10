@@ -33,31 +33,54 @@ function safely(read) {{ try {{ return read(); }} catch {{ return undefined; }} 
     )
 }
 pub fn extension(exe: &Path, h: Harness, events: &[(&str, &str)]) -> String {
+    observed_extension(exe, h, events, None)
+}
+pub(crate) fn observed_extension(
+    exe: &Path,
+    h: Harness,
+    events: &[(&str, &str)],
+    observer: Option<&str>,
+) -> String {
     let table = serde_json::to_string(&events).expect("static event names");
+    let setup = observer.map_or("", |_| "const observer = createObserver(ctx => send('status-update', capture('status-update', {}, ctx)));");
+    let extra = observer.map_or(
+        "",
+        |_| ", ...safely(() => observer.capture(name, event, ctx))",
+    );
+    let install = observer.map_or("", |_| "safely(() => observer.install(name, ctx));");
     format!(
         r#"{}
 const events = {table};
 export default function (api) {{
+  {setup}
+  function capture(name, event, ctx) {{
+    const tokens = safely(() => ctx.getContextUsage()?.tokens);
+    const running = safely(() => ctx.getAsyncJobSnapshot()?.running);
+    return {{
+      session_id: safely(() => ctx.sessionManager.getSessionId()),
+      session_file: safely(() => ctx.sessionManager.getSessionFile()),
+      session_title: safely(() => api.getSessionName()), cwd: safely(() => ctx?.cwd),
+      tool_name: safely(() => event?.toolName), tool_call_id: safely(() => event?.toolCallId),
+      will_continue: safely(() => event?.willContinue), will_retry: safely(() => event?.willRetry), aborted: safely(() => event?.aborted),
+      background_jobs: safely(() => Array.isArray(running) ? running.length : undefined),
+      context_tokens: Number.isFinite(tokens) && tokens >= 0 ? Math.round(tokens) : undefined,
+      effort: safely(() => api.getThinkingLevel?.()),
+      model: safely(() => ctx?.model?.provider && ctx?.model?.id ? `${{ctx.model.provider}}/${{ctx.model.id}}` : ctx?.model?.id)
+      {extra}
+    }};
+  }}
   for (const [name, forward] of events) {{
     try {{ api.on(name, (event, ctx) => {{
-      const tokens = safely(() => ctx.getContextUsage()?.tokens);
-      const running = safely(() => ctx.getAsyncJobSnapshot()?.running);
-      return send(forward, {{
-        session_id: safely(() => ctx.sessionManager.getSessionId()),
-        session_file: safely(() => ctx.sessionManager.getSessionFile()),
-        session_title: safely(() => api.getSessionName()), cwd: ctx?.cwd,
-        tool_name: event?.toolName, tool_call_id: event?.toolCallId,
-        will_continue: event?.willContinue, will_retry: event?.willRetry, aborted: event?.aborted,
-        background_jobs: Array.isArray(running) ? running.length : undefined,
-        context_tokens: Number.isFinite(tokens) && tokens >= 0 ? Math.round(tokens) : undefined,
-        effort: safely(() => api.getThinkingLevel?.()),
-        model: ctx?.model?.provider && ctx?.model?.id ? `${{ctx.model.provider}}/${{ctx.model.id}}` : ctx?.model?.id,
-      }});
+      const body = capture(name, event, ctx);
+      {install}
+      return send(forward, body);
     }}); }} catch {{}}
   }}
 }}
+{}
 "#,
-        transport(exe, h)
+        transport(exe, h),
+        observer.unwrap_or("")
     )
 }
 pub fn opencode(exe: &Path) -> String {

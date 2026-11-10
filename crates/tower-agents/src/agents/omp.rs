@@ -2,6 +2,7 @@ use crate::{Harness, definition::*, runtime::AgentSpec};
 use std::{io, path::Path};
 use tower_pal::Environment;
 use tower_pal::write_private;
+mod prompts;
 pub struct Definition;
 impl AgentDefinition for Definition {
     fn kind(&self) -> Harness {
@@ -30,6 +31,11 @@ impl AgentDefinition for Definition {
         value: &serde_json::Value,
         event: &mut crate::events::AgentEvent,
     ) {
+        event.blocking_prompt = value
+            .get("blocking_prompt")
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| matches!(*s, "approval" | "decision" | "none"))
+            .map(str::to_owned);
         if let Some(jobs) = value
             .get("async_jobs")
             .and_then(serde_json::Value::as_array)
@@ -38,7 +44,7 @@ impl AgentDefinition for Definition {
         }
     }
     fn hook_session(&self, _env: &Environment) -> Box<dyn crate::hook::HookSession> {
-        Box::new(crate::hook::Stateless)
+        Box::new(prompts::Hooks::default())
     }
     fn supports_fork(&self) -> bool {
         true
@@ -77,13 +83,8 @@ impl AgentDefinition for Definition {
         _env: &mut Environment,
         argv: &mut Vec<String>,
     ) -> io::Result<()> {
-        let h = self.kind();
-
         let path = dir.join("tower-extension.ts");
-        write_private(
-            &path,
-            crate::extensions::extension(exe, h, EVENTS).as_bytes(),
-        )?;
+        write_private(&path, extension(exe).as_bytes())?;
         argv.extend(["-e".into(), path.to_string_lossy().into_owned()]);
         Ok(())
     }
@@ -99,5 +100,16 @@ pub(crate) const EVENTS: &[(&str, &str)] = &[
     ("session_switch", "SessionStart"),
     ("tool_approval_requested", "PermissionRequest"),
     ("tool_approval_resolved", "PermissionResult"),
+    ("plan_review_requested", "status-update"),
+    ("plan_review_resolved", "status-update"),
     ("agent_end", "Stop"),
 ];
+
+pub(crate) fn extension(exe: &Path) -> String {
+    crate::extensions::observed_extension(
+        exe,
+        Harness::Omp,
+        EVENTS,
+        Some(include_str!("omp/prompts.mjs")),
+    )
+}

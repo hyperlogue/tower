@@ -874,3 +874,53 @@ fn failed_state_writes_do_not_drop_the_native_process_or_replay_its_launch() {
     f.call(&["kill", id]);
     f.wait(id, "exited");
 }
+
+#[test]
+fn omp_dialogs_and_child_prompts_reach_the_registry_without_replacing_root_facts() {
+    let f = Fixture::new();
+    std::fs::write(f.root.path().join("bin/omp"),r#"#!/bin/sh
+report() { printf '%s' "$2" | "$TOWER_TEST_BIN" hook omp "$1"; }
+report SessionStart '{"session_id":"native-omp","model":"parent-model"}'
+last=
+while :; do
+  phase=$(cat phase 2>/dev/null || :)
+  if [ "$phase" != "$last" ]; then
+    case $phase in
+      question) report status-update '{"session_id":"native-omp","blocking_prompt":"decision"}';;
+      child) report Stop '{"session_id":"child","session_is_child":true,"blocking_prompt":"approval","model":"child-model","cwd":"/child"}';;
+      finish) report Stop '{"session_id":"native-omp"}';;
+      child-release) report status-update '{"session_id":"child","session_is_child":true,"blocking_prompt":"none"}';;
+      release) report status-update '{"session_id":"native-omp","blocking_prompt":"none"}';;
+    esac
+    printf '%s' "$phase" > observed-phase
+    last=$phase
+  fi
+  sleep 0.03
+done
+"#).unwrap();
+    let launched = f.call(&["launch", "omp", "--headless"]);
+    let id = launched["id"].as_str().unwrap();
+    f.wait(id, "idle");
+    f.phase("question");
+    f.wait(id, "waiting_input");
+    f.phase("child");
+    let row = f.wait(id, "waiting_approval");
+    assert_eq!(row["native_session_id"], "native-omp");
+    assert_eq!(row["status_detail"]["model"], "parent-model");
+    assert_ne!(row["cwd"], "/child");
+    f.phase("finish");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while std::fs::read_to_string(f.root.path().join("observed-phase")).unwrap_or_default()
+        != "finish"
+    {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(f.call(&["get", id])["status"], "waiting_approval");
+    f.phase("child-release");
+    f.wait(id, "waiting_input");
+    f.phase("release");
+    f.wait(id, "idle");
+    f.call(&["kill", id]);
+    f.wait(id, "exited");
+}

@@ -287,6 +287,8 @@ fn generated_extensions_execute_native_callbacks_in_order_without_prompt_data() 
         let module = root.path().join("extension.mjs");
         let source = if h == Harness::Opencode {
             extensions::opencode(&receiver)
+        } else if h == Harness::Omp {
+            agents::omp::extension(&receiver)
         } else {
             extensions::extension(
                 &receiver,
@@ -697,4 +699,196 @@ async fn antigravity_observer_tracks_native_background_completion_without_cleari
     .await
     .unwrap();
     assert_eq!(s.detail.background_jobs, Some(0));
+}
+
+#[test]
+fn omp_prompts_preserve_underlying_work_and_isolate_child_facts() {
+    let mut s = state();
+    s.harness = Harness::Omp;
+    let mut hooks = Harness::Omp.definition().hook_session(&Default::default());
+    let apply = |hooks: &mut Box<dyn crate::hook::HookSession>,
+                 s: &mut runtime::RuntimeState,
+                 name: &str,
+                 body: Value| {
+        let event = events::parse(Harness::Omp, name, &serde_json::to_vec(&body).unwrap()).unwrap();
+        hooks.apply(s, event, s.updated_at + 1);
+    };
+    apply(
+        &mut hooks,
+        &mut s,
+        "SessionStart",
+        json!({"session_id":"root","model":"parent-model"}),
+    );
+    apply(
+        &mut hooks,
+        &mut s,
+        "UserPromptSubmit",
+        json!({"session_id":"root"}),
+    );
+    apply(
+        &mut hooks,
+        &mut s,
+        "status-update",
+        json!({"session_id":"root","blocking_prompt":"decision"}),
+    );
+    assert_eq!(s.status, "waiting_input");
+    apply(&mut hooks, &mut s, "Stop", json!({"session_id":"root"}));
+    assert_eq!(s.status, "waiting_input");
+    apply(
+        &mut hooks,
+        &mut s,
+        "status-update",
+        json!({"session_id":"root","blocking_prompt":"none"}),
+    );
+    assert_eq!(s.status, "idle");
+    apply(
+        &mut hooks,
+        &mut s,
+        "PermissionRequest",
+        json!({"session_id":"root","blocking_prompt":"approval","tool_name":"bash"}),
+    );
+    assert_eq!(s.status, "waiting_approval");
+    apply(
+        &mut hooks,
+        &mut s,
+        "status-update",
+        json!({"session_id":"root","blocking_prompt":"none"}),
+    );
+    assert_eq!(s.status, "idle");
+    apply(
+        &mut hooks,
+        &mut s,
+        "status-update",
+        json!({"session_id":"root","blocking_prompt":"approval"}),
+    );
+    for id in ["child-a", "child-b"] {
+        apply(
+            &mut hooks,
+            &mut s,
+            "Stop",
+            json!({"session_id":id,"session_is_child":true,"blocking_prompt":"decision","model":"child-model","cwd":"/child","session_title":"child-title"}),
+        );
+    }
+    assert_eq!(s.status, "waiting_approval");
+    assert_eq!(s.native.as_ref().unwrap().id, "root");
+    assert_eq!(s.detail.model.as_deref(), Some("parent-model"));
+    assert_ne!(s.cwd, "/child");
+    assert_eq!(s.display_name, None);
+    apply(
+        &mut hooks,
+        &mut s,
+        "status-update",
+        json!({"session_id":"child-a","session_is_child":true,"blocking_prompt":"none"}),
+    );
+    assert_eq!(s.status, "waiting_approval");
+    apply(
+        &mut hooks,
+        &mut s,
+        "status-update",
+        json!({"session_id":"root","blocking_prompt":"none"}),
+    );
+    assert_eq!(s.status, "waiting_input");
+    apply(
+        &mut hooks,
+        &mut s,
+        "status-update",
+        json!({"session_id":"foreign","blocking_prompt":"none"}),
+    );
+    assert_eq!(s.status, "waiting_input");
+    apply(
+        &mut hooks,
+        &mut s,
+        "status-update",
+        json!({"session_id":"child-b","session_is_child":true,"blocking_prompt":"none"}),
+    );
+    assert_eq!(s.status, "idle");
+    apply(
+        &mut hooks,
+        &mut s,
+        "PermissionRequest",
+        json!({"session_id":"root","tool_name":"ask","tool_call_id":"ask-1","blocking_prompt":"approval"}),
+    );
+    assert_eq!(s.status, "waiting_input");
+    apply(
+        &mut hooks,
+        &mut s,
+        "PostToolUse",
+        json!({"session_id":"root","tool_name":"ask","tool_call_id":"ask-1","blocking_prompt":"none"}),
+    );
+    assert_eq!(s.status, "working");
+    apply(
+        &mut hooks,
+        &mut s,
+        "status-update",
+        json!({"session_id":"root","blocking_prompt":"decision"}),
+    );
+    apply(
+        &mut hooks,
+        &mut s,
+        "SessionStart",
+        json!({"session_id":"new","blocking_prompt":"none"}),
+    );
+    assert_eq!(s.status, "idle");
+    s.stop_requested = true;
+    let seq = s.seq;
+    apply(
+        &mut hooks,
+        &mut s,
+        "status-update",
+        json!({"session_id":"new","blocking_prompt":"approval"}),
+    );
+    assert_eq!(s.seq, seq);
+    assert_eq!(s.status, "idle");
+}
+
+#[test]
+fn omp_generated_ui_observer_preserves_native_calls_and_emits_only_prompt_state() {
+    let root = tempfile::tempdir().unwrap();
+    let receiver = root.path().join("receiver");
+    std::fs::write(
+        &receiver,
+        "#!/bin/sh\n{ printf '%s\\t' \"$3\"; cat; printf '\\n'; } >> \"$TOWER_TEST_EVENTS\"\n",
+    )
+    .unwrap();
+    tower_pal::make_executable(&receiver).unwrap();
+    let module = root.path().join("extension.mjs");
+    std::fs::write(&module, agents::omp::extension(&receiver)).unwrap();
+    let test = root.path().join("test.mjs");
+    std::fs::write(&test, include_str!("agents/omp/prompts.test.mjs")).unwrap();
+    let output = std::process::Command::new("node")
+        .arg(test)
+        .arg(&module)
+        .env_clear()
+        .env("PATH", std::env::var("PATH").unwrap())
+        .env("TOWER_TEST_EVENTS", root.path().join("events"))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = std::fs::read_to_string(root.path().join("events")).unwrap();
+    assert!(!text.contains("SECRET"));
+    let rows: Vec<Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line.split_once('\t').unwrap().1).unwrap())
+        .collect();
+    assert!(rows.iter().any(|r| r["blocking_prompt"] == "decision"));
+    assert!(rows.iter().any(|r| r["blocking_prompt"] == "approval"));
+    assert!(
+        rows.iter()
+            .any(|r| r["session_id"] == "child" && r["session_is_child"] == true)
+    );
+    assert_eq!(
+        rows.iter()
+            .find(|r| r["tool_name"] == "after-old-settles")
+            .unwrap()["blocking_prompt"],
+        "decision"
+    );
+    assert_eq!(rows.last().unwrap()["blocking_prompt"], "none");
+    assert_eq!(rows.last().unwrap()["session_id"], "new");
+    let pi = extensions::extension(&receiver, Harness::Pi, agents::pi::EVENTS);
+    assert!(!pi.contains("blocking_prompt"));
+    assert!(!pi.contains("createObserver"));
 }

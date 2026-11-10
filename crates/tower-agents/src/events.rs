@@ -53,6 +53,8 @@ pub struct AgentEvent {
     pub background_jobs: Option<u32>,
     #[serde(default)]
     pub background_active: Option<bool>,
+    #[serde(default)]
+    pub blocking_prompt: Option<String>,
     pub continuing: bool,
     pub authoritative_status: Option<String>,
 }
@@ -211,6 +213,7 @@ pub fn parse(harness: Harness, name: &str, bytes: &[u8]) -> Result<AgentEvent, &
                 && harness.definition().status_behavior().session_start_is_root),
         background_active: None,
         background_jobs: count(&value, &["/background_jobs"]).and_then(|n| n.try_into().ok()),
+        blocking_prompt: None,
         continuing: value.get("will_continue").and_then(Value::as_bool) == Some(true)
             || value.get("will_retry").and_then(Value::as_bool) == Some(true),
         authoritative_status: None,
