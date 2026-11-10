@@ -305,13 +305,6 @@ trust_level = "trusted"
         row["native_session_id"].is_string(),
         "missing native session identity: {row}"
     );
-    assert!(
-        !f.command(&["restart", id, "--mode", "native"])
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
     f.call(&["restart", id]);
     assert_eq!(
         f.response(id, third - 1).await,
@@ -571,5 +564,81 @@ trust_level="trusted"
     proxy.abort();
     let _ = server.start_kill();
     let _ = server.wait().await;
+    api.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires installed Codex; native hooks and queue use only a local fixture API"]
+async fn real_codex_native_hooks_queue_and_resume() {
+    let f = Fixture::new();
+    let (port, api) = gateway().await;
+    let home = f.root.path().join("codex");
+    std::fs::create_dir(&home).unwrap();
+    let project = serde_json::to_string(f.root.path()).unwrap();
+    std::fs::write(
+        home.join("config.toml"),
+        format!(
+            r#"model="test-model"
+model_provider="fixture"
+approval_policy="never"
+sandbox_mode="read-only"
+check_for_update_on_startup=false
+[model_providers.fixture]
+name="Local native fixture"
+base_url="http://127.0.0.1:{port}/v1"
+wire_api="responses"
+request_max_retries=0
+stream_max_retries=0
+[projects.{project}]
+trust_level="trusted"
+"#
+        ),
+    )
+    .unwrap();
+    let opened = f.call(&[
+        "launch",
+        "codex",
+        "--mode",
+        "native",
+        "--headless",
+        "--",
+        "Reply with ready.",
+    ]);
+    let id = opened["id"].as_str().unwrap();
+    let first = f.response(id, 0).await;
+    let before = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let row = f.call(&["get", id]);
+            if row["status"] == "idle" && row["native_session_id"].is_string() {
+                break row;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "native hooks did not report readiness: {}",
+            f.call(&["get", id])
+        )
+    });
+    assert_eq!(before["mode"], "native");
+    assert_eq!(before["shared_process"], false);
+    assert!(
+        !home
+            .join("app-server-control/app-server-control.sock")
+            .exists()
+    );
+    let receipt = f.call(&["send", id, "Reply again."]);
+    assert_eq!(receipt["method"], "queue");
+    let second = f.response(id, first).await;
+    f.call(&["restart", id]);
+    assert_eq!(f.response(id, second - 1).await, second);
+    let resumed = f.call(&["get", id]);
+    assert_eq!(resumed["mode"], "native");
+    assert_eq!(resumed["native_session_id"], before["native_session_id"]);
+    assert_ne!(resumed["pid"], before["pid"]);
+    f.call(&["kill", id]);
+    assert_eq!(f.call(&["get", id])["status"], "exited");
     api.abort();
 }

@@ -23,6 +23,12 @@ pub struct AgentSpec {
     pub native_home: Option<String>,
 }
 
+impl AgentSpec {
+    pub fn uses_app_server(&self) -> bool {
+        self.harness == Harness::Codex && self.mode.as_deref() == Some("app-server")
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LauncherPlan {
     pub id: String,

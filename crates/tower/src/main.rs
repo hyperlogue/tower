@@ -45,6 +45,8 @@ enum Command {
     },
     Launch {
         harness: String,
+        #[arg(long, value_parser = ["app-server", "native"], help = "Codex terminal mode (default: app-server; resume keeps the current mode)")]
+        mode: Option<String>,
         #[arg(long)]
         checkout: Option<String>,
         #[arg(long)]
@@ -94,6 +96,8 @@ enum Command {
     },
     Restart {
         id: String,
+        #[arg(long, value_parser = ["app-server", "native"], help = "Codex terminal mode (default: app-server; resume keeps the current mode)")]
+        mode: Option<String>,
         #[arg(last = true)]
         args: Option<Vec<String>>,
         #[arg(
@@ -105,6 +109,8 @@ enum Command {
     },
     Resume {
         id: String,
+        #[arg(long, value_parser = ["app-server", "native"], help = "Codex terminal mode (default: app-server; resume keeps the current mode)")]
+        mode: Option<String>,
         #[arg(last = true)]
         args: Option<Vec<String>>,
         #[arg(
@@ -795,6 +801,7 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
         Command::Catalog => print_json(&client.call("catalog.get", &serde_json::json!({})).await?)?,
         Command::Launch {
             harness,
+            mode,
             checkout,
             protocol,
             cwd,
@@ -819,7 +826,7 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
                 checkout_id: checkout.clone(),
                 harness,
                 protocol,
-                mode: None,
+                mode,
                 headless,
                 args,
                 resume: resume.map(|native_session_id| ConversationSeed {
@@ -859,6 +866,7 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
         )?,
         Command::Restart {
             id,
+            mode,
             args,
             clear_args,
         } => print_json(
@@ -867,7 +875,7 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
                     "session.restart",
                     &SessionRestartParams {
                         id,
-                        mode: None,
+                        mode,
                         args: if clear_args { Some(vec![]) } else { args },
                     },
                 )
@@ -875,6 +883,7 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
         )?,
         Command::Resume {
             id,
+            mode,
             args,
             clear_args,
         } => print_json(
@@ -883,7 +892,7 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
                     "session.resume",
                     &SessionRestartParams {
                         id,
-                        mode: None,
+                        mode,
                         args: if clear_args { Some(vec![]) } else { args },
                     },
                 )

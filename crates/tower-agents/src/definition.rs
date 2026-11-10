@@ -31,7 +31,7 @@ pub struct ResumeOptions {
 pub trait AgentDefinition: Send + Sync {
     fn kind(&self) -> Harness;
     fn info(&self) -> AgentInfo;
-    fn execution(&self) -> Execution;
+    fn execution(&self, spec: &AgentSpec) -> Execution;
     fn status_behavior(&self) -> StatusBehavior;
     fn normalize_hook(
         &self,

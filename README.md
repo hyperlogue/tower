@@ -7,7 +7,7 @@ shared terminal attachment, a local registry, scoped tokens, and live status eve
 The pool and terminal parser are implemented in Rust, without libshpool or libghostty.
 
 Managed launchers support Claude Code, Codex, Reasonix, Kimi Code, Grok Build,
-opencode, Pi, Antigravity, and omp. Codex uses one host app-server shared by its sessions.
+opencode, Pi, Antigravity, and omp. Codex defaults to one host app-server shared by its sessions; terminal sessions can opt into native mode.
 The public interface is Tower's JSON-RPC API; Miao clients need a Tower adapter.
 Native Claude/Codex messages, approvals, process discovery, MCP, loopback HTTP/SSE,
 and Allgather status/policy synchronization are available. Allgather supports owner-initiated pairing, incremental state and policy synchronization,
@@ -338,8 +338,9 @@ Reports continue while the daemon is stopped. Status stays `unknown` until the
 harness supplies evidence. Hook reports retain operational metadata, not prompt text.
 Projects with an `.envrc` require direnv approval before their agents start.
 
-Codex requires version 0.166.0 or later and uses Codex's own app-server daemon
-for terminal and structured sessions. By default Tower connects to its socket,
+Codex app-server mode requires version 0.166.0 or later and uses Codex's own
+app-server daemon. This remains the default for terminal sessions and the only
+mode for structured sessions. By default Tower connects to its socket,
 `$CODEX_HOME/app-server-control/app-server-control.sock` (`~/.codex/...` when
 `CODEX_HOME` is unset). If the daemon is not running, Tower runs
 `codex app-server daemon start`; if that fails, the session's terminal explains
@@ -349,6 +350,30 @@ The daemon survives Tower daemon and terminal restarts. Stopping a
 session interrupts its turn, stops its background terminals, and waits for its
 thread to unload. If termination cannot be confirmed, Tower reports uncertainty
 and preserves the service and other sessions.
+
+To run Codex directly in a terminal instead:
+
+```sh
+tower-cli launch codex --mode native
+tower-cli launch codex --mode native --resume NATIVE_SESSION_ID
+```
+
+Native mode requires a Codex CLI with named profile and hook support. Tower
+selects its own `tower` profile in the real `CODEX_HOME`; the base `config.toml`
+and global hook settings are unchanged. Tower regenerates this profile's hook
+definitions and Tower MCP entry. Codex's saved model choices, project trust,
+other profile settings, and trust entries for hooks defined elsewhere survive
+subsequent launches. An
+existing unmarked `tower.config.toml` is refused. `--profile`/`-p` and `--remote`
+remain reserved. Native sessions run in their own process group, and stopping
+one does not stop the app-server or other sessions. Messaging uses `codex queue`
+when supported; unsupported versions report the capability reason. Codex PTY
+message injection remains disabled.
+
+Restart/resume retains the selected mode. Use `restart SESSION_ID --mode native`
+or `--mode app-server` to switch. Tower first checks that the destination store
+can resolve the same native conversation; an unavailable conversation fails
+before stopping the running session. Native mode does not use `codex.endpoint`.
 
 To use another app-server, set its Unix endpoint once in Tower configuration.
 Tower then connects only to that endpoint and never starts a server for it.
@@ -389,7 +414,7 @@ native storage location after direnv loading prevents launch. Kimi and Antigravi
 do not advertise fork support.
 
 Tower preserves native history and credentials. Generated overlays are private.
-Codex uses a Tower-owned profile in its native home. Grok uses a Tower-owned hook
+Codex native mode uses a Tower-owned profile in its native home. Grok uses a Tower-owned hook
 file in its native home; the hooks are inactive outside managed sessions.
 
 ## Try the local registry

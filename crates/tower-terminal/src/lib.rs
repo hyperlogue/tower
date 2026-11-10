@@ -120,9 +120,15 @@ impl TerminalBackend {
         if request
             .mode
             .as_deref()
-            .is_some_and(|mode| mode != "app-server")
+            .is_some_and(|mode| !matches!(mode, "app-server" | "native"))
         {
-            return Err(error("invalid_params", "Codex requires app-server mode"));
+            return Err(error(
+                "invalid_params",
+                "Codex mode must be app-server or native",
+            ));
+        }
+        if request.mode.as_deref() == Some("native") {
+            return Ok("native".into());
         }
         tower_agents::codex_service::Config::load(&self.paths).map_err(|_| {
             error(
@@ -414,7 +420,7 @@ impl TerminalBackend {
                     result.caps.wake_when_idle = caps.wake_when_idle;
                     result.caps.reply_path = caps.reply_path;
                 }
-                if state.harness == tower_agents::Harness::Codex {
+                if binding.plan.spec.uses_app_server() {
                     result.pid = state
                         .private
                         .get("server_pid")
@@ -426,7 +432,7 @@ impl TerminalBackend {
                         .and_then(|v| v.as_u64());
                 }
                 result.metadata = tower_sessions::SessionMetadata {
-                    shared_process: Some(state.harness == tower_agents::Harness::Codex),
+                    shared_process: Some(binding.plan.spec.uses_app_server()),
                     native_session_id: state.native.map(|n| n.id),
                     display_name: state
                         .display_name
@@ -527,21 +533,28 @@ impl ManagedBackend for TerminalBackend {
                     .push("codex: host_inventory_unavailable".into()),
             }
         }
-        if harness != Some(tower_agents::Harness::Codex) {
+        {
             let mut inventory = self
                 .inventory
                 .lock()
                 .map_err(|_| error("internal_error", "Inventory unavailable"))?;
             let selected: Vec<_> = tower_agents::Harness::ALL
                 .into_iter()
-                .filter(|h| {
-                    *h != tower_agents::Harness::Codex
-                        && harness.is_none_or(|selected| selected == *h)
-                })
+                .filter(|h| harness.is_none_or(|selected| selected == *h))
                 .collect();
             let entries =
                 inventory.list_selected(&tower_pal::environment(), &selected, request.refresh);
-            found.candidates.extend(entries.candidates);
+            let mut seen: std::collections::HashSet<_> = found
+                .candidates
+                .iter()
+                .map(|c| (c.harness.id(), c.native.id.clone()))
+                .collect();
+            found.candidates.extend(
+                entries
+                    .candidates
+                    .into_iter()
+                    .filter(|c| seen.insert((c.harness.id(), c.native.id.clone()))),
+            );
             found.errors.extend(entries.errors);
             found.truncated |= entries.truncated;
         }
@@ -619,7 +632,7 @@ impl ManagedBackend for TerminalBackend {
                 executable: h.program().into(),
                 available: tower_pal::find_program(h.program(), &env).is_some(),
                 modes: if *h == tower_agents::Harness::Codex {
-                    vec!["app-server".into()]
+                    vec!["app-server".into(), "native".into()]
                 } else {
                     vec![]
                 },
@@ -646,7 +659,9 @@ impl ManagedBackend for TerminalBackend {
             .resume
             .as_ref()
             .map(|seed| {
-                if harness == tower_agents::Harness::Codex {
+                if harness == tower_agents::Harness::Codex
+                    && request.mode.as_deref() != Some("native")
+                {
                     return self.codex_conversation(&seed.native_session_id);
                 }
                 self.inventory
@@ -666,7 +681,9 @@ impl ManagedBackend for TerminalBackend {
             request.mode.clone()
         };
         let spec = tower_agents::runtime::AgentSpec {
-            native_home: if harness == tower_agents::Harness::Codex {
+            native_home: if harness == tower_agents::Harness::Codex
+                && mode.as_deref() == Some("app-server")
+            {
                 Some(
                     tower_agents::codex_host::namespace(&self.paths).map_err(|_| {
                         error(
@@ -864,7 +881,7 @@ impl ManagedBackend for TerminalBackend {
     fn stop(&self, session: &ManagedSession) -> Result<Observation> {
         let name = name(session)?;
         let binding = binding(session)?;
-        let codex = binding.plan.spec.harness == tower_agents::Harness::Codex;
+        let codex = binding.plan.spec.uses_app_server();
         let reserved = if codex {
             pool::list(&self.paths)
                 .map_err(|_| error("stop_unconfirmed", "Cannot read terminal session state"))?
@@ -983,9 +1000,21 @@ impl ManagedBackend for TerminalBackend {
                 .map_err(|e| error("resume_options_required", &e.to_string()))?,
         };
         spec.fork = false;
+        let old_mode = spec.mode.clone();
         spec.mode = mode.map(str::to_owned).or(spec.mode);
         tower_agents::config::validate(&spec)
             .map_err(|e| error("invalid_params", &e.to_string()))?;
+        if spec.harness == tower_agents::Harness::Codex && old_mode != spec.mode {
+            let native = &spec.resume.as_ref().expect("resume checked").id;
+            let target = if spec.uses_app_server() {
+                self.codex_conversation(native)?
+            } else {
+                self.inventory.lock().map_err(|_| error("internal_error", "Inventory unavailable"))?
+                    .resolve(&tower_pal::environment(), spec.harness, native)
+                    .map_err(|_| error("conversation_unavailable", "The target Codex mode cannot find this conversation in its native store"))?
+            };
+            spec.native_home = target.namespace;
+        }
         let request = SessionOpenParams {
             checkout_id: None,
             resume: None,

@@ -1,6 +1,7 @@
 use crate::{Harness, definition::*, runtime::AgentSpec};
 use std::{io, path::Path};
 use tower_pal::Environment;
+pub(crate) mod native;
 pub struct Definition;
 impl AgentDefinition for Definition {
     fn kind(&self) -> Harness {
@@ -14,8 +15,12 @@ impl AgentDefinition for Definition {
             aliases: &["codex"],
         }
     }
-    fn execution(&self) -> Execution {
-        Execution::CodexAppServer
+    fn execution(&self, spec: &AgentSpec) -> Execution {
+        if spec.mode.as_deref() == Some("native") {
+            Execution::Hooks
+        } else {
+            Execution::CodexAppServer
+        }
     }
     fn status_behavior(&self) -> StatusBehavior {
         StatusBehavior {
@@ -75,12 +80,15 @@ impl AgentDefinition for Definition {
     }
     fn configure_launch(
         &self,
-        _spec: &AgentSpec,
+        spec: &AgentSpec,
         _dir: &Path,
-        _exe: &Path,
-        _env: &mut Environment,
-        _argv: &mut Vec<String>,
+        exe: &Path,
+        env: &mut Environment,
+        argv: &mut Vec<String>,
     ) -> io::Result<()> {
+        if spec.mode.as_deref() == Some("native") {
+            native::configure(exe, env, argv)?;
+        }
         Ok(())
     }
 }

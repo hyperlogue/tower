@@ -924,3 +924,129 @@ done
     f.call(&["kill", id]);
     f.wait(id, "exited");
 }
+
+fn native_codex(f: &Fixture) {
+    std::fs::rename(
+        f.root.path().join("bin/codex"),
+        f.root.path().join("bin/codex-host"),
+    )
+    .unwrap();
+    let bin = f.root.path().join("bin/codex");
+    std::fs::write(&bin,r#"#!/bin/sh
+if [ "$1" = queue ]; then
+  if [ "$2" = --help ]; then printf '%s\n' '--thread --message'; else printf '%s\n' "$3" > queued-thread; fi
+  exit 0
+fi
+if [ "$1" != --profile ]; then exec "$HOME/bin/codex-host" "$@"; fi
+printf '%s\n' "$@" > native.args
+id="native-$TOWER_AGENT_ID"
+previous=
+for arg in "$@"; do
+  if [ "$previous" = resume ]; then id=$arg; fi
+  previous=$arg
+done
+mkdir -p "$CODEX_HOME/sessions/2026/01/01"
+printf '{"type":"session_meta","payload":{"id":"%s","cwd":"%s","source":"cli"}}\n' "$id" "$PWD" > "$CODEX_HOME/sessions/2026/01/01/$id.jsonl"
+payload=$(printf '{"session_id":"%s","model":"native-model","cwd":"%s"}' "$id" "$PWD")
+report() { printf '%s' "$payload" | "$TOWER_TEST_BIN" hook codex "$1"; }
+report SessionStart
+last=
+while :; do
+  phase=$(cat phase 2>/dev/null || :)
+  if [ "$phase" != "$last" ]; then
+    case $phase in work) report UserPromptSubmit;; approval) report PermissionRequest;; idle) report Stop;; esac
+    last=$phase
+  fi
+  sleep 0.03
+done
+"#).unwrap();
+    tower_pal::make_executable(&bin).unwrap();
+}
+
+#[test]
+fn codex_native_mode_uses_hooks_queue_and_its_own_process_without_a_host() {
+    let f = Fixture::new();
+    native_codex(&f);
+    std::fs::create_dir_all(f.root.path().join("c/tower")).unwrap();
+    std::fs::write(
+        f.root.path().join("c/tower/config.toml"),
+        "[codex]\nendpoint=42\n",
+    )
+    .unwrap();
+    let opened = f.call(&["launch", "codex", "--mode", "native", "--headless"]);
+    let id = opened["id"].as_str().unwrap();
+    let row = f.wait(id, "idle");
+    assert_eq!(row["mode"], "native");
+    assert_eq!(row["shared_process"], false);
+    assert!(row["pid"].is_number());
+    assert_eq!(row["caps"]["message"], "queue");
+    assert!(
+        !f.root
+            .path()
+            .join(".codex/app-server-control/app-server-control.sock")
+            .exists()
+    );
+    let native = row["native_session_id"].as_str().unwrap();
+    let args = std::fs::read_to_string(f.root.path().join("native.args")).unwrap();
+    assert!(args.starts_with("--profile\ntower\n--enable\nhooks\n"));
+    f.phase("work");
+    f.wait(id, "working");
+    let receipt = f.call(&["send", id, "native fixture message"]);
+    assert_eq!(receipt["method"], "queue");
+    assert_eq!(
+        std::fs::read_to_string(f.root.path().join("queued-thread"))
+            .unwrap()
+            .trim(),
+        native
+    );
+    f.call(&["daemon", "stop"]);
+    let recovered = f.wait(id, "working");
+    assert_eq!(recovered["pid"], row["pid"]);
+    f.phase("idle");
+    f.wait(id, "idle");
+    f.call(&["kill", id]);
+    f.wait(id, "exited");
+    f.call(&["resume", id]);
+    let resumed = f.wait(id, "idle");
+    assert_eq!(resumed["mode"], "native");
+    assert_eq!(resumed["native_session_id"], native);
+    assert_ne!(resumed["pid"], row["pid"]);
+    f.call(&["kill", id]);
+}
+
+#[test]
+fn codex_mode_switch_validates_history_and_preserves_the_shared_host() {
+    let f = Fixture::new();
+    native_codex(&f);
+    let opened = f.call(&["launch", "codex", "--headless"]);
+    let id = opened["id"].as_str().unwrap();
+    f.wait(id, "idle");
+    f.phase("work");
+    f.wait(id, "working");
+    f.phase("idle");
+    let original = f.wait(id, "idle");
+    assert_eq!(original["mode"], "app-server");
+    let native = original["native_session_id"].as_str().unwrap();
+    let rejected = f
+        .command(&["restart", id, "--mode", "native"])
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert_eq!(f.wait(id, "idle")["pid"], original["pid"]);
+    let sessions = f.root.path().join(".codex/sessions/2026/01/01");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::write(sessions.join(format!("{native}.jsonl")),format!("{}\n",json!({"type":"session_meta","payload":{"id":native,"cwd":f.root.path(),"source":"cli"}}))).unwrap();
+    f.call(&["restart", id, "--mode", "native"]);
+    let switched = f.wait(id, "idle");
+    assert_eq!(switched["mode"], "native");
+    assert_eq!(switched["native_session_id"], native);
+    assert_eq!(switched["shared_process"], false);
+    assert!(tower_pal::process_identity(original["pid"].as_u64().unwrap() as u32).is_ok());
+    f.call(&["restart", id, "--mode", "app-server"]);
+    let back = f.wait(id, "idle");
+    assert_eq!(back["mode"], "app-server");
+    assert_eq!(back["native_session_id"], native);
+    assert_eq!(back["pid"], original["pid"]);
+    assert_eq!(back["shared_process"], true);
+    f.call(&["kill", id]);
+}

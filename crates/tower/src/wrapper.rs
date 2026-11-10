@@ -15,7 +15,7 @@ pub async fn run(
     let harness = Harness::parse(&name).ok_or("Unknown harness")?;
     if harness == Harness::Codex {
         return Err(
-            "Codex requires a managed app-server session; use tower-cli launch codex".into(),
+            "Codex requires a managed terminal session; use tower-cli launch codex or tower-cli launch codex --mode native".into(),
         );
     }
     let cwd = std::env::current_dir()?;

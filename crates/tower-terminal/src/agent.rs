@@ -55,7 +55,7 @@ async fn configure(
     let exe = tower_pal::Program::Cli.path()?;
     let mut env =
         project_environment(Path::new(&plan.spec.cwd), &exe, tower_pal::environment()).await?;
-    let config = match plan.spec.harness.definition().execution() {
+    let config = match plan.spec.harness.definition().execution(&plan.spec) {
         tower_agents::definition::Execution::Hooks => None,
         tower_agents::definition::Execution::CodexAppServer => Some(
             tower_agents::codex_service::Config::load(&tower_pal::Paths::discover()?)
@@ -101,6 +101,12 @@ async fn configure(
         &exe,
         env,
     )?;
+    if plan.spec.harness == tower_agents::Harness::Codex && config.is_none() {
+        let queue =
+            tower_agents::delivery::queue_supported(&invocation.env, Path::new(&plan.spec.cwd))
+                .await;
+        state.private.insert("queue_supported".into(), queue.into());
+    }
     if super::clipboard_mode(plan.spec.harness).is_some() {
         tower_clipboard::shim::install(
             Path::new(&plan.state_dir),

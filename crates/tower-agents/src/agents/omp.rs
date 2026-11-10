@@ -16,7 +16,7 @@ impl AgentDefinition for Definition {
             aliases: &["omp", "oh-my-pi"],
         }
     }
-    fn execution(&self) -> Execution {
+    fn execution(&self, _spec: &AgentSpec) -> Execution {
         Execution::Hooks
     }
     fn status_behavior(&self) -> StatusBehavior {

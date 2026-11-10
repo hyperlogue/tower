@@ -149,7 +149,7 @@ fn configurations_preserve_native_state_and_limit_owned_changes() {
     );
 }
 #[test]
-fn codex_rejects_native_mode_and_endpoint_overrides_without_editing_native_config() {
+fn codex_modes_preserve_base_config_and_reject_endpoint_overrides() {
     let t = tempfile::tempdir().unwrap();
     let root = t.path();
     std::fs::create_dir(root.join(".codex")).unwrap();
@@ -168,7 +168,7 @@ fn codex_rejects_native_mode_and_endpoint_overrides_without_editing_native_confi
     );
     let mut native = spec(Harness::Codex, root);
     native.mode = Some("native".into());
-    assert!(config::validate(&native).is_err());
+    assert!(config::validate(&native).is_ok());
     for arg in ["--profile=other", "-pother", "--remote=unix:///tmp/other"] {
         let mut selected = spec(Harness::Codex, root);
         selected.args.push(arg.into());

@@ -151,10 +151,10 @@ pub fn validate(spec: &AgentSpec) -> io::Result<()> {
     if spec.harness != Harness::Codex && spec.mode.is_some() {
         return Err(invalid("mode is only supported for Codex"));
     }
-    if spec.harness == Harness::Codex && spec.mode.as_deref() != Some("app-server") {
-        return Err(invalid(
-            "Tower launches Codex through its host app-server only",
-        ));
+    if spec.harness == Harness::Codex
+        && !matches!(spec.mode.as_deref(), Some("app-server" | "native"))
+    {
+        return Err(invalid("Codex mode must be app-server or native"));
     }
     if let Some(native) = &spec.resume {
         let selectors = spec.harness.definition().identity_options();
