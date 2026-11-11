@@ -20,6 +20,7 @@ pub struct Snapshot {
     pub limited: bool,
     pub buffer: Vec<u8>,
 }
+type ExitWatch = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
 pub enum Command {
     Clipboard {
         id: u64,
@@ -348,10 +349,41 @@ impl Actor {
         self.reply_bytes = 0;
         self.offset = 0;
     }
+    fn reap(&mut self) {
+        if let Some(p) = &mut self.pty {
+            match p.poll_exit() {
+                Ok(Some(code)) => {
+                    self.clear_input();
+                    if self.read_closed {
+                        self.exited(code);
+                    } else {
+                        self.pending_exit = Some(code);
+                    }
+                }
+                Err(_) => {
+                    let _ = p.signal(true);
+                }
+                _ => {}
+            }
+        }
+    }
     async fn run(mut self) {
-        let mut next_poll = Instant::now();
         let mut bytes = vec![0; 32 * 1024];
+        let mut exit: Option<(u32, ExitWatch)> = None;
         loop {
+            match self.pty.as_ref().map(|p| (p.pid(), p.start_time)) {
+                Some((pid, start)) if exit.as_ref().is_none_or(|(watched, _)| *watched != pid) => {
+                    exit = Some((
+                        pid,
+                        match tower_pal::ProcessExit::watch(pid, start) {
+                            Ok(watch) => Box::pin(watch.exited()) as ExitWatch,
+                            Err(_) => Box::pin(std::future::pending()),
+                        },
+                    ));
+                }
+                None => exit = None,
+                _ => {}
+            }
             if self.offset == 0
                 && let Some(proof) = self.input.front().and_then(|u| match &u.origin {
                     InputOrigin::Message(m) => Some(&m.proof),
@@ -376,9 +408,8 @@ impl Actor {
                 .clients
                 .values()
                 .filter_map(|c| c.input.deadline())
-                .min()
-                .unwrap_or(next_poll)
-                .min(next_poll);
+                .chain(self.killing)
+                .min();
             tokio::select! {
                 read = async { pty.unwrap().read(&mut bytes).await },
                     if pty.is_some() && !self.read_closed && self.reply_bytes < 128 * 1024 => {
@@ -386,6 +417,7 @@ impl Actor {
                         Ok(0) | Err(_) => {
                             self.read_closed = true;
                             if let Some(code) = self.pending_exit.take() { self.exited(code); }
+                            else { self.reap(); }
                         }
                         Ok(n) => {
                             let out = self.terminal.process(&bytes[..n]);
@@ -414,7 +446,12 @@ impl Actor {
                         _ => self.clear_input(),
                     }
                 }
-                _ = tokio::time::sleep_until(wake.into()), if pty.is_some() => {
+                () = async { exit.as_mut().unwrap().1.as_mut().await }, if pty.is_some() && exit.is_some() && self.pending_exit.is_none() => {
+                    // A finished future must not be polled again; keep the PID so it is not re-armed.
+                    if let Some((_, fired)) = &mut exit { *fired = Box::pin(std::future::pending()); }
+                    self.reap();
+                }
+                _ = tokio::time::sleep_until(wake.unwrap_or_else(Instant::now).into()), if pty.is_some() && wake.is_some() => {
                     let now = Instant::now();
                     let closed=self.clients.iter().filter(|(_,c)|c.out.is_closed()).map(|(id,_)|*id).collect::<Vec<_>>();
                     if !closed.is_empty(){for id in closed{self.remove_client(id);}self.resize();}
@@ -434,21 +471,10 @@ impl Actor {
                         for id in overflow { self.remove_client(id); }
                         self.resize();
                     }
-                    if now >= next_poll {
-                        next_poll = now + Duration::from_millis(100);
-                        if self.killing.is_some_and(|deadline| now >= deadline)
-                            && let Some(p) = &self.pty { let _ = p.signal(true); }
-                        if let Some(p) = &mut self.pty {
-                            match p.poll_exit() {
-                                Ok(Some(code)) => {
-                                    self.clear_input();
-                                    if self.read_closed { self.exited(code); }
-                                    else { self.pending_exit = Some(code); }
-                                }
-                                Err(_) => { let _ = p.signal(true); }
-                                _ => {}
-                            }
-                        }
+                    if self.killing.is_some_and(|deadline| now >= deadline)
+                        && let Some(p) = &self.pty {
+                        let _ = p.signal(true);
+                        self.killing = Some(now + Duration::from_secs(1));
                     }
                 }
                 event = self.clipboard.receive.recv() => {
