@@ -3,6 +3,7 @@
 pub mod allgather;
 pub mod client;
 mod clipboard;
+mod discovery;
 mod http;
 mod http_io;
 mod metrics;
@@ -80,7 +81,13 @@ where
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| paths.home.join(".claude"))
         .join("sessions");
-    let claude = tokio::spawn(claude_sessions(service.clone(), claude_dir));
+    let claude = tokio::spawn(discovery::claude_sessions(service.clone(), claude_dir));
+    let codex_dir = std::env::var_os("CODEX_HOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| paths.home.join(".codex"))
+        .join("sessions");
+    let codex = tokio::spawn(discovery::codex_rollouts(service.clone(), codex_dir));
     let checkout_refresh = tokio::spawn(service.vcs().observe_changes(service.events()));
     let signals = tower_pal::shutdown_signal();
     tokio::pin!(signals);
@@ -114,6 +121,7 @@ where
     tasks.abort_all();
     maintenance.abort();
     claude.abort();
+    codex.abort();
     checkout_refresh.abort();
     let _ = checkout_refresh.await;
     while tasks.join_next().await.is_some() {}
@@ -192,56 +200,6 @@ async fn maintain(service: ServiceWorker, paths: Paths) {
             _ = async { match &mut states { Some(w) => w.changed().await, None => std::future::pending().await } } => managed = true,
             _ = async { match sleep { Some(at) => tokio::time::sleep_until(at).await, None => std::future::pending().await } } => due = true,
         }
-    }
-}
-
-/// Discovers unmanaged Claude Code sessions from the session files Claude writes.
-async fn claude_sessions(service: ServiceWorker, dir: std::path::PathBuf) {
-    use std::collections::BTreeMap;
-    while !dir.is_dir() {
-        match tower_pal::FileWatch::new(std::slice::from_ref(&dir)) {
-            Ok(mut watch) if !dir.is_dir() => watch.changed().await,
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("tower: Claude sessions are unobservable: {e}");
-                return;
-            }
-        }
-    }
-    let mut watch = match tower_pal::TreeWatch::new(&dir, None) {
-        Ok(watch) => watch,
-        Err(e) => {
-            eprintln!("tower: Claude sessions are unobservable: {e}");
-            return;
-        }
-    };
-    let mut seen: BTreeMap<std::path::PathBuf, (std::time::SystemTime, u64)> = BTreeMap::new();
-    loop {
-        let mut present = Vec::new();
-        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
-            let path = entry.path();
-            if path.extension().is_none_or(|e| e != "json") {
-                continue;
-            }
-            let Ok(meta) = entry.metadata() else { continue };
-            let version = (meta.modified().unwrap_or(std::time::UNIX_EPOCH), meta.len());
-            present.push(path.clone());
-            if meta.len() > 65536 || seen.get(&path) == Some(&version) {
-                continue;
-            }
-            seen.insert(path.clone(), version);
-            let Ok(text) = std::fs::read(&path) else {
-                continue;
-            };
-            let Ok(file) = serde_json::from_slice::<service::ClaudeSession>(&text) else {
-                continue;
-            };
-            let _ = service
-                .execute(move |s| s.observe_claude_session(file))
-                .await;
-        }
-        seen.retain(|path, _| present.contains(path));
-        watch.changed().await;
     }
 }
 

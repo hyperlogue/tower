@@ -145,37 +145,22 @@ pub(crate) struct ClaudeSession {
     #[serde(rename = "nameSource")]
     name_source: Option<String>,
 }
+/// A harness session observed from its own files rather than from a hook.
+pub(crate) struct NativeSession {
+    pub(crate) harness: &'static str,
+    pub(crate) pid: u32,
+    pub(crate) start: u64,
+    pub(crate) native: String,
+    pub(crate) cwd: String,
+    pub(crate) status: &'static str,
+    pub(crate) display_name: Option<String>,
+}
 impl Service {
     /// Register or update an unmanaged Claude session from its native session file.
-    pub(crate) fn observe_claude_session(&self, file: ClaudeSession) -> Result<()> {
-        let Ok(process) = tower_pal::inspect_process(file.pid) else {
-            return Ok(());
+    pub(crate) fn observe_claude_session(&self, file: ClaudeSession) -> Result<bool> {
+        let Some(start) = file.proc_start.and_then(|s| s.parse().ok()) else {
+            return Ok(false);
         };
-        if file.proc_start.as_deref() != Some(process.identity.start_time.to_string().as_str())
-            || process.tower_agent.is_some()
-        {
-            return Ok(());
-        }
-        let known = self.all().map_err(Error::Rpc)?;
-        if known
-            .iter()
-            .any(|r| r.ownership == "owned" && r.pid == Some(file.pid))
-            || descends_from_owned(&known, process.identity.parent)
-        {
-            return Ok(());
-        }
-        let existing = self
-            .store
-            .agent_by_native_id("claude", &file.session_id)
-            .ok()
-            .filter(|a| a.ended_at.is_none() && a.record.pid == Some(file.pid));
-        let token = existing.as_ref().and_then(|a| {
-            let bytes = tower_pal::read_private(&self.paths.token_path(&a.record.id).ok()?).ok()?;
-            String::from_utf8(bytes).ok()
-        });
-        if existing.is_some() && token.is_none() {
-            return Ok(());
-        }
         let status = match file.status.as_deref() {
             Some("busy" | "shell") => "working",
             Some("idle") => "idle",
@@ -190,19 +175,75 @@ impl Service {
                     .take(200)
                     .collect::<String>()
             });
+        self.observe_native_session(NativeSession {
+            harness: "claude",
+            pid: file.pid,
+            start,
+            native: file.session_id,
+            cwd: file.cwd,
+            status,
+            display_name,
+        })
+    }
+    /// Register or update an unmanaged session. Returns false when the process
+    /// is not one Tower should report from native files.
+    pub(crate) fn observe_native_session(&self, session: NativeSession) -> Result<bool> {
+        let Ok(process) = tower_pal::inspect_process(session.pid) else {
+            return Ok(false);
+        };
+        if process.identity.start_time != session.start || process.tower_agent.is_some() {
+            return Ok(false);
+        }
+        let known = self.all().map_err(Error::Rpc)?;
+        if known
+            .iter()
+            .any(|r| r.ownership == "owned" && r.pid == Some(session.pid))
+            || descends_from_owned(&known, process.identity.parent)
+        {
+            return Ok(false);
+        }
+        if let Some(previous) = known.iter().find(|r| {
+            r.harness == session.harness
+                && r.ownership == "registered"
+                && !r.shared_process
+                && r.pid == Some(session.pid)
+                && r.pid_start_time == Some(session.start)
+                && r.native_session_id
+                    .as_ref()
+                    .is_some_and(|n| *n != session.native)
+                && !matches!(r.status.as_str(), "exited" | "lost")
+        }) && self
+            .store
+            .rebind_native(&previous.id, &session.native, now_ms())
+            .is_err()
+        {
+            return Ok(true);
+        }
+        let existing = self
+            .store
+            .agent_by_native_id(session.harness, &session.native)
+            .ok()
+            .filter(|a| a.ended_at.is_none() && a.record.pid == Some(session.pid));
+        let token = existing.as_ref().and_then(|a| {
+            let bytes = tower_pal::read_private(&self.paths.token_path(&a.record.id).ok()?).ok()?;
+            String::from_utf8(bytes).ok()
+        });
+        if existing.is_some() && token.is_none() {
+            return Ok(true);
+        }
         let request = Request {
             jsonrpc: "2.0".into(),
             id: None,
             method: "agent.hook".into(),
             context: Default::default(),
             params: value(serde_json::json!({
-                "harness": "claude",
-                "native_session_id": file.session_id,
-                "pid": file.pid,
-                "cwd": file.cwd,
-                "display_name": display_name,
+                "harness": session.harness,
+                "native_session_id": session.native,
+                "pid": session.pid,
+                "cwd": session.cwd,
+                "display_name": session.display_name,
                 "kind": if existing.is_some() { "metadata" } else { "ready" },
-                "status": status,
+                "status": session.status,
                 "detail": {},
                 "token": token,
             }))
@@ -213,7 +254,7 @@ impl Service {
             pid: None,
         };
         self.dispatch(&request, peer)
-            .map(|_| ())
+            .map(|_| true)
             .map_err(Error::Rpc)
     }
 }

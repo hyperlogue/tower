@@ -1061,12 +1061,78 @@ fn unmanaged_claude_sessions_are_discovered_from_session_files() {
     let pid = child.id();
     let start = tower_pal::process_identity(pid).unwrap().start_time;
     let native = "0e9d6f8e-1111-4222-8333-444455556666";
-    let write = |status: &str| {
+    let write_session = |native: &str, status: &str| {
         let staged = sessions.join("staged");
         let file = serde_json::json!({"pid":pid,"procStart":start.to_string(),"sessionId":native,"cwd":f.root.path(),"status":status,"name":"Fixture","nameSource":"user"});
         std::fs::write(&staged, file.to_string()).unwrap();
         std::fs::rename(&staged, sessions.join(format!("{pid}.json"))).unwrap();
     };
+    let find_session = |native: &str, status: &str| {
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            let all = f.call(&["ls", "--all"]);
+            if let Some(row) = all
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["native_session_id"] == native && r["status"] == status)
+            {
+                return row.clone();
+            }
+            assert!(Instant::now() < until, "expected {status}: {all}");
+            thread::sleep(Duration::from_millis(40));
+        }
+    };
+    write_session(native, "busy");
+    let row = find_session(native, "working");
+    assert_eq!(row["ownership"], "registered");
+    assert_eq!(row["pid"], pid);
+    write_session(native, "idle");
+    let first = find_session(native, "idle");
+    // A cleared conversation keeps the process and its record.
+    let cleared = "1f9d6f8e-1111-4222-8333-444455556666";
+    write_session(cleared, "busy");
+    assert_eq!(find_session(cleared, "working")["id"], first["id"]);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    find_session(cleared, "lost");
+}
+
+#[test]
+fn unmanaged_codex_rollouts_are_discovered_from_their_writer() {
+    let f = Fixture::new();
+    let day = f.root.path().join(".codex/sessions/2026/11/10");
+    std::fs::create_dir_all(&day).unwrap();
+    let native = "0e9d6f8e-2222-4222-8333-444455556666";
+    let rollout = day.join(format!("rollout-2026-11-10T00-00-00-{native}.jsonl"));
+    let append = |line: Value| {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&rollout)
+            .unwrap();
+        writeln!(file, "{line}").unwrap();
+    };
+    append(
+        json!({"type":"session_meta","payload":{"id":native,"cwd":f.root.path(),"source":"cli"}}),
+    );
+    let standalone = f.root.path().join("standalone");
+    std::fs::create_dir(&standalone).unwrap();
+    let bin = standalone.join("codex");
+    std::fs::write(&bin, "#!/bin/sh\nexec 3>>\"$1\"\nread _\n").unwrap();
+    tower_pal::make_executable(&bin).unwrap();
+    let mut child = Command::new(&bin)
+        .arg(&rollout)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let until = Instant::now() + Duration::from_secs(5);
+    while !tower_pal::open_files(pid).is_ok_and(|files| files.contains(&rollout)) {
+        assert!(Instant::now() < until, "fixture never opened its rollout");
+        thread::sleep(Duration::from_millis(20));
+    }
     let find = |status: &str| {
         let until = Instant::now() + Duration::from_secs(10);
         loop {
@@ -1083,13 +1149,46 @@ fn unmanaged_claude_sessions_are_discovered_from_session_files() {
             thread::sleep(Duration::from_millis(40));
         }
     };
-    write("busy");
-    let row = find("working");
+    let row = find("idle");
     assert_eq!(row["ownership"], "registered");
+    assert_eq!(row["harness"], "codex");
     assert_eq!(row["pid"], pid);
-    write("idle");
+    append(json!({"type":"event_msg","payload":{"type":"task_started"}}));
+    find("working");
+    append(json!({"type":"event_msg","payload":{"type":"task_complete"}}));
     find("idle");
     child.kill().unwrap();
     child.wait().unwrap();
     find("lost");
+
+    // A rollout started while the daemon runs is found from its first write.
+    let native = "0e9d6f8e-3333-4222-8333-444455556666";
+    let rollout = day.join(format!("rollout-2026-11-10T00-00-01-{native}.jsonl"));
+    let mut child = Command::new(&bin)
+        .arg(&rollout)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let until = Instant::now() + Duration::from_secs(5);
+    while !tower_pal::open_files(child.id()).is_ok_and(|files| files.contains(&rollout)) {
+        assert!(Instant::now() < until, "fixture never opened its rollout");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let line =
+        json!({"type":"session_meta","payload":{"id":native,"cwd":f.root.path(),"source":"cli"}});
+    let started = json!({"type":"event_msg","payload":{"type":"task_started"}});
+    std::fs::write(&rollout, format!("{line}\n{started}\n")).unwrap();
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let all = f.call(&["ls", "--all"]);
+        if all.as_array().unwrap().iter().any(|r| {
+            r["native_session_id"] == native && r["status"] == "working" && r["pid"] == child.id()
+        }) {
+            break;
+        }
+        assert!(Instant::now() < until, "expected the new rollout: {all}");
+        thread::sleep(Duration::from_millis(40));
+    }
+    child.kill().unwrap();
+    child.wait().unwrap();
 }

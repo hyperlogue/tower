@@ -969,6 +969,38 @@ impl Store {
         tx.commit()?;
         Ok(agent.record)
     }
+    /// Moves a live registered process to a new native session, as when the
+    /// harness starts a fresh conversation without restarting.
+    pub fn rebind_native(&self, id: &str, native: &str, now: u64) -> Result<AgentRecord> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let mut agent = stored_agent(&tx, id)?;
+        if agent.ended_at.is_some() || agent.record.ownership == "owned" {
+            return Err(Error::Conflict("only a live registered session can rebind"));
+        }
+        let taken: Option<String> = tx
+            .query_row(
+                "SELECT id FROM agents WHERE harness=?1 AND native_id=?2",
+                params![agent.record.harness, native],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if taken.is_some_and(|other| other != id) {
+            return Err(Error::Conflict(
+                "native identity belongs to another session",
+            ));
+        }
+        agent.record.native_session_id = Some(native.into());
+        agent.record.updated_at = now;
+        agent.record.revision = next_revision(&tx)?;
+        tx.execute(
+            "UPDATE agents SET native_id=?2 WHERE id=?1",
+            params![id, native],
+        )?;
+        save_record(&tx, &agent.record)?;
+        tx.commit()?;
+        Ok(agent.record)
+    }
     pub fn mark_lost(&self, id: &str, now: u64) -> Result<()> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
