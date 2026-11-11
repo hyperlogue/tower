@@ -527,11 +527,11 @@ impl Client {
             return Err(Error::Limit);
         }
         tokio::time::timeout(timeout, async {
-            for _ in 0..600 {
+            for _ in 0..240 {
                 if self.thread_status(thread).await? == ThreadStatus::NotLoaded {
                     return Ok(());
                 }
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                tokio::time::sleep(Duration::from_millis(250)).await;
             }
             Err(Error::Limit)
         })
