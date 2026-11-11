@@ -68,6 +68,7 @@ impl Requests {
         }
         request.after_sequence = after_sequence;
         items.insert(request.wire.source_request_id.clone(), request);
+        tower_store::touch();
         Ok(())
     }
     pub fn validate_reply(&self, params: &Value) -> Result<()> {
@@ -87,12 +88,14 @@ impl Requests {
         let response = validate_reply(request, params)?;
         let id = request.wire.native_request_id.clone();
         items.remove(key);
+        tower_store::touch();
         Ok((id, response))
     }
     pub fn retire_all(&self) -> Result<()> {
         for request in self.items.lock().map_err(internal)?.values_mut() {
             request.retire("stale")?;
         }
+        tower_store::touch();
         Ok(())
     }
     pub fn retire_native(&self, id: &Value, state: &str) -> Result<()> {
@@ -104,6 +107,7 @@ impl Requests {
                 request.retire(state)?;
             }
         }
+        tower_store::touch();
         Ok(())
     }
     pub fn updates(

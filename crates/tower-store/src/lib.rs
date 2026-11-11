@@ -1,7 +1,7 @@
 //! Shared SQLite storage with separate registry and execution persistence APIs.
 
 mod database;
-pub use database::Database;
+pub use database::{Database, changes, touch};
 mod messaging;
 mod vcs;
 pub use messaging::{DeliveryState, StoredApproval};

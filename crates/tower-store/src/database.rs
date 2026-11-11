@@ -11,6 +11,16 @@ const REGISTRY: &str = include_str!("schema.sql");
 const RUNTIME: &str = include_str!("runtime.sql");
 
 /// Shared by persistence modules; domain callers use Store or Journal operations.
+static CHANGES: std::sync::LazyLock<tokio::sync::watch::Sender<u64>> =
+    std::sync::LazyLock::new(|| tokio::sync::watch::channel(0).0);
+/// Signals that persistent or live process state may have changed.
+pub fn touch() {
+    CHANGES.send_modify(|n| *n = n.wrapping_add(1));
+}
+/// Wakes after any database commit or [`touch`] in this process.
+pub fn changes() -> tokio::sync::watch::Receiver<u64> {
+    CHANGES.subscribe()
+}
 pub struct Database {
     conn: Mutex<Connection>,
     runtime_directory: PathBuf,
@@ -98,6 +108,10 @@ impl Database {
             SCHEMA_VERSION => {}
             _ => return Err(Error::Schema),
         }
+        conn.commit_hook(Some(|| {
+            touch();
+            false
+        }))?;
         Ok(Self {
             conn: Mutex::new(conn),
             runtime_directory,

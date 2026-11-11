@@ -373,7 +373,10 @@ async fn connection(
     let epoch = worker
         .execute(move |s| s.sync_activate(&handshake_key, &ack.node_name))
         .await??;
-    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    let mut changes = tower_store::changes();
+    let key_path = paths.state.join("allgather.key");
+    let mut key_changes = tower_pal::FileWatch::new(std::slice::from_ref(&key_path))?;
+    let mut dirty = true;
     let mut last_ping = tokio::time::Instant::now();
     let mut last_response = last_ping;
     let mut publisher = status::Publisher::default();
@@ -417,31 +420,50 @@ async fn connection(
     let mut pending_since: Option<tokio::time::Instant> = None;
     let mut replies = tokio::task::JoinSet::new();
     loop {
-        tokio::select! {
-            _=tick.tick()=>{
-                if tower_pal::read_private(&paths.state.join("allgather.key")).ok().as_deref()!=Some(key.as_bytes()){return Ok(());}
-                worker.execute(move|s|s.check_remote(epoch)).await??;
-                if last_response.elapsed()>Duration::from_secs(35){return Err(Error::Other("Sync peer stopped responding".into()));}
-                if last_ping.elapsed()>=Duration::from_secs(10){socket.send(Message::Ping(Vec::new().into())).await.map_err(|_|Error::Other("Sync ping failed".into()))?;last_ping=tokio::time::Instant::now();}
-                if pending_since.is_some_and(|sent|sent.elapsed()>=Duration::from_secs(30)) {
-                    return Err(tower_protocol::RpcError::application("sync_ack_timeout", "Status projection was not acknowledged").into());
+        if dirty {
+            dirty = false;
+            if tower_pal::read_private(&key_path).ok().as_deref() != Some(key.as_bytes()) {
+                return Ok(());
+            }
+            worker.execute(move |s| s.check_remote(epoch)).await??;
+            let cursor = worker.execute(|s| s.sync_cursor()).await??;
+            if !publisher.waiting() && previous_cursor != Some(cursor) {
+                let records = worker.execute(|s| s.sync_state()).await??;
+                if let Some(frame) = publisher.prepare(&records, delta_enabled)? {
+                    write(&mut socket, &frame).await?;
+                    pending_since = Some(tokio::time::Instant::now());
                 }
-                let cursor=worker.execute(|s|s.sync_cursor()).await??;
-                if !publisher.waiting() && previous_cursor!=Some(cursor) {
-                    let records=worker.execute(|s|s.sync_state()).await??;
-                    if let Some(frame)=publisher.prepare(&records,delta_enabled)? {
-                        write(&mut socket,&frame).await?;
-                        pending_since=Some(tokio::time::Instant::now());
-                    }
-                    previous_cursor=Some(cursor);
-                }
-                if let Some(frame) = catalog.prepare(&worker, epoch).await? {
+                previous_cursor = Some(cursor);
+            }
+            if let Some(frame) = catalog.prepare(&worker, epoch).await? {
+                write(&mut socket, &frame).await?;
+            }
+            if managed_enabled || terminal_enabled {
+                for frame in execution
+                    .prepare(&worker, epoch, [managed_enabled, terminal_enabled])
+                    .await?
+                {
                     write(&mut socket, &frame).await?;
                 }
-                if managed_enabled || terminal_enabled {for frame in execution.prepare(&worker,epoch,[managed_enabled,terminal_enabled]).await? {write(&mut socket,&frame).await?;}}
             }
-            Some(reply)=replies.join_next(),if !replies.is_empty()=>{if let Ok(Some(reply))=reply {worker.execute(move|s|s.check_remote(epoch)).await??;write(&mut socket,&reply).await?;}}
+        }
+        let ack_deadline = pending_since.map(|sent| sent + Duration::from_secs(30));
+        tokio::select! {
+            _=changes.changed()=>{dirty=true;}
+            _=key_changes.changed()=>{dirty=true;}
+            _=tokio::time::sleep_until(last_ping + Duration::from_secs(10))=>{
+                socket.send(Message::Ping(Vec::new().into())).await.map_err(|_|Error::Other("Sync ping failed".into()))?;
+                last_ping=tokio::time::Instant::now();
+            }
+            _=tokio::time::sleep_until(last_response + Duration::from_secs(35))=>{
+                return Err(Error::Other("Sync peer stopped responding".into()));
+            }
+            _=async { tokio::time::sleep_until(ack_deadline.unwrap_or_else(tokio::time::Instant::now)).await }, if ack_deadline.is_some()=>{
+                return Err(tower_protocol::RpcError::application("sync_ack_timeout", "Status projection was not acknowledged").into());
+            }
+            Some(reply)=replies.join_next(),if !replies.is_empty()=>{dirty=true;if let Ok(Some(reply))=reply {worker.execute(move|s|s.check_remote(epoch)).await??;write(&mut socket,&reply).await?;}}
             incoming=socket.next()=>{
+                dirty=true;
                 let Some(incoming)=incoming else{return Ok(())};
                 let incoming=incoming.map_err(|_|Error::Other("Sync read failed".into()))?;
                 match incoming {
