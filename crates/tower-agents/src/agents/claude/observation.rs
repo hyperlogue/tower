@@ -122,14 +122,26 @@ impl HookSession for Session {
         self.request = Some(request);
     }
     fn changed(&mut self) -> BoxFuture<'_, ()> {
+        let Self {
+            activity,
+            updates,
+            pending,
+            ..
+        } = self;
         Box::pin(async move {
-            let Some(rx) = &mut self.updates else {
-                return std::future::pending().await;
+            let transcript = async {
+                let Some(rx) = updates else {
+                    return std::future::pending().await;
+                };
+                if rx.changed().await.is_ok() {
+                    *pending = rx.borrow_and_update().clone();
+                } else {
+                    std::future::pending().await
+                }
             };
-            if rx.changed().await.is_ok() {
-                self.pending = rx.borrow_and_update().clone();
-            } else {
-                std::future::pending().await
+            tokio::select! {
+                () = transcript => {}
+                () = activity.changed() => {}
             }
         })
     }

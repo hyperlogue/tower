@@ -228,7 +228,9 @@ async fn serve(
         >,
     )>(64);
     let permits = Arc::new(Semaphore::new(32));
-    let mut tick = tokio::time::interval(Duration::from_millis(100));
+    if server.is_none() && activity.refresh(state, now()) {
+        publisher.publish(state).await?;
+    }
     let mut accept_after = tokio::time::Instant::now();
     let mut child_exit = None;
     let mut stop_confirmed = false;
@@ -352,7 +354,6 @@ async fn serve(
             Some(event)=observed.recv(), if server.is_some()=>{
                 let kind=event.kind;let before=state.seq;let was_idle=state.status=="idle";activity.apply(state,event,now());if state.seq!=before{super::injection::observe_idle(state,kind,was_idle);}publisher.publish(state).await?;
             }
-            _=tick.tick()=>{}
         }
         if server.is_none() && activity.refresh(state, now()) {
             publisher.publish(state).await?;

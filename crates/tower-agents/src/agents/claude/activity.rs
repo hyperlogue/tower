@@ -5,7 +5,7 @@ use crate::{
 use serde::Deserialize;
 use std::{
     path::PathBuf,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, SystemTime},
 };
 
 #[derive(Clone, Deserialize)]
@@ -19,7 +19,8 @@ struct ClaudeState {
 }
 pub struct Activity {
     directory: Option<PathBuf>,
-    next: Instant,
+    /// The watched PID, its watch, and whether the sessions directory existed when armed.
+    watched: Option<(u32, tower_pal::FileWatch, bool)>,
     started: SystemTime,
     version: Option<(SystemTime, u64)>,
     cached: Option<ClaudeState>,
@@ -33,17 +34,16 @@ impl Activity {
             .or_else(|| env.get("HOME").map(|s| PathBuf::from(s).join(".claude")));
         Self {
             directory: home.map(|p| p.join("sessions")),
-            next: Instant::now(),
+            watched: None,
             started: SystemTime::now(),
             version: None,
             cached: None,
         }
     }
     pub fn refresh(&mut self, state: &mut RuntimeState, now: u64) -> bool {
-        if Instant::now() < self.next || state.stop_requested {
+        if state.stop_requested {
             return false;
         }
-        self.next = Instant::now() + Duration::from_millis(500);
         let Some(directory) = &self.directory else {
             return false;
         };
@@ -51,6 +51,17 @@ impl Activity {
             return false;
         };
         let path = directory.join(format!("{pid}.json"));
+        // A watch armed before Claude created its sessions directory sees only that creation.
+        if self
+            .watched
+            .as_ref()
+            .is_none_or(|(watched, _, armed)| *watched != pid || !armed)
+        {
+            let armed = directory.is_dir();
+            self.watched = tower_pal::FileWatch::new(std::slice::from_ref(&path))
+                .ok()
+                .map(|watch| (pid, watch, armed));
+        }
         let Ok(meta) = std::fs::metadata(&path) else {
             return false;
         };
@@ -145,11 +156,21 @@ impl Activity {
         }
         changed
     }
+    /// Resolves when Claude rewrites the session file of the PID last refreshed.
+    pub async fn changed(&mut self) {
+        match &mut self.watched {
+            Some((_, watch, _)) => watch.changed().await,
+            None => std::future::pending().await,
+        }
+    }
 }
 
 impl crate::hook::HookSession for Activity {
     fn apply(&mut self, state: &mut RuntimeState, event: crate::events::AgentEvent, now: u64) {
         crate::events::apply(state, event, now);
+    }
+    fn changed(&mut self) -> futures_util::future::BoxFuture<'_, ()> {
+        Box::pin(Activity::changed(self))
     }
     fn refresh(&mut self, state: &mut RuntimeState, now: u64) -> bool {
         self.refresh(state, now)
