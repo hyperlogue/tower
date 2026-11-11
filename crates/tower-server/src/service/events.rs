@@ -57,6 +57,7 @@ impl Service {
     }
     pub(super) fn publish(&self) -> std::result::Result<(), RpcError> {
         self.wake.replan();
+        self.authority.send_modify(|n| *n = n.wrapping_add(1));
         let records: BTreeMap<_, _> = self.all()?.into_iter().map(|r| (r.id.clone(), r)).collect();
         let mut state = self
             .published

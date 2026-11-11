@@ -386,6 +386,7 @@ async fn events(
         context: context.clone(),
     };
     let mut events = app.worker.events();
+    let mut authority = app.worker.authority_changes();
     let snapshot = match app.worker.request(request, peer()).await {
         Ok(v) => v,
         Err(e) => {
@@ -409,7 +410,9 @@ async fn events(
         let _permit=permit;
         let mut stop=app.stop.clone();
         yield Ok::<_,Infallible>(Event::default().event("snapshot").data(serde_json::to_string(&snapshot).unwrap_or_default()));
-        let mut interval=tokio::time::interval(Duration::from_secs(1));
+        let expiring=context.clone();
+        let mut expiry=app.worker.execute(move |s|s.credential_expiry(&expiring)).await.ok().flatten()
+            .map(|at|tokio::time::Instant::now()+Duration::from_millis(at.saturating_sub(crate::service::now_ms()).saturating_add(1)));
         loop {
             tokio::select! {
                 _=stop.changed()=>break,
@@ -423,7 +426,13 @@ async fn events(
                     match app.worker.execute(move |s|s.event_visible(&ctx,peer(),&check)).await {Ok(Ok(true))=>{},Ok(Ok(false))=>continue,_=>break}
                     yield Ok(Event::default().event(event.method.clone()).id(event.params.seq.to_string()).data(serde_json::to_string(&*event).unwrap_or_default()));
                 }
-                _=interval.tick()=>{
+                _=async { match expiry { Some(at)=>tokio::time::sleep_until(at).await, None=>std::future::pending().await } }=>{
+                    expiry=None;
+                    let ctx=context.clone();
+                    if !matches!(app.worker.execute(move |s|s.check_subscription(&ctx,peer())).await,Ok(Ok(()))){break;}
+                }
+                changed=authority.changed()=>{
+                    if changed.is_err(){break;}
                     let ctx=context.clone();
                     if !matches!(app.worker.execute(move |s|s.check_subscription(&ctx,peer())).await,Ok(Ok(()))){break;}
                 }

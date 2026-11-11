@@ -168,6 +168,8 @@ pub(super) struct Service {
     events: tokio::sync::broadcast::Sender<Arc<EventNotification>>,
     published: Mutex<events::Published>,
     wake: Arc<Wake>,
+    /// Advances after any state change that can alter a caller's authority.
+    authority: tokio::sync::watch::Sender<u64>,
 }
 /// Next deadline in epoch milliseconds, and live `(pid, start_time)` incarnations.
 pub(crate) type MaintenancePlan = (Option<u64>, Vec<(u32, u64)>);
@@ -259,6 +261,7 @@ impl Service {
             events: tokio::sync::broadcast::channel(256).0,
             published: Mutex::new(events::Published::default()),
             wake: Arc::default(),
+            authority: tokio::sync::watch::channel(0).0,
         })
     }
     pub(crate) fn authorize_host_metrics(
@@ -340,6 +343,14 @@ impl Service {
             .filter_map(|r| Some((r.pid?, r.pid_start_time?)))
             .collect();
         Ok((next, processes))
+    }
+    pub(crate) fn authority_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.authority.subscribe()
+    }
+    /// When the bearer token in `context` stops authorizing, if it expires.
+    pub(crate) fn credential_expiry(&self, context: &CallerContext) -> Option<u64> {
+        let token = context.bearer_token.as_ref()?;
+        self.store.token_by_hash(&hash(token)).ok()?.info.expires_at
     }
     pub(crate) fn wake(&self) -> Arc<Wake> {
         self.wake.clone()

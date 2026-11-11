@@ -26,6 +26,12 @@ impl ServiceWorker {
     ) -> tokio::sync::broadcast::Receiver<Arc<tower_protocol::EventNotification>> {
         self.service.events()
     }
+    pub fn authority_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.service.authority_changes()
+    }
+    pub fn wake(&self) -> Arc<crate::service::Wake> {
+        self.service.wake()
+    }
     pub fn new(service: Service) -> Self {
         Self {
             service: Arc::new(service),

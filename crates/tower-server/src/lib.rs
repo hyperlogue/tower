@@ -132,9 +132,7 @@ where
 async fn maintain(service: ServiceWorker, paths: Paths) {
     use std::collections::BTreeMap;
     use std::sync::atomic::Ordering;
-    let Ok(wake) = service.execute(|s| s.wake()).await else {
-        return;
-    };
+    let wake = service.wake();
     let sessions = paths.state.join("sessions");
     let mut states = match tower_pal::private_dir(&sessions)
         .and_then(|_| tower_pal::TreeWatch::new(&sessions, "state.json"))
@@ -198,6 +196,25 @@ async fn maintain(service: ServiceWorker, paths: Paths) {
     }
 }
 
+/// The earliest expiry among the credentials a connection is acting on.
+async fn credential_deadline(
+    service: &ServiceWorker,
+    subscription: Option<&tower_protocol::CallerContext>,
+    clipboard: Option<tower_protocol::CallerContext>,
+) -> Result<Option<tokio::time::Instant>> {
+    let contexts: Vec<_> = subscription.cloned().into_iter().chain(clipboard).collect();
+    if contexts.iter().all(|c| c.bearer_token.is_none()) {
+        return Ok(None);
+    }
+    let at = service
+        .execute(move |s| contexts.iter().filter_map(|c| s.credential_expiry(c)).min())
+        .await?;
+    Ok(at.map(|at| {
+        tokio::time::Instant::now()
+            + Duration::from_millis(at.saturating_sub(service::now_ms()).saturating_add(1))
+    }))
+}
+
 async fn serve_connection(
     stream: tower_pal::IpcStream,
     peer: tower_pal::Peer,
@@ -245,12 +262,14 @@ async fn serve_connection(
         Vec<String>,
         Option<String>,
     )> = None;
-    let mut check = tokio::time::interval(Duration::from_secs(1));
+    let mut authority = service.authority_changes();
+    let mut expiry: Option<tokio::time::Instant> = None;
     loop {
         let line = tokio::select! {
             line=incoming.recv()=>match line {Some(Ok(Some(line)))=>line,Some(Err(e))=>return Err(e.into()),_=>return Ok(())},
             event=clipboard.next()=>{
                 clipboard.check(&service,peer).await?;
+                expiry=credential_deadline(&service,subscription.as_ref().map(|s|&s.0),clipboard.context()).await?;
                 if let Some(event)=event {let mut v=serde_json::to_value(event)?;v["jsonrpc"]="2.0".into();wire::write_frame(&mut write,&v).await?;}
                 continue;
             }
@@ -267,9 +286,15 @@ async fn serve_connection(
                 wire::write_frame(&mut write,&*event).await?;
                 continue;
             }
-            _=check.tick(),if subscription.is_some()||clipboard.context().is_some()=>{
+            _=async {
+                tokio::select! {
+                    _=authority.changed()=>{},
+                    _=async { match expiry { Some(at)=>tokio::time::sleep_until(at).await, None=>std::future::pending().await } }=>{},
+                }
+            },if subscription.is_some()||clipboard.context().is_some()=>{
                 if let Some(subscription)=&subscription {let context=subscription.0.clone();service.execute(move |s|s.check_subscription(&context,peer)).await??;}
                 clipboard.check(&service,peer).await?;
+                expiry=credential_deadline(&service,subscription.as_ref().map(|s|&s.0),clipboard.context()).await?;
                 continue;
             }
         };
@@ -351,6 +376,12 @@ async fn serve_connection(
                 subscription = None;
             }
         }
+        expiry = credential_deadline(
+            &service,
+            subscription.as_ref().map(|s| &s.0),
+            clipboard.context(),
+        )
+        .await?;
         let stopped = stop && result.is_ok();
         if let Some(id) = id {
             let body = match result {
