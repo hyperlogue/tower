@@ -1,5 +1,6 @@
 mod clipboard;
 mod enrollment;
+pub(crate) use enrollment::EnrollmentStep;
 mod events;
 mod execution;
 mod managed;

@@ -1,5 +1,6 @@
 use super::*;
-use crate::allgather::enrollment::{Poll, Started};
+use crate::allgather::enrollment::{Enrollment, Plan};
+use crate::service::EnrollmentStep;
 const PAIRING_CODE: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 fn request(method: &str, mut p: serde_json::Value, context: CallerContext) -> Request {
     if method == "allgather.enrollment.begin" && p.get("pairing_code").is_none() {
@@ -19,36 +20,42 @@ fn peer(pid: u32) -> Peer {
         pid: Some(pid),
     }
 }
-fn started(id: &str) -> Started {
-    Started {
+const TOKEN: &str = "private-confirmation-token-fixture";
+fn enrollment(id: &str) -> Enrollment {
+    Enrollment {
         enrollment_id: id.into(),
         authorization_url: format!("https://allgather.example/tower/enroll/{id}"),
-        polling_token: Secret("private-polling-token-fixture".into()),
+        confirmation_token: Secret(TOKEN.into()),
         expires_at: "2099-01-01T00:00:00Z".into(),
-        interval: 1,
+        machine_id: "machine".into(),
+        credential_id: "credential".into(),
+        access_key: Secret("machine-key-fixture".into()),
+        node_label: Some("Fixture".into()),
+        scopes: vec!["read".into(), "send".into()],
     }
 }
-fn approved() -> Poll {
-    Poll {
-        state: "approved".into(),
-        interval: None,
-        machine_id: Some("machine".into()),
-        credential_id: Some("credential".into()),
-        access_key: Some(Secret("machine-key-fixture".into())),
-        node_label: Some("Fixture".into()),
-        scopes: Some(vec!["read".into(), "send".into()]),
+fn begin(step: EnrollmentStep) -> Plan {
+    match step {
+        EnrollmentStep::Begin(plan) => plan,
+        EnrollmentStep::Saved(..) => panic!("expected a new pairing request"),
+    }
+}
+fn resume(step: EnrollmentStep) -> (Value, Option<crate::allgather::enrollment::Confirmation>) {
+    match step {
+        EnrollmentStep::Saved(result, confirmation) => (result, confirmation),
+        EnrollmentStep::Begin(_) => panic!("expected a saved pairing result"),
     }
 }
 #[test]
 fn pairing_request_is_private_durable_and_immutable_across_processes_and_restart() {
     use std::os::unix::fs::PermissionsExt;
     let (_dir, store, s) = setup();
-    let begin = request(
+    let start = request(
         "allgather.enrollment.begin",
         serde_json::json!({"url":"https://allgather.example"}),
         human(),
     );
-    let plan = s.enrollment_plan(&begin, peer(100)).unwrap().unwrap();
+    let plan = begin(s.enrollment_plan(&start, peer(100)).unwrap());
     assert!(crate::allgather::enrollment::valid_pairing_secret(
         &plan.request_id
     ));
@@ -72,7 +79,7 @@ fn pairing_request_is_private_durable_and_immutable_across_processes_and_restart
         .code,
         "invalid_params"
     );
-    let retried = s.enrollment_plan(&begin, peer(101)).unwrap().unwrap();
+    let retried = begin(s.enrollment_plan(&start, peer(101)).unwrap());
     assert_eq!(retried.body(), plan.body());
     let mut older = saved;
     older.get_mut(&plan.request_id).unwrap().plan.tower_version = "previous-fixture-version".into();
@@ -80,7 +87,7 @@ fn pairing_request_is_private_durable_and_immutable_across_processes_and_restart
     let paths = s.paths.clone();
     drop(s);
     let s = Service::new(paths, store, "test", tower_sessions::Backends::default()).unwrap();
-    let resumed = s.enrollment_plan(&begin, peer(102)).unwrap().unwrap();
+    let resumed = begin(s.enrollment_plan(&start, peer(102)).unwrap());
     assert_eq!(resumed.request_id, plan.request_id);
     assert_eq!(resumed.tower_version, "previous-fixture-version");
     for options in [
@@ -98,30 +105,26 @@ fn pairing_request_is_private_durable_and_immutable_across_processes_and_restart
             "conflict"
         );
     }
-    let visible = s
-        .remember_enrollment(resumed.clone(), started("durable"))
+    let (visible, _) = s
+        .accept_enrollment(resumed.clone(), enrollment("durable"))
         .unwrap();
     assert_eq!(
-        s.remember_enrollment(resumed, started("durable")).unwrap(),
+        s.accept_enrollment(resumed, enrollment("durable"))
+            .unwrap()
+            .0,
         visible
     );
     let paths = s.paths.clone();
     let store = s.store.clone();
     drop(s);
     let s = Service::new(paths, store, "test", tower_sessions::Backends::default()).unwrap();
-    assert_eq!(
-        s.enrollment_plan(&begin, peer(103)).unwrap().err().unwrap(),
-        visible
-    );
-    let query = request(
-        "allgather.enrollment.poll",
-        serde_json::json!({"id":"durable"}),
-        human(),
-    );
-    assert!(s.claim_enrollment_poll(&query, peer(104)).unwrap().is_ok());
+    let (resumed, confirmation) = resume(s.enrollment_plan(&start, peer(103)).unwrap());
+    assert_eq!(resumed, visible);
+    assert!(confirmation.is_some());
     let text = serde_json::to_string(&visible).unwrap();
     assert!(!text.contains(PAIRING_CODE));
-    assert!(!text.contains("private-polling"));
+    assert!(!text.contains(TOKEN));
+    assert!(!text.contains("machine-key-fixture"));
 }
 #[test]
 fn invalid_or_missing_codes_do_not_allocate_pairing_state() {
@@ -150,22 +153,17 @@ fn invalid_or_missing_codes_do_not_allocate_pairing_state() {
 #[test]
 fn pairing_responses_cannot_echo_credentials_as_public_identity() {
     let (_dir, _store, s) = setup();
-    let begin = request(
+    let start = request(
         "allgather.enrollment.begin",
         serde_json::json!({"url":"https://allgather.example"}),
         human(),
     );
-    let plan = s.enrollment_plan(&begin, peer(100)).unwrap().unwrap();
-    s.remember_enrollment(plan, started("redacted")).unwrap();
-    for secret in [
-        PAIRING_CODE,
-        "machine-key-fixture",
-        "private-polling-token-fixture",
-    ] {
-        let mut response = approved();
+    let plan = begin(s.enrollment_plan(&start, peer(100)).unwrap());
+    for secret in [PAIRING_CODE, "machine-key-fixture", TOKEN] {
+        let mut response = enrollment("redacted");
         response.node_label = Some(secret.into());
         assert_eq!(
-            s.finish_enrollment_poll("redacted", Ok(response))
+            s.accept_enrollment(plan.clone(), response)
                 .err()
                 .unwrap()
                 .data
@@ -174,14 +172,10 @@ fn pairing_responses_cannot_echo_credentials_as_public_identity() {
         );
         assert!(!s.paths.state.join("allgather.key").exists());
     }
-    let mut response = approved();
-    response.machine_id = Some(PAIRING_CODE.into());
+    let mut response = enrollment("redacted");
+    response.machine_id = PAIRING_CODE.into();
     assert_eq!(
-        s.finish_enrollment_poll("redacted", Ok(response))
-            .err()
-            .unwrap()
-            .data
-            .code,
+        s.accept_enrollment(plan, response).err().unwrap().data.code,
         "enrollment_failed"
     );
     assert!(!s.paths.state.join("allgather-consent.json").exists());
@@ -190,17 +184,15 @@ fn pairing_responses_cannot_echo_credentials_as_public_identity() {
 fn invalid_pairing_consent_never_falls_back_to_manual_scopes() {
     let (_dir, store, mut s) = setup();
     s.allgather_config.scopes = Some(vec!["read".into(), "send".into(), "acp:control".into()]);
-    let begin = request(
+    let start = request(
         "allgather.enrollment.begin",
         serde_json::json!({"url":"https://allgather.example","read_only":true}),
         human(),
     );
-    let plan = s.enrollment_plan(&begin, peer(100)).unwrap().unwrap();
-    s.remember_enrollment(plan, started("restricted")).unwrap();
-    let mut response = approved();
-    response.scopes = Some(vec!["read".into()]);
-    s.finish_enrollment_poll("restricted", Ok(response))
-        .unwrap();
+    let plan = begin(s.enrollment_plan(&start, peer(100)).unwrap());
+    let mut response = enrollment("restricted");
+    response.scopes = vec!["read".into()];
+    s.accept_enrollment(plan, response).unwrap();
     store.set_enrollment("allgather", Some("machine")).unwrap();
     assert_eq!(s.remote_scopes().unwrap(), ["read"]);
     let consent = s.paths.state.join("allgather-consent.json");
@@ -243,15 +235,15 @@ fn invalid_pairing_consent_never_falls_back_to_manual_scopes() {
 #[test]
 fn logout_cancels_create_and_late_responses_across_restart() {
     let (_dir, store, s) = setup();
-    let begin = request(
+    let start = request(
         "allgather.enrollment.begin",
         serde_json::json!({"url":"https://allgather.example"}),
         human(),
     );
-    let plan = s.enrollment_plan(&begin, peer(100)).unwrap().unwrap();
+    let plan = begin(s.enrollment_plan(&start, peer(100)).unwrap());
     call(&s, "allgather.logout", serde_json::json!({}), human()).unwrap();
     assert_eq!(
-        s.remember_enrollment(plan.clone(), started("late"))
+        s.accept_enrollment(plan.clone(), enrollment("late"))
             .err()
             .unwrap()
             .data
@@ -262,7 +254,7 @@ fn logout_cancels_create_and_late_responses_across_restart() {
     drop(s);
     let s = Service::new(paths, store, "test", tower_sessions::Backends::default()).unwrap();
     assert_eq!(
-        s.remember_enrollment(plan, started("late"))
+        s.accept_enrollment(plan, enrollment("late"))
             .err()
             .unwrap()
             .data
@@ -279,19 +271,21 @@ fn logout_cancels_create_and_late_responses_across_restart() {
 #[test]
 fn confirmation_recovers_only_after_credential_persistence_and_keeps_completion() {
     let (_dir, store, s) = setup();
-    let begin = request(
+    let start = request(
         "allgather.enrollment.begin",
         serde_json::json!({"url":"https://allgather.example"}),
         human(),
     );
-    let plan = s.enrollment_plan(&begin, peer(100)).unwrap().unwrap();
-    s.remember_enrollment(plan, started("saved")).unwrap();
+    let plan = begin(s.enrollment_plan(&start, peer(100)).unwrap());
     let key_path = s.paths.state.join("allgather.key");
     std::fs::create_dir(&key_path).unwrap();
-    assert!(s.finish_enrollment_poll("saved", Ok(approved())).is_err());
+    assert!(
+        s.accept_enrollment(plan.clone(), enrollment("saved"))
+            .is_err()
+    );
     assert!(s.pending_enrollment_confirmation().unwrap().is_none());
     std::fs::remove_dir(&key_path).unwrap();
-    let (authorized, confirmation) = s.finish_enrollment_poll("saved", Ok(approved())).unwrap();
+    let (authorized, confirmation) = s.accept_enrollment(plan, enrollment("saved")).unwrap();
     assert!(
         !serde_json::to_string(&authorized)
             .unwrap()
@@ -313,27 +307,16 @@ fn confirmation_recovers_only_after_credential_persistence_and_keeps_completion(
     let complete = s.confirm_enrollment(&recovered).unwrap();
     assert_eq!(s.confirm_enrollment(&recovered).unwrap(), complete);
     assert!(s.pending_enrollment_confirmation().unwrap().is_none());
-    assert!(s.enrollment_plan(&begin, peer(105)).unwrap().is_err());
-    let query = request(
-        "allgather.enrollment.poll",
-        serde_json::json!({"id":"saved"}),
-        human(),
-    );
-    let reply = serde_json::to_value(
-        s.claim_enrollment_poll(&query, peer(105))
-            .unwrap()
-            .err()
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(reply["state"], "complete");
+    let (reply, confirmation) = resume(s.enrollment_plan(&start, peer(105)).unwrap());
+    assert_eq!(serde_json::to_value(reply).unwrap()["state"], "complete");
+    assert!(confirmation.is_none());
     let stored = std::fs::read_to_string(s.paths.state.join("allgather-pairing.json")).unwrap();
     assert!(!stored.contains(PAIRING_CODE));
-    assert!(!stored.contains("private-polling"));
+    assert!(!stored.contains(TOKEN));
     assert!(!stored.contains("machine-key-fixture"));
 }
 #[test]
-fn enrollment_grants_no_local_admin_and_only_its_initiator_can_poll() {
+fn enrollment_grants_no_local_admin_and_only_its_initiator_can_resume() {
     let (_dir, _store, s) = setup();
     let registered = call(
         &s,
@@ -351,11 +334,11 @@ fn enrollment_grants_no_local_admin_and_only_its_initiator_can_poll() {
         serde_json::json!({"url":"https://allgather.example"}),
         context.clone(),
     );
-    let plan = s.enrollment_plan(&r, peer(1)).unwrap().unwrap();
+    let plan = begin(s.enrollment_plan(&r, peer(1)).unwrap());
     assert!(plan.scopes.iter().any(|s| s == "acp:control"));
-    let published = s.remember_enrollment(plan, started("first")).unwrap();
+    let (published, _) = s.accept_enrollment(plan, enrollment("first")).unwrap();
     let json = serde_json::to_string(&published).unwrap();
-    assert!(!json.contains("private-polling"));
+    assert!(!json.contains(TOKEN));
     assert_eq!(
         call(
             &s,
@@ -368,48 +351,31 @@ fn enrollment_grants_no_local_admin_and_only_its_initiator_can_poll() {
         .code,
         "denied"
     );
-    let query = request(
-        "allgather.enrollment.poll",
-        serde_json::json!({"id":"first"}),
+    let other = request(
+        "allgather.enrollment.begin",
+        serde_json::json!({"url":"https://allgather.example"}),
         human(),
     );
     assert_eq!(
-        s.claim_enrollment_poll(&query, peer(2))
-            .err()
-            .unwrap()
-            .data
-            .code,
+        s.enrollment_plan(&other, peer(2)).err().unwrap().data.code,
         "denied"
     );
-    let query = request(
-        "allgather.enrollment.poll",
-        serde_json::json!({"id":"first"}),
-        context,
-    );
-    assert!(s.claim_enrollment_poll(&query, peer(3)).unwrap().is_ok());
+    assert_eq!(resume(s.enrollment_plan(&r, peer(3)).unwrap()).0, published);
 }
 #[test]
 fn pairing_approval_cannot_widen_scopes_and_logout_invalidates_pending_grants() {
     let (_dir, store, s) = setup();
-    let begin = request(
+    let start = request(
         "allgather.enrollment.begin",
         serde_json::json!({"url":"https://allgather.example","read_only":true}),
         human(),
     );
-    let plan = s.enrollment_plan(&begin, peer(100)).unwrap().unwrap();
+    let plan = begin(s.enrollment_plan(&start, peer(100)).unwrap());
     assert_eq!(plan.scopes, vec!["read".to_owned()]);
-    s.remember_enrollment(plan, started("read-only")).unwrap();
-    let approved = Poll {
-        state: "approved".into(),
-        interval: None,
-        machine_id: Some("machine".into()),
-        credential_id: Some("credential".into()),
-        access_key: Some(Secret("machine-key-fixture".into())),
-        node_label: Some("Fixture".into()),
-        scopes: Some(vec!["read".into(), "acp:control".into()]),
-    };
+    let mut response = enrollment("read-only");
+    response.scopes = vec!["read".into(), "acp:control".into()];
     assert_eq!(
-        s.finish_enrollment_poll("read-only", Ok(approved))
+        s.accept_enrollment(plan.clone(), response)
             .err()
             .unwrap()
             .data
@@ -420,50 +386,27 @@ fn pairing_approval_cannot_widen_scopes_and_logout_invalidates_pending_grants() 
     assert_eq!(store.host().unwrap().mode, "standalone");
     call(&s, "allgather.logout", serde_json::json!({}), human()).unwrap();
     assert_eq!(
-        s.finish_enrollment_poll(
-            "read-only",
-            Ok(Poll {
-                state: "pending".into(),
-                interval: None,
-                machine_id: None,
-                credential_id: None,
-                access_key: None,
-                node_label: None,
-                scopes: None
-            })
-        )
-        .err()
-        .unwrap()
-        .data
-        .code,
+        s.accept_enrollment(plan, enrollment("read-only"))
+            .err()
+            .unwrap()
+            .data
+            .code,
         "not_found"
     );
 }
 #[test]
 fn authorized_enrollment_saves_credential_before_confirmation_and_never_returns_it() {
     let (_dir, store, s) = setup();
-    let begin = request(
+    let start = request(
         "allgather.enrollment.begin",
         serde_json::json!({"url":"https://allgather.example"}),
         human(),
     );
-    let plan = s.enrollment_plan(&begin, peer(100)).unwrap().unwrap();
-    s.remember_enrollment(plan, started("authorized")).unwrap();
-    let approved = Poll {
-        state: "approved".into(),
-        interval: None,
-        machine_id: Some("machine".into()),
-        credential_id: Some("credential".into()),
-        access_key: Some(Secret("machine-key-fixture".into())),
-        node_label: Some("Fixture".into()),
-        scopes: Some(vec!["read".into(), "send".into()]),
-    };
-    let (result, confirmation) = s
-        .finish_enrollment_poll("authorized", Ok(approved))
-        .unwrap();
+    let plan = begin(s.enrollment_plan(&start, peer(100)).unwrap());
+    let (result, confirmation) = s.accept_enrollment(plan, enrollment("authorized")).unwrap();
     let text = serde_json::to_string(&result).unwrap();
     assert!(!text.contains("machine-key-fixture"));
-    assert!(!text.contains("private-polling"));
+    assert!(!text.contains(TOKEN));
     assert_eq!(store.host().unwrap().mode, "allgather");
     assert_eq!(
         tower_pal::read_private(&s.paths.state.join("allgather.key")).unwrap(),
@@ -472,7 +415,7 @@ fn authorized_enrollment_saves_credential_before_confirmation_and_never_returns_
     assert!(s.paths.state.join("allgather-pairing.json").exists());
     s.confirm_enrollment(&confirmation.unwrap()).unwrap();
     let stored = std::fs::read_to_string(s.paths.state.join("allgather-pairing.json")).unwrap();
-    assert!(!stored.contains("private-polling"));
+    assert!(!stored.contains(TOKEN));
     assert!(!stored.contains(PAIRING_CODE));
 }
 #[test]

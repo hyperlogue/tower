@@ -647,83 +647,13 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
                         .await?,
                 )?;
             } else {
-                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
                 let params = serde_json::json!({"url":url,"pairing_code":pairing_code,"node_label":name,"read_only":read_only});
-                let started = loop {
-                    match client.call("allgather.enrollment.begin", &params).await {
-                        Ok(result) => break serde_json::to_value(result)?,
-                        Err(tower_server::Error::Rpc(e))
-                            if matches!(
-                                e.data.code.as_str(),
-                                "enrollment_unavailable" | "rate_limited"
-                            ) => {}
-                        Err(tower_server::Error::Io(_)) => {
-                            client = Client::connect(&paths, context()?, !cli.no_start).await?;
-                        }
-                        Err(error) => return Err(error.into()),
-                    }
-                    if tokio::time::Instant::now() >= deadline {
-                        return Err(
-                            "Pairing attempt expired; obtain a new code from the owner".into()
-                        );
-                    }
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                };
-                let id = started["id"]
-                    .as_str()
-                    .ok_or("Enrollment did not return an identity")?
-                    .to_owned();
-                eprintln!(
-                    "Pairing status: {}",
-                    started["authorization_url"]
-                        .as_str()
-                        .ok_or("Pairing did not return an owner status URL")?
-                );
-                if cli.json {
-                    print_json(&started)?;
-                }
-                let mut interval = started["interval"].as_u64().unwrap_or(5).clamp(1, 30);
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
-                    if tokio::time::Instant::now() >= deadline {
-                        return Err(
-                            "Pairing attempt expired; obtain a new code from the owner".into()
-                        );
-                    }
-                    let polled = match client
-                        .call("allgather.enrollment.poll", &serde_json::json!({"id":id}))
-                        .await
-                    {
-                        Ok(value) => serde_json::to_value(value)?,
-                        Err(tower_server::Error::Rpc(e))
-                            if matches!(
-                                e.data.code.as_str(),
-                                "enrollment_unavailable" | "rate_limited"
-                            ) =>
-                        {
-                            continue;
-                        }
-                        Err(tower_server::Error::Io(_)) => {
-                            client = Client::connect(&paths, context()?, !cli.no_start).await?;
-                            continue;
-                        }
-                        Err(error) => return Err(error.into()),
-                    };
-                    interval = polled["interval"].as_u64().unwrap_or(interval).clamp(1, 30);
-                    match polled["state"].as_str() {
-                        Some("complete") => {
-                            print_json(&polled)?;
-                            break;
-                        }
-                        Some("pending" | "authorized") => {}
-                        Some("denied") => return Err("Pairing was denied".into()),
-                        Some("expired") => {
-                            return Err(
-                                "Pairing attempt expired; obtain a new code from the owner".into(),
-                            );
-                        }
-                        _ => return Err("Unexpected pairing state".into()),
-                    }
+                let result = serde_json::to_value(
+                    client.call("allgather.enrollment.begin", &params).await?,
+                )?;
+                print_json(&result)?;
+                if result["state"] != "complete" {
+                    return Err("Pairing is saved but Allgather has not confirmed it; rerun the same login to retry".into());
                 }
             }
         }

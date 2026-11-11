@@ -587,8 +587,8 @@ private status URL containing no secrets. This also works over SSH. Use
 Tower saves each create request privately before sending it. If login is
 interrupted, repeat the same command and options: Tower reuses its saved request
 ID and body. A changed origin, host, scope selection, or name requires a new
-invitation. The server always requires a code. Pairing and polling secrets are
-removed from the saved attempt after confirmation; the machine credential
+invitation. The server always requires a code. Pairing and confirmation secrets
+are removed from the saved attempt after confirmation; the machine credential
 remains in the private state directory.
 
 ```sh

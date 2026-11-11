@@ -73,9 +73,7 @@ impl ServiceWorker {
             "message.send" => self.send_message(request, peer).await,
             "approval.watch" => self.approval_watch(request, peer).await,
             "conversation.list" => self.conversations(request, peer).await,
-            "allgather.enrollment.begin" | "allgather.enrollment.poll" => {
-                self.enroll(request, peer).await
-            }
+            "allgather.enrollment.begin" => self.enroll(request, peer).await,
             _ => self.execute(move |s| s.dispatch(&request, peer)).await,
         };
         match result {
@@ -200,15 +198,17 @@ impl ServiceWorker {
                     "Enrollment workers are busy",
                 ))
             })?;
-        if request.method == "allgather.enrollment.begin" {
-            let plan = match self
-                .execute(move |s| s.enrollment_plan(&request, peer))
-                .await??
-            {
-                Ok(plan) => plan,
-                Err(started) => return Ok(Ok(started)),
-            };
-            let started = crate::allgather::enrollment::begin(&plan)
+        let plan = match self
+            .execute(move |s| s.enrollment_plan(&request, peer))
+            .await??
+        {
+            crate::service::EnrollmentStep::Begin(plan) => plan,
+            crate::service::EnrollmentStep::Saved(result, confirmation) => {
+                return self.complete_enrollment(result, confirmation).await;
+            }
+        };
+        let response =
+            crate::allgather::enrollment::begin(&plan)
                 .await
                 .map_err(|error| match error {
                     Error::Rpc(error) => Error::Rpc(error),
@@ -217,25 +217,16 @@ impl ServiceWorker {
                         "Cannot start pairing at this private Allgather origin",
                     )),
                 })?;
-            return self
-                .execute(move |s| s.remember_enrollment(plan, started))
-                .await;
-        }
-        let pending = match self
-            .execute(move |s| s.claim_enrollment_poll(&request, peer))
-            .await??
-        {
-            Ok(pending) => pending,
-            Err(result) => return Ok(Ok(result)),
-        };
-        let polled = crate::allgather::enrollment::poll(&pending).await;
-        let id = pending
-            .started
-            .ok_or_else(|| Error::Other("Pairing has not started".into()))?
-            .enrollment_id;
         let (result, confirmation) = self
-            .execute(move |s| s.finish_enrollment_poll(&id, polled))
+            .execute(move |s| s.accept_enrollment(plan, response))
             .await??;
+        self.complete_enrollment(result, confirmation).await
+    }
+    async fn complete_enrollment(
+        &self,
+        result: tower_protocol::Value,
+        confirmation: Option<crate::allgather::enrollment::Confirmation>,
+    ) -> Result<std::result::Result<tower_protocol::Value, tower_protocol::RpcError>> {
         if let Some(confirmation) = confirmation
             && crate::allgather::enrollment::confirm(&confirmation)
                 .await

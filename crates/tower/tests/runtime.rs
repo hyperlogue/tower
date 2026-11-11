@@ -88,7 +88,7 @@ async fn pairing_retries_lost_create_and_confirm_across_cli_and_daemon_restart()
         atomic::{AtomicBool, Ordering},
     };
     const CODE: &str = "-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-    const POLL: &str = "polling-secret-for-fixture";
+    const TOKEN: &str = "confirmation-secret-for-fixture";
     const KEY: &str = "access-secret-for-fixture";
     let f = Fixture::new();
     let config = f.dir.path().join("config/tower");
@@ -105,7 +105,6 @@ async fn pairing_retries_lost_create_and_confirm_across_cli_and_daemon_restart()
     let confirmations = Arc::new(Mutex::new(Vec::<Value>::new()));
     let first_create = Arc::new(tokio::sync::Notify::new());
     let first_confirm = Arc::new(tokio::sync::Notify::new());
-    let confirmed = Arc::new(AtomicBool::new(false));
     let allow_create = Arc::new(AtomicBool::new(false));
     let allow_confirm = Arc::new(AtomicBool::new(false));
     let (create_allowed, confirm_allowed) = (allow_create.clone(), allow_confirm.clone());
@@ -167,18 +166,10 @@ async fn pairing_retries_lost_create_and_confirm_across_cli_and_daemon_restart()
                     if !create_allowed.load(Ordering::SeqCst) {
                         continue;
                     }
-                    json!({"enrollment_id":"pairing-fixture","authorization_url":format!("{server_origin}/tower/enroll/pairing-fixture"),"polling_token":POLL,"expires_at":"2099-01-01T00:00:00Z","interval":1})
-                }
-                "/api/tower/enrollments/pairing-fixture/poll" => {
-                    assert_eq!(authorization, format!("Bearer {POLL}"));
-                    if confirmed.load(Ordering::SeqCst) {
-                        json!({"state":"confirmed","interval":1})
-                    } else {
-                        json!({"state":"approved","machine_id":"machine-fixture","credential_id":"credential-fixture","access_key":KEY,"node_label":"Fixture","scopes":["read","send"],"interval":1})
-                    }
+                    json!({"enrollment_id":"pairing-fixture","authorization_url":format!("{server_origin}/tower/enroll/pairing-fixture"),"confirmation_token":TOKEN,"expires_at":"2099-01-01T00:00:00Z","machine_id":"machine-fixture","credential_id":"credential-fixture","access_key":KEY,"node_label":"Fixture","scopes":["read","send"]})
                 }
                 "/api/tower/enrollments/pairing-fixture/confirm" => {
-                    assert_eq!(authorization, format!("Bearer {POLL}"));
+                    assert_eq!(authorization, format!("Bearer {TOKEN}"));
                     let value: Value = serde_json::from_slice(&body).unwrap();
                     assert_eq!(
                         std::fs::read(server_state.join("allgather.key")).unwrap(),
@@ -195,7 +186,6 @@ async fn pairing_retries_lost_create_and_confirm_across_cli_and_daemon_restart()
                         requests.push(value);
                         requests.len() == 1
                     };
-                    confirmed.store(true, Ordering::SeqCst);
                     if first {
                         confirm_signal.notify_one();
                     }
@@ -236,7 +226,7 @@ async fn pairing_retries_lost_create_and_confirm_across_cli_and_daemon_restart()
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
-        for secret in [CODE, POLL, KEY] {
+        for secret in [CODE, TOKEN, KEY] {
             assert!(!visible.contains(secret));
         }
     };
@@ -244,7 +234,7 @@ async fn pairing_retries_lost_create_and_confirm_across_cli_and_daemon_restart()
     tokio::time::timeout(Duration::from_secs(20), first_create.notified())
         .await
         .unwrap();
-    first.kill().await.unwrap();
+    let _ = first.kill().await;
     private_output(&first.wait_with_output().await.unwrap());
     f.stop();
     allow_create.store(true, Ordering::SeqCst);
@@ -252,7 +242,7 @@ async fn pairing_retries_lost_create_and_confirm_across_cli_and_daemon_restart()
     tokio::time::timeout(Duration::from_secs(20), first_confirm.notified())
         .await
         .unwrap();
-    second.kill().await.unwrap();
+    let _ = second.kill().await;
     private_output(&second.wait_with_output().await.unwrap());
     f.stop();
     let creates_before_final_restart = creates.lock().unwrap().len();
@@ -280,7 +270,7 @@ async fn pairing_retries_lost_create_and_confirm_across_cli_and_daemon_restart()
     drop(confirms);
     let persisted = std::fs::read_to_string(state.join("allgather-pairing.json")).unwrap();
     assert!(!persisted.contains(CODE));
-    assert!(!persisted.contains(POLL));
+    assert!(!persisted.contains(TOKEN));
     assert!(!persisted.contains(KEY));
     assert_eq!(
         std::fs::read(state.join("allgather.key")).unwrap(),

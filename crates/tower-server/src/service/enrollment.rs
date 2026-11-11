@@ -1,8 +1,13 @@
 use super::*;
 use crate::allgather::enrollment::{
-    self, Attempts, Confirmation, Consent, Pending, Plan, Poll, Started,
+    self, Attempts, Confirmation, Consent, Enrollment, Pending, Plan,
 };
-use std::time::{Duration, Instant};
+
+/// What a pairing request does next: contact Allgather, or finish a saved result.
+pub(crate) enum EnrollmentStep {
+    Begin(Plan),
+    Saved(Value, Option<Confirmation>),
+}
 
 fn enrollment_storage(_: impl std::fmt::Display) -> RpcError {
     app("internal_error", "Cannot access pairing state")
@@ -59,7 +64,7 @@ impl Service {
         &self,
         request: &Request,
         peer: Peer,
-    ) -> std::result::Result<std::result::Result<Plan, Value>, RpcError> {
+    ) -> std::result::Result<EnrollmentStep, RpcError> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Input {
@@ -112,10 +117,12 @@ impl Service {
                     "Pairing code is already bound to different host or request options",
                 ));
             }
-            return match existing.public_start() {
-                Some(started) => Ok(Err(value(started)?)),
-                None => Ok(Ok(existing.plan.clone())),
-            };
+            return Ok(match &existing.result {
+                Some(result) => {
+                    EnrollmentStep::Saved(value(result)?, existing.confirmation.clone())
+                }
+                None => EnrollmentStep::Begin(existing.plan.clone()),
+            });
         }
         if pending.len() >= enrollment::MAX_ATTEMPTS {
             return Err(app("rate_limited", "Too many pending pairing attempts"));
@@ -142,43 +149,40 @@ impl Service {
             Pending {
                 plan: plan.clone(),
                 code_hash,
-                started: None,
                 deadline_ms: now_ms().saturating_add(enrollment::ATTEMPT_LIFETIME_MS),
-                next_poll: None,
                 result: None,
                 confirmation: None,
             },
         );
         self.save_attempts(&mut pending, next)?;
-        Ok(Ok(plan))
+        Ok(EnrollmentStep::Begin(plan))
     }
-    pub(crate) fn remember_enrollment(
+    pub(crate) fn accept_enrollment(
         &self,
         plan: Plan,
-        started: Started,
-    ) -> std::result::Result<Value, RpcError> {
+        response: Enrollment,
+    ) -> std::result::Result<(Value, Option<Confirmation>), RpcError> {
         let _mutation = self.mutation.lock().map_err(enrollment_storage)?;
-        self.check_enrollment_origin(&enrollment::socket_url(&plan.origin))?;
-        let mut pending = self
+        let url = enrollment::socket_url(&plan.origin);
+        self.check_enrollment_origin(&url)?;
+        let mut all = self
             .pending_enrollments
             .lock()
             .map_err(enrollment_storage)?;
-        let current = pending
+        let current = all
             .get(&plan.request_id)
             .ok_or_else(|| app("not_found", "Pairing was cancelled"))?;
         if current.deadline_ms <= now_ms() {
             return Err(app("expired", "Pairing attempt expired"));
         }
-        if let Some(existing) = &current.started {
-            if existing.enrollment_id != started.enrollment_id
-                || (current.result.is_none() && existing.polling_token.0 != started.polling_token.0)
-            {
+        if let Some(result) = &current.result {
+            if current.enrollment_id() != Some(response.enrollment_id.as_str()) {
                 return Err(app(
                     "enrollment_failed",
                     "Pairing retry returned a different enrollment",
                 ));
             }
-            return value(current.public_start().unwrap());
+            return Ok((value(result)?, current.confirmation.clone()));
         }
         if current.plan.actor != plan.actor
             || current.plan.body() != plan.body()
@@ -189,134 +193,26 @@ impl Service {
                 "Pairing request changed before its response",
             ));
         }
-        if pending.values().any(|p| {
-            p.started
-                .as_ref()
-                .is_some_and(|s| s.enrollment_id == started.enrollment_id)
-        }) {
+        if all
+            .values()
+            .any(|p| p.enrollment_id() == Some(response.enrollment_id.as_str()))
+        {
             return Err(app(
                 "enrollment_failed",
                 "Enrollment identity is already bound to another request",
             ));
         }
-        let mut next = pending.clone();
-        let p = next.get_mut(&plan.request_id).unwrap();
-        p.deadline_ms = p
-            .deadline_ms
-            .min(enrollment::expires_at(&started.expires_at).map_err(enrollment_storage)?);
-        if p.deadline_ms <= now_ms() {
-            return Err(app("expired", "Pairing invitation expired"));
-        }
-        p.started = Some(started);
-        let result = value(p.public_start().unwrap())?;
-        self.save_attempts(&mut pending, next)?;
-        Ok(result)
-    }
-    pub(crate) fn claim_enrollment_poll(
-        &self,
-        request: &Request,
-        peer: Peer,
-    ) -> std::result::Result<std::result::Result<Pending, Value>, RpcError> {
-        let id: IdParams = params(&request.params)?;
-        let actor = self.enrollment_actor(request, peer)?;
-        let mut pending = self
-            .pending_enrollments
-            .lock()
-            .map_err(enrollment_storage)?;
-        let p = pending
-            .values_mut()
-            .find(|p| p.started.as_ref().is_some_and(|s| s.enrollment_id == id.id))
-            .ok_or_else(|| {
-                app(
-                    "not_found",
-                    "Pairing attempt is unavailable; retry login with the same code",
-                )
-            })?;
-        if p.plan.actor != actor {
-            return Err(app("denied", "Pairing belongs to another local caller"));
-        }
-        if p.deadline_ms <= now_ms() {
-            return Err(app("expired", "Pairing attempt expired"));
-        }
-        if let Some(result) = &p.result {
-            return Ok(Err(value(result)?));
-        }
-        let started = p.started.as_ref().unwrap();
-        if p.next_poll.is_some_and(|at| at > Instant::now()) {
-            return Ok(Err(value(
-                serde_json::json!({"state":"pending","interval":started.interval}),
-            )?));
-        }
-        p.next_poll = Some(Instant::now() + Duration::from_secs(30));
-        Ok(Ok(p.clone()))
-    }
-    pub(crate) fn finish_enrollment_poll(
-        &self,
-        id: &str,
-        response: std::result::Result<Poll, crate::Error>,
-    ) -> std::result::Result<(Value, Option<Confirmation>), RpcError> {
-        let _mutation = self.mutation.lock().map_err(enrollment_storage)?;
-        let mut all = self
-            .pending_enrollments
-            .lock()
-            .map_err(enrollment_storage)?;
-        let request_id = all
-            .iter()
-            .find(|(_, p)| p.started.as_ref().is_some_and(|s| s.enrollment_id == id))
-            .map(|(key, _)| key.clone())
-            .ok_or_else(|| app("not_found", "Pairing was cancelled"))?;
-        let p = all.get_mut(&request_id).unwrap();
-        if p.deadline_ms <= now_ms() {
-            return Err(app("expired", "Pairing attempt expired"));
-        }
-        if let Some(result) = &p.result {
-            return Ok((value(result)?, p.confirmation.clone()));
-        }
-        p.next_poll =
-            Some(Instant::now() + Duration::from_secs(p.started.as_ref().unwrap().interval));
-        let response = response.map_err(|_| {
-            app(
-                "enrollment_unavailable",
-                "Pairing polling failed; retry polling",
-            )
-        })?;
-        let mut next = all.clone();
-        let p = next.get_mut(&request_id).unwrap();
-        let started = p.started.as_mut().unwrap();
-        if let Some(interval) = response.interval {
-            started.interval = interval.clamp(1, 30);
-            p.next_poll = Some(Instant::now() + Duration::from_secs(started.interval));
-        }
-        if response.state != "approved" {
-            if !matches!(response.state.as_str(), "pending" | "denied" | "expired") {
-                return Err(app("enrollment_failed", "Unexpected pairing state"));
-            }
-            let result = serde_json::json!({"state":response.state,"interval":started.interval});
-            if response.state != "pending" {
-                p.result = Some(result.clone());
-                p.clear_secrets();
-            }
-            self.save_attempts(&mut all, next)?;
-            return Ok((value(result)?, None));
-        }
-        let key = response.access_key.ok_or_else(|| {
-            app(
-                "enrollment_failed",
-                "Pairing approval has no machine credential",
-            )
-        })?;
+        let key = response.access_key;
         if key.0.len() < 16 || key.0.len() > 4096 || key.0.chars().any(char::is_control) {
             return Err(app(
                 "enrollment_failed",
                 "Invalid paired machine credential",
             ));
         }
-        let machine_id = response
-            .machine_id
+        let machine_id = Some(response.machine_id)
             .filter(|s| tower_sessions::valid_protocol(s))
             .ok_or_else(|| app("enrollment_failed", "Invalid paired machine identity"))?;
-        let credential_id = response
-            .credential_id
+        let credential_id = Some(response.credential_id)
             .filter(|s| {
                 !s.is_empty()
                     && s.len() <= 160
@@ -331,46 +227,50 @@ impl Service {
             || std::iter::once(machine_id.as_str())
                 .chain(response.node_label.as_deref())
                 .any(|text| {
-                    [&key.0, &p.plan.pairing_code.0, &started.polling_token.0]
+                    [&key.0, &plan.pairing_code.0, &response.confirmation_token.0]
                         .iter()
                         .any(|secret| !secret.is_empty() && text.contains(secret.as_str()))
                 })
         {
             return Err(app("enrollment_failed", "Unsafe paired machine identity"));
         }
-        let scopes = response
-            .scopes
-            .ok_or_else(|| app("enrollment_failed", "Pairing approval omitted scopes"))?;
+        let scopes = response.scopes;
         if scopes.is_empty()
             || scopes.len() > 4
             || scopes.iter().collect::<HashSet<_>>().len() != scopes.len()
             || scopes
                 .iter()
-                .any(|s| !p.plan.scopes.contains(s) || !self.allgather_config.permits_scope(s))
+                .any(|s| !plan.scopes.contains(s) || !self.allgather_config.permits_scope(s))
         {
             return Err(app(
                 "enrollment_failed",
                 "Pairing granted unrequested or locally disabled scopes",
             ));
         }
-        let url = enrollment::socket_url(&p.plan.origin);
-        self.check_enrollment_origin(&url)?;
+        let mut next = all.clone();
+        let p = next.get_mut(&plan.request_id).unwrap();
+        p.deadline_ms = p
+            .deadline_ms
+            .min(enrollment::expires_at(&response.expires_at).map_err(enrollment_storage)?);
+        if p.deadline_ms <= now_ms() {
+            return Err(app("expired", "Pairing invitation expired"));
+        }
         let confirmation = Confirmation {
-            request_id: request_id.clone(),
-            origin: p.plan.origin.clone(),
-            enrollment_id: id.into(),
-            polling_token: started.polling_token.clone(),
+            request_id: plan.request_id.clone(),
+            origin: plan.origin.clone(),
+            enrollment_id: response.enrollment_id.clone(),
+            confirmation_token: response.confirmation_token,
             credential_id,
             machine_id: machine_id.clone(),
             access_key_hash: enrollment::key_hash(&key),
             expires_at_ms: p.deadline_ms,
         };
         let consent = Consent {
-            origin: p.plan.origin.clone(),
+            origin: plan.origin.clone(),
             machine_id: machine_id.clone(),
             scopes,
         };
-        let result = serde_json::json!({"state":"authorized","mode":"allgather","machine_id":machine_id,"node_label":response.node_label,"scopes":consent.scopes,"interval":started.interval});
+        let result = serde_json::json!({"state":"authorized","mode":"allgather","id":response.enrollment_id,"authorization_url":response.authorization_url,"machine_id":machine_id,"node_label":response.node_label,"scopes":consent.scopes});
         p.result = Some(result.clone());
         p.confirmation = Some(confirmation.clone());
         enrollment::check_capacity(&next).map_err(enrollment_storage)?;
@@ -433,9 +333,7 @@ impl Service {
             return Err(app("expired", "Pairing attempt expired"));
         }
         if p.plan.origin != confirmation.origin
-            || p.started
-                .as_ref()
-                .is_none_or(|s| s.enrollment_id != confirmation.enrollment_id)
+            || p.enrollment_id() != Some(confirmation.enrollment_id.as_str())
             || p.result
                 .as_ref()
                 .is_none_or(|r| r["machine_id"] != confirmation.machine_id)

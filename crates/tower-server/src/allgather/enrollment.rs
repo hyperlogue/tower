@@ -31,34 +31,33 @@ impl Plan {
         body
     }
 }
-#[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct Started {
+/// Allgather's reply to a pairing request: an issued, not yet confirmed credential.
+#[derive(Deserialize)]
+pub(crate) struct Enrollment {
     pub enrollment_id: String,
     pub authorization_url: String,
-    pub polling_token: Secret,
+    pub confirmation_token: Secret,
     pub expires_at: String,
-    pub interval: u64,
+    pub machine_id: String,
+    pub credential_id: String,
+    pub access_key: Secret,
+    pub node_label: Option<String>,
+    pub scopes: Vec<String>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Pending {
     pub plan: Plan,
     pub code_hash: String,
-    pub started: Option<Started>,
     pub deadline_ms: u64,
-    #[serde(skip)]
-    pub next_poll: Option<std::time::Instant>,
     pub result: Option<serde_json::Value>,
     pub confirmation: Option<Confirmation>,
 }
 impl Pending {
-    pub(crate) fn public_start(&self) -> Option<serde_json::Value> {
-        self.started.as_ref().map(|s| json!({"id":s.enrollment_id,"authorization_url":s.authorization_url,"expires_at":s.expires_at,"interval":s.interval}))
+    pub(crate) fn enrollment_id(&self) -> Option<&str> {
+        self.result.as_ref()?.get("id")?.as_str()
     }
     pub(crate) fn clear_secrets(&mut self) {
         self.plan.pairing_code.0.clear();
-        if let Some(started) = &mut self.started {
-            started.polling_token.0.clear();
-        }
         self.confirmation = None;
     }
 }
@@ -114,16 +113,6 @@ pub(crate) fn expires_at(value: &str) -> Result<u64> {
     u64::try_from(time.unix_timestamp_nanos() / 1_000_000)
         .map_err(|_| Error::Other("Invalid enrollment expiry".into()))
 }
-#[derive(Deserialize)]
-pub(crate) struct Poll {
-    pub state: String,
-    pub interval: Option<u64>,
-    pub machine_id: Option<String>,
-    pub credential_id: Option<String>,
-    pub access_key: Option<Secret>,
-    pub node_label: Option<String>,
-    pub scopes: Option<Vec<String>>,
-}
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Consent {
     pub origin: String,
@@ -135,7 +124,8 @@ pub(crate) struct Confirmation {
     pub request_id: String,
     pub origin: String,
     pub enrollment_id: String,
-    pub polling_token: Secret,
+    #[serde(alias = "polling_token")]
+    pub confirmation_token: Secret,
     pub credential_id: String,
     pub machine_id: String,
     pub access_key_hash: String,
@@ -175,7 +165,7 @@ fn identifier(s: &str) -> bool {
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
 }
-pub(crate) async fn begin(plan: &Plan) -> Result<Started> {
+pub(crate) async fn begin(plan: &Plan) -> Result<Enrollment> {
     if !valid_pairing_secret(&plan.pairing_code.0) || !valid_pairing_secret(&plan.request_id) {
         return Err(enrollment_error(
             "invalid_params",
@@ -202,7 +192,7 @@ pub(crate) async fn begin(plan: &Plan) -> Result<Started> {
             "Allgather refused the pairing code or its bound request; obtain a valid invitation from the owner",
         ));
     }
-    let started: Started = serde_json::from_value(
+    let started: Enrollment = serde_json::from_value(
         json_response(response)
             .await
             .map_err(|_| enrollment_error("enrollment_failed", "Invalid pairing response"))?,
@@ -211,9 +201,9 @@ pub(crate) async fn begin(plan: &Plan) -> Result<Started> {
     let url = reqwest::Url::parse(&started.authorization_url)
         .map_err(|_| enrollment_error("enrollment_failed", "Invalid owner status URL"))?;
     if !identifier(&started.enrollment_id)
-        || started.polling_token.0.len() < 16
-        || started.polling_token.0.len() > 4096
-        || started.polling_token.0.chars().any(char::is_control)
+        || started.confirmation_token.0.len() < 16
+        || started.confirmation_token.0.len() > 4096
+        || started.confirmation_token.0.chars().any(char::is_control)
         || url.origin().ascii_serialization() != plan.origin
         || url.username() != ""
         || url.password().is_some()
@@ -221,14 +211,15 @@ pub(crate) async fn begin(plan: &Plan) -> Result<Started> {
         || url.path() != format!("/tower/enroll/{}", started.enrollment_id)
         || url.query().is_some()
         || started.authorization_url.chars().any(char::is_control)
-        || started.authorization_url.contains(&started.polling_token.0)
+        || started
+            .authorization_url
+            .contains(&started.confirmation_token.0)
         || started.authorization_url.contains(&plan.pairing_code.0)
         || [&started.enrollment_id, &started.expires_at]
             .iter()
             .any(|text| {
-                text.contains(&started.polling_token.0) || text.contains(&plan.pairing_code.0)
+                text.contains(&started.confirmation_token.0) || text.contains(&plan.pairing_code.0)
             })
-        || !(1..=30).contains(&started.interval)
         || expires_at(&started.expires_at).is_err()
     {
         return Err(enrollment_error(
@@ -238,45 +229,13 @@ pub(crate) async fn begin(plan: &Plan) -> Result<Started> {
     }
     Ok(started)
 }
-pub(crate) async fn poll(pending: &Pending) -> Result<Poll> {
-    let started = pending
-        .started
-        .as_ref()
-        .ok_or_else(|| Error::Other("Pairing has not started".into()))?;
-    let response = http_client()?
-        .post(format!(
-            "{}/api/tower/enrollments/{}/poll",
-            pending.plan.origin, started.enrollment_id
-        ))
-        .bearer_auth(&started.polling_token.0)
-        .json(&json!({}))
-        .send()
-        .await
-        .map_err(|_| Error::Other("Enrollment polling failed".into()))?;
-    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-        return Ok(Poll {
-            state: "pending".into(),
-            interval: Some(10),
-            machine_id: None,
-            credential_id: None,
-            access_key: None,
-            node_label: None,
-            scopes: None,
-        });
-    }
-    if !response.status().is_success() {
-        return Err(Error::Other("Allgather refused enrollment polling".into()));
-    }
-    serde_json::from_value(json_response(response).await?)
-        .map_err(|_| Error::Other("Invalid enrollment polling response".into()))
-}
 pub(crate) async fn confirm(c: &Confirmation) -> Result<()> {
     let response = http_client()?
         .post(format!(
             "{}/api/tower/enrollments/{}/confirm",
             c.origin, c.enrollment_id
         ))
-        .bearer_auth(&c.polling_token.0)
+        .bearer_auth(&c.confirmation_token.0)
         .json(&json!({"credential_id":c.credential_id,"access_key_hash":c.access_key_hash}))
         .send()
         .await
