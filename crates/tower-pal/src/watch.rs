@@ -56,22 +56,23 @@ impl FileWatch {
     }
 }
 
-/// Recursive watch below `root` that signals changes to files named `name`.
+/// Recursive watch below `root` that signals changes to files named `name`,
+/// or to any file when `name` is `None`.
 pub struct TreeWatch {
     _watcher: notify::RecommendedWatcher,
     changes: watch::Receiver<u64>,
 }
 impl TreeWatch {
-    pub fn new(root: &Path, name: &'static str) -> io::Result<Self> {
+    pub fn new(root: &Path, name: impl Into<Option<&'static str>>) -> io::Result<Self> {
+        let name = name.into();
         let (updates, changes) = watch::channel(0u64);
         let mut watcher =
             notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
                 if event.is_ok_and(|event| {
                     !matches!(event.kind, notify::EventKind::Access(_))
-                        && event
-                            .paths
-                            .iter()
-                            .any(|p| p.file_name().is_some_and(|n| n == name))
+                        && event.paths.iter().any(|p| {
+                            name.is_none_or(|name| p.file_name().is_some_and(|n| n == name))
+                        })
                 }) {
                     updates.send_modify(|revision| *revision = revision.wrapping_add(1));
                 }

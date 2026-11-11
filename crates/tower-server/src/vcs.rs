@@ -1,12 +1,7 @@
 use crate::service::{Service, now_ms};
 use serde::Deserialize;
 use serde_json::json;
-use std::{
-    collections::BTreeSet,
-    path::PathBuf,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::BTreeSet, path::PathBuf, sync::Arc, time::Duration};
 use tower_protocol::*;
 use tower_store::{Store, StoredCheckout, StoredVcsOperation};
 use tower_vcs::{Binding, Prepared};
@@ -80,17 +75,11 @@ pub(crate) fn authentication(
 pub(crate) struct Config {
     pub worktree_root: Option<String>,
 }
-struct Refresh {
-    last_run: Instant,
-    session_offset: usize,
-    checkout_offset: usize,
-}
 pub(crate) struct Vcs {
     pub store: Arc<Store>,
     pub paths: tower_pal::Paths,
     pub root: PathBuf,
     pub gate: Arc<tokio::sync::Semaphore>,
-    refresh: tokio::sync::Mutex<Refresh>,
     active: Arc<tokio::sync::watch::Sender<BTreeSet<String>>>,
 }
 /// Marks a plan as executing in this process and holds its worker slot until dropped.
@@ -121,11 +110,6 @@ impl Vcs {
             paths,
             root,
             gate: Arc::new(tokio::sync::Semaphore::new(4)),
-            refresh: tokio::sync::Mutex::new(Refresh {
-                last_run: Instant::now() - Duration::from_secs(30),
-                session_offset: 0,
-                checkout_offset: 0,
-            }),
             active: Arc::new(tokio::sync::watch::channel(BTreeSet::new()).0),
         })
     }
@@ -418,58 +402,91 @@ impl Vcs {
             Err(e) => Err(e),
         }
     }
-    pub async fn refresh_all(&self) {
-        let Ok(mut last) = self.refresh.try_lock() else {
-            return;
-        };
-        if last.last_run.elapsed() < Duration::from_secs(10) {
-            return;
-        }
-        last.last_run = Instant::now();
-        let Ok(_permit) = self.gate.clone().try_acquire_owned() else {
-            return;
-        };
-        if let Ok(mut sessions) = self.store.agents(&AgentFilter {
-            ownership: Some("owned".into()),
-            ..Default::default()
-        }) {
-            if !sessions.is_empty() {
-                let offset = last.session_offset % sessions.len();
-                sessions.rotate_left(offset);
-                last.session_offset = (offset + 4) % sessions.len();
-            }
-            let mut seen = std::collections::BTreeSet::new();
-            for session in sessions.into_iter().take(4) {
-                if session.checkout_id.is_none() && seen.insert(session.cwd.clone()) {
-                    let _ = tokio::time::timeout(
-                        Duration::from_secs(5),
-                        self.register(&session.cwd, None),
-                    )
-                    .await;
+    /// Keeps checkout observations current from Git metadata changes and agent activity.
+    pub async fn observe_changes(
+        self: Arc<Self>,
+        mut events: tokio::sync::broadcast::Receiver<Arc<EventNotification>>,
+    ) {
+        use std::collections::{BTreeMap, BTreeSet};
+        let mut changes = tower_store::changes();
+        let (due, mut pending) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let mut watched: BTreeMap<String, tokio::task::JoinHandle<()>> = BTreeMap::new();
+        let mut attempted: BTreeSet<(String, String)> = BTreeSet::new();
+        loop {
+            if let Ok(checkouts) = self.store.checkouts(&CheckoutFilter::default()) {
+                let ids: BTreeSet<_> = checkouts.iter().map(|c| c.record.id.clone()).collect();
+                watched.retain(|id, task| {
+                    let keep = ids.contains(id);
+                    if !keep {
+                        task.abort();
+                    }
+                    keep
+                });
+                for c in checkouts {
+                    if watched.contains_key(&c.record.id) {
+                        continue;
+                    }
+                    if let Ok(binding) = Self::binding(&c) {
+                        let task =
+                            tokio::spawn(watch_checkout(binding, c.record.id.clone(), due.clone()));
+                        watched.insert(c.record.id, task);
+                    }
                 }
             }
-        }
-        let Ok(mut checkouts) = self.store.checkouts(&CheckoutFilter::default()) else {
-            return;
-        };
-        if checkouts.is_empty() {
-            return;
-        }
-        let offset = last.checkout_offset % checkouts.len();
-        checkouts.rotate_left(offset);
-        last.checkout_offset = (offset + 16) % checkouts.len();
-        let mut groups = std::collections::BTreeSet::new();
-        for c in checkouts.into_iter().take(16) {
-            if let Ok(binding) = Self::binding(&c)
-                && groups.insert(binding.repository_key())
-            {
-                let _ = tokio::time::timeout(
-                    Duration::from_secs(5),
-                    self.register(&binding.common_dir.to_string_lossy(), None),
-                )
-                .await;
+            if let Ok(sessions) = self.store.agents(&AgentFilter {
+                ownership: Some("owned".into()),
+                ..Default::default()
+            }) {
+                for session in sessions {
+                    if session.checkout_id.is_none()
+                        && attempted.insert((session.id.clone(), session.cwd.clone()))
+                        && let Ok(_permit) = self.gate.clone().acquire_owned().await
+                    {
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            self.register(&session.cwd, None),
+                        )
+                        .await;
+                    }
+                }
             }
-            let _ = tokio::time::timeout(Duration::from_secs(5), self.refresh(&c.record.id)).await;
+            tokio::select! {
+                _ = changes.changed() => {}
+                event = events.recv() => match event {
+                    Ok(event) if event.method.starts_with("agent.") => {
+                        if let Ok(agent) = self.store.agent(&event.params.id)
+                            && let Some(checkout) = agent.record.checkout_id
+                        {
+                            let _ = due.send(checkout);
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                    _ => {}
+                },
+                Some(first) = pending.recv() => {
+                    // Coalesce a burst of Git writes into one observation per checkout.
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    let mut ids = BTreeSet::from([first]);
+                    while let Ok(id) = pending.try_recv() {
+                        ids.insert(id);
+                    }
+                    let mut groups = BTreeSet::new();
+                    for id in ids {
+                        let Ok(_permit) = self.gate.clone().acquire_owned().await else { return };
+                        if let Ok(c) = self.checkout(&id)
+                            && let Ok(binding) = Self::binding(&c)
+                            && groups.insert(binding.repository_key())
+                        {
+                            let _ = tokio::time::timeout(
+                                Duration::from_secs(5),
+                                self.register(&binding.common_dir.to_string_lossy(), None),
+                            )
+                            .await;
+                        }
+                        let _ = tokio::time::timeout(Duration::from_secs(5), self.refresh(&id)).await;
+                    }
+                }
+            }
         }
     }
     pub fn begin(&self, plan: &str, permit: tokio::sync::OwnedSemaphorePermit) -> Active {
@@ -644,6 +661,39 @@ impl Vcs {
             return prepared.review().destination.iter().cloned().collect();
         }
         prepared.affected_paths().to_vec()
+    }
+}
+
+/// Signals `checkout` whenever its Git metadata or working directory entry changes.
+async fn watch_checkout(
+    binding: Binding,
+    checkout: String,
+    due: tokio::sync::mpsc::UnboundedSender<String>,
+) {
+    let mut paths = vec![
+        binding.git_dir.join("HEAD"),
+        binding.git_dir.join("index"),
+        binding.common_dir.join("packed-refs"),
+        binding.common_dir.join("worktrees"),
+    ];
+    paths.extend(binding.directory.clone());
+    let files = tower_pal::FileWatch::new(&paths);
+    let refs = tower_pal::TreeWatch::new(&binding.common_dir.join("refs"), None);
+    let (mut files, mut refs) = match (files, refs) {
+        (Ok(files), Ok(refs)) => (files, refs),
+        (Err(e), _) | (_, Err(e)) => {
+            eprintln!("tower: checkout {checkout} is unobservable: {e}");
+            return;
+        }
+    };
+    loop {
+        tokio::select! {
+            _ = files.changed() => {}
+            _ = refs.changed() => {}
+        }
+        if due.send(checkout.clone()).is_err() {
+            return;
+        }
     }
 }
 

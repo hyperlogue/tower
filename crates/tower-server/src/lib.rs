@@ -75,15 +75,7 @@ where
     let shutdown = Arc::new(Notify::new());
     let mut tasks = JoinSet::new();
     let maintenance = tokio::spawn(maintain(service.clone(), paths.clone()));
-    let vcs = service.vcs();
-    let checkout_refresh = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(10));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            interval.tick().await;
-            vcs.refresh_all().await;
-        }
-    });
+    let checkout_refresh = tokio::spawn(service.vcs().observe_changes(service.events()));
     let signals = tower_pal::shutdown_signal();
     tokio::pin!(signals);
     let result = loop {
