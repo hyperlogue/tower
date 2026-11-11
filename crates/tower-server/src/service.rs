@@ -167,6 +167,25 @@ pub(super) struct Service {
     mutation: Mutex<()>,
     events: tokio::sync::broadcast::Sender<Arc<EventNotification>>,
     published: Mutex<events::Published>,
+    wake: Arc<Wake>,
+}
+/// Next deadline in epoch milliseconds, and live `(pid, start_time)` incarnations.
+pub(crate) type MaintenancePlan = (Option<u64>, Vec<(u32, u64)>);
+/// Wakes the maintenance task: `run` asks for a maintenance pass, otherwise it
+/// only re-plans deadlines and process watches after a state change.
+#[derive(Default)]
+pub(crate) struct Wake {
+    pub notify: tokio::sync::Notify,
+    pub run: std::sync::atomic::AtomicBool,
+}
+impl Wake {
+    pub fn replan(&self) {
+        self.notify.notify_one();
+    }
+    pub fn run(&self) {
+        self.run.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.notify.notify_one();
+    }
 }
 impl Service {
     pub fn new(
@@ -239,6 +258,7 @@ impl Service {
             mutation: Mutex::new(()),
             events: tokio::sync::broadcast::channel(256).0,
             published: Mutex::new(events::Published::default()),
+            wake: Arc::default(),
         })
     }
     pub(crate) fn authorize_host_metrics(
@@ -257,14 +277,21 @@ impl Service {
         self.sync_managed()?;
         Ok(())
     }
+    #[cfg(test)]
     pub fn maintain(&self) -> Result<()> {
+        self.maintain_with(true)
+    }
+    /// Apply due expiries and liveness checks; `managed` also re-reads managed session state.
+    pub fn maintain_with(&self, managed: bool) -> Result<()> {
         let _guard = self
             .mutation
             .lock()
             .map_err(|_| Error::Other("mutation lock poisoned".into()))?;
-        self.sync_managed()?;
+        if managed {
+            self.sync_managed()?;
+            self.maintain_clipboard().map_err(Error::Rpc)?;
+        }
         self.scan_processes()?;
-        self.maintain_clipboard().map_err(Error::Rpc)?;
         self.store.expire_vcs_plans(now_ms())?;
         let now = now_ms();
         for r in self.store.agents(&AgentFilter::default())? {
@@ -298,6 +325,24 @@ impl Service {
         }
         self.publish().map_err(Error::Rpc)?;
         Ok(())
+    }
+    /// When maintenance next has timed work, and which live processes to watch for exit.
+    pub fn maintenance_plan(&self) -> Result<MaintenancePlan> {
+        let mut next = self.store.next_deadline(self.retention_ms)?;
+        if let Some(scan) = self.scan_deadline()? {
+            next = Some(next.map_or(scan, |n| n.min(scan)));
+        }
+        let processes = self
+            .all()
+            .map_err(Error::Rpc)?
+            .into_iter()
+            .filter(|r| !matches!(r.status.as_str(), "exited" | "lost"))
+            .filter_map(|r| Some((r.pid?, r.pid_start_time?)))
+            .collect();
+        Ok((next, processes))
+    }
+    pub(crate) fn wake(&self) -> Arc<Wake> {
+        self.wake.clone()
     }
     fn all(&self) -> std::result::Result<Vec<AgentRecord>, RpcError> {
         self.store

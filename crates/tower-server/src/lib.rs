@@ -74,20 +74,7 @@ where
     let sinks = sinks::start(&paths, &service)?;
     let shutdown = Arc::new(Notify::new());
     let mut tasks = JoinSet::new();
-    let maintenance_service = service.clone();
-    let maintenance = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            interval.tick().await;
-            if !matches!(
-                maintenance_service.execute(Service::maintain).await,
-                Ok(Ok(()))
-            ) {
-                eprintln!("tower: registry maintenance failed");
-            }
-        }
-    });
+    let maintenance = tokio::spawn(maintain(service.clone(), paths.clone()));
     let vcs = service.vcs();
     let checkout_refresh = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(10));
@@ -138,6 +125,77 @@ where
     service.drain().await?;
     drop(listener);
     result
+}
+
+/// Runs maintenance when managed state files change, a watched process exits,
+/// or a stored deadline falls due; otherwise it sleeps.
+async fn maintain(service: ServiceWorker, paths: Paths) {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::Ordering;
+    let Ok(wake) = service.execute(|s| s.wake()).await else {
+        return;
+    };
+    let sessions = paths.state.join("sessions");
+    let mut states = match tower_pal::private_dir(&sessions)
+        .and_then(|_| tower_pal::TreeWatch::new(&sessions, "state.json"))
+    {
+        Ok(watch) => Some(watch),
+        Err(e) => {
+            eprintln!("tower: managed session state is unobservable: {e}");
+            None
+        }
+    };
+    let mut exits: BTreeMap<(u32, u64), tokio::task::JoinHandle<()>> = BTreeMap::new();
+    let mut managed = true;
+    let mut due = true;
+    loop {
+        // A process exit may end a managed session, so it re-reads managed state too.
+        managed |= wake.run.swap(false, Ordering::SeqCst);
+        if (managed || due)
+            && !matches!(
+                service.execute(move |s| s.maintain_with(managed)).await,
+                Ok(Ok(()))
+            )
+        {
+            eprintln!("tower: registry maintenance failed");
+        }
+        (managed, due) = (false, false);
+        let (deadline, processes) = match service.execute(|s| s.maintenance_plan()).await {
+            Ok(Ok(plan)) => plan,
+            _ => {
+                eprintln!("tower: maintenance planning failed");
+                (None, Vec::new())
+            }
+        };
+        // A fired watcher stays until its record changes, so an exit is reported once.
+        exits.retain(|key, task| {
+            let keep = processes.contains(key);
+            if !keep {
+                task.abort();
+            }
+            keep
+        });
+        for (pid, start) in processes {
+            exits.entry((pid, start)).or_insert_with(|| {
+                let wake = wake.clone();
+                tokio::spawn(async move {
+                    if let Ok(exit) = tower_pal::ProcessExit::watch(pid, start) {
+                        exit.exited().await;
+                    }
+                    wake.run();
+                })
+            });
+        }
+        let sleep = deadline.map(|at| {
+            let wait = at.saturating_add(1).saturating_sub(service::now_ms());
+            tokio::time::Instant::now() + Duration::from_millis(wait)
+        });
+        tokio::select! {
+            _ = wake.notify.notified() => {}
+            _ = async { match &mut states { Some(w) => w.changed().await, None => std::future::pending().await } } => managed = true,
+            _ = async { match sleep { Some(at) => tokio::time::sleep_until(at).await, None => std::future::pending().await } } => due = true,
+        }
+    }
 }
 
 async fn serve_connection(

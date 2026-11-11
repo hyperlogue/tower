@@ -56,6 +56,7 @@ impl Service {
         require(&self.actor(context, peer)?, "subscribe")
     }
     pub(super) fn publish(&self) -> std::result::Result<(), RpcError> {
+        self.wake.replan();
         let records: BTreeMap<_, _> = self.all()?.into_iter().map(|r| (r.id.clone(), r)).collect();
         let mut state = self
             .published

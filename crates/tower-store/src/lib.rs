@@ -952,7 +952,8 @@ impl Store {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         let mut agent = stored_agent(&tx, id)?;
-        if agent.ended_at.is_none() {
+        // The credential holder's report outranks exit detection that marked it lost first.
+        if agent.ended_at.is_none() || agent.record.status == "lost" {
             tx.execute("UPDATE agents SET stop_requested=1 WHERE id=?1", [id])?;
             observe_status(&tx, &mut agent.record, "exited")?;
             disable_delivery(&mut agent.record.caps, "session_ended");
@@ -1027,6 +1028,54 @@ impl Store {
         }
         tx.commit()?;
         Ok(removed)
+    }
+    /// The earliest time at which `expire`, `expiring_managed`, `expire_approvals`,
+    /// `expire_vcs_plans`, or the unseen-registration rule has work to do.
+    pub fn next_deadline(&self, owned_retention_ms: u64) -> Result<Option<u64>> {
+        let conn = self.lock()?;
+        let mut next: Option<u64> = None;
+        let mut consider = |at: u64| next = Some(next.map_or(at, |n| n.min(at)));
+        for r in all_records(&conn)? {
+            let a = stored_agent(&conn, &r.id)?;
+            match a.ended_at {
+                Some(ended) if !a.recovery_pending => {
+                    if matches!(r.status.as_str(), "exited" | "lost") {
+                        consider(ended.saturating_add(if r.ownership == "owned" {
+                            owned_retention_ms
+                        } else if r.status == "lost" {
+                            600_000
+                        } else {
+                            60_000
+                        }));
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    if r.ownership == "registered"
+                        && (r.pid.is_none() || r.pid_start_time.is_none())
+                    {
+                        consider(r.last_seen.saturating_add(180_000));
+                    }
+                }
+            }
+        }
+        let min = |sql: &str| -> Result<Option<u64>> {
+            Ok(conn
+                .query_row(sql, [], |r| r.get::<_, Option<i64>>(0))?
+                .and_then(|n| u64::try_from(n).ok()))
+        };
+        for at in [
+            min("SELECT MIN(json_extract(data,'$.expires_at')) FROM approvals WHERE json_extract(data,'$.state')='pending'")?,
+            min("SELECT MIN(json_extract(record,'$.expires_at')) FROM vcs_operations WHERE state='prepared'")?,
+            min("SELECT MIN(json_extract(record,'$.created_at')) FROM vcs_operations WHERE state IN ('completed','failed')")?
+                .map(|at| at.saturating_add(30 * 86_400_000)),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            consider(at);
+        }
+        Ok(next)
     }
     pub fn expiring_managed(&self, now: u64, retention_ms: u64) -> Result<Vec<ManagedSession>> {
         if now < retention_ms {

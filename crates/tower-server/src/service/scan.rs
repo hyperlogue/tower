@@ -16,6 +16,18 @@ impl Default for Config {
     }
 }
 impl Service {
+    pub(super) fn scan_deadline(&self) -> Result<Option<u64>> {
+        if !self.scan.enabled {
+            return Ok(None);
+        }
+        let last = self
+            .last_scan
+            .lock()
+            .map_err(|_| Error::Other("Scanner state unavailable".into()))?;
+        let remaining =
+            Duration::from_secs(self.scan.interval_s.max(1)).saturating_sub(last.elapsed());
+        Ok(Some(now_ms().saturating_add(remaining.as_millis() as u64)))
+    }
     pub(super) fn scan_processes(&self) -> Result<()> {
         if !self.scan.enabled {
             return Ok(());
