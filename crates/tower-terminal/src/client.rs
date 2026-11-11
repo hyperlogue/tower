@@ -67,7 +67,6 @@ pub async fn attach_with_terminal(info: AttachInfo, terminal: LocalTerminal) -> 
     let input = async {
         let mut buf = [0; 8192];
         let mut detach = Detach::default();
-        let mut tick = tokio::time::interval(Duration::from_millis(50));
         loop {
             let mut bytes = Vec::new();
             let end = tokio::select! {
@@ -79,7 +78,10 @@ pub async fn attach_with_terminal(info: AttachInfo, terminal: LocalTerminal) -> 
                     wire::write(&mut write, &Request::Resize { size: dimensions(&terminal)? }).await?;
                     false
                 },
-                _ = tick.tick() => { detach.expire(&mut bytes); false },
+                _ = tokio::time::sleep_until(detach.deadline.unwrap_or_else(Instant::now).into()), if detach.deadline.is_some() => {
+                    detach.expire(&mut bytes);
+                    false
+                },
             };
             if !bytes.is_empty() {
                 wire::data(&mut write, &bytes).await?;
@@ -167,6 +169,9 @@ impl Detach {
                 }
                 out.push(self.pending.remove(0));
             }
+        }
+        if self.pending.is_empty() && self.prefix.is_empty() {
+            self.deadline = None;
         }
         false
     }
