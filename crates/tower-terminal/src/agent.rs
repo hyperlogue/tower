@@ -37,30 +37,47 @@ impl AgentAdapter for CodexAdapter {
 pub(crate) fn task(context: SessionContext) -> SessionTask {
     Box::pin(async move {
         let mut context = context;
-        match configure(&context.plan, &mut context.state).await {
+        let token = std::mem::take(&mut context.token);
+        match configure(&context.plan, &mut context.state, token).await {
             Ok(adapter) => adapter.run(context).await,
             Err(error) => Ok(failed(context.state, error)),
         }
     })
 }
+/// What hosts this launcher: Tower's own daemon and pool, or an embedding
+/// program's terminal window.
+struct Host {
+    exe: std::path::PathBuf,
+    paths: tower_pal::Paths,
+    daemon: bool,
+}
+fn host(plan: &LauncherPlan) -> io::Result<Host> {
+    Ok(match &plan.embedding {
+        Some(embedding) => Host {
+            exe: embedding.helper.clone().into(),
+            paths: tower_pal::Paths::rooted(embedding.state.clone().into())?,
+            daemon: false,
+        },
+        None => Host {
+            exe: tower_pal::Program::Cli.path()?,
+            paths: tower_pal::Paths::discover()?,
+            daemon: true,
+        },
+    })
+}
 async fn configure(
     plan: &LauncherPlan,
     state: &mut RuntimeState,
+    token: String,
 ) -> io::Result<Box<dyn AgentAdapter>> {
-    let token = std::env::var("TOWER_AGENT_TOKEN")
-        .map_err(|_| io::Error::other("missing session credential"))?;
-    if token.is_empty() {
-        return Err(io::Error::other("empty credential"));
-    }
-    let exe = tower_pal::Program::Cli.path()?;
+    let Host { exe, paths, daemon } = host(plan)?;
     let mut env =
         project_environment(Path::new(&plan.spec.cwd), &exe, tower_pal::environment()).await?;
     let config = match plan.spec.harness.definition().execution(&plan.spec) {
         tower_agents::definition::Execution::Hooks => None,
-        tower_agents::definition::Execution::CodexAppServer => Some(
-            tower_agents::codex_service::Config::load(&tower_pal::Paths::discover()?)
-                .map_err(io::Error::other)?,
-        ),
+        tower_agents::definition::Execution::CodexAppServer => {
+            Some(tower_agents::codex_service::Config::load(&paths).map_err(io::Error::other)?)
+        }
     };
     let native_home = match &config {
         Some(c) => Some(format!("codex-endpoint:{}", c.endpoint.display())),
@@ -93,7 +110,12 @@ async fn configure(
     }
     env.insert("TOWER_AGENT_ID".into(), plan.id.clone());
     env.insert("TOWER_AGENT_TOKEN".into(), token.clone());
-    env.insert("TOWER_SOCKET".into(), plan.tower_socket.clone());
+    // Integrations that call back into the daemon key off this variable.
+    if daemon {
+        env.insert("TOWER_SOCKET".into(), plan.tower_socket.clone());
+    } else {
+        env.remove("TOWER_SOCKET");
+    }
     env.insert("TOWER_LAUNCHER_SOCKET".into(), plan.control_socket.clone());
     let mut invocation = tower_agents::config::prepare(
         &plan.spec,
@@ -107,7 +129,8 @@ async fn configure(
                 .await;
         state.private.insert("queue_supported".into(), queue.into());
     }
-    if super::clipboard_mode(plan.spec.harness).is_some() {
+    // The shim reaches the pool's clipboard; a plain terminal has its own.
+    if daemon && super::clipboard_mode(plan.spec.harness).is_some() {
         tower_clipboard::shim::install(
             Path::new(&plan.state_dir),
             &exe,
@@ -175,15 +198,15 @@ async fn serve(
 ) -> io::Result<i32> {
     let mut invocation = configured.invocation;
     let token = configured.token;
-    let paths = tower_pal::Paths::discover()?;
+    let Host { paths, daemon, .. } = host(plan)?;
     state.private.insert(
         "pty_supported".into(),
-        super::injection::supported(&paths).await.into(),
+        (daemon && super::injection::supported(&paths).await).into(),
     );
     let listener = IpcListener::bind(Path::new(&plan.control_socket)).await?;
     let (observations, mut observed) = mpsc::channel(128);
     let mut server = if let Some(config) = codex {
-        match super::app_server::start(plan, &mut invocation, observations, config).await {
+        match super::app_server::start(plan, &paths, &mut invocation, observations, config).await {
             Ok(server) => Some(server),
             Err(e) => {
                 // The session's terminal is where the person launching it looks.
@@ -286,7 +309,7 @@ async fn serve(
                         let _=ack.send(Err(tower_protocol::RpcError::application("delivery_failed","Target session is unavailable"))); continue;
                     }
                     if report.pty_only {
-                        if !super::injection::allowed(&paths,plan.spec.harness){let _=ack.send(Err(tower_protocol::RpcError::application("unsupported","PTY injection is disabled")));continue;}
+                        if !daemon || !super::injection::allowed(&paths,plan.spec.harness){let _=ack.send(Err(tower_protocol::RpcError::application("unsupported","PTY injection is disabled")));continue;}
                         match super::injection::proof(state) {
                             Ok(proof)=>{let paths=paths.clone();let name=plan.id.clone();tokio::spawn(async move{let _=ack.send(super::injection::send(paths,name,proof,text).await.map(Some));});}
                             Err(e)=>{let _=ack.send(Err(e));}
@@ -343,7 +366,7 @@ async fn serve(
                     let kind=event.kind;let child=event.child;let before=state.seq;let was_idle=state.status=="idle";activity.apply(state,event,now());
                     if state.seq!=before && !child {
                         super::injection::observe_idle(state,kind,was_idle);
-                        continue_turn(&paths,plan,state);
+                        if daemon { continue_turn(&paths,plan,state); }
                         if let Some(endpoint)=report.delivery && tower_agents::delivery::validate(&endpoint).is_ok() && endpoint.messaging_socket.is_some() && endpoint.messaging_token.is_some() {
                             state.private.insert("delivery".into(),serde_json::to_value(endpoint)?);
                         }

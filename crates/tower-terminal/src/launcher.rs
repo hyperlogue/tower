@@ -133,6 +133,17 @@ pub async fn run(path: &Path) -> io::Result<i32> {
         ));
     }
     let plan: LauncherPlan = serde_json::from_slice(&tower_pal::read_private(path)?)?;
+    let token = match &plan.embedding {
+        Some(embedding) => String::from_utf8(tower_pal::read_private(
+            &tower_pal::Paths::rooted(embedding.state.clone().into())?.token_path(&plan.id)?,
+        )?)
+        .map_err(io::Error::other)?,
+        None => std::env::var("TOWER_AGENT_TOKEN")
+            .map_err(|_| io::Error::other("missing session credential"))?,
+    };
+    if token.is_empty() {
+        return Err(io::Error::other("empty credential"));
+    }
     let _lock = SingletonLock::acquire(&Path::new(&plan.state_dir).join("launcher.lock"))?;
     let terminated = tower_pal::Termination::new()?.into_channel();
     let identity = tower_pal::process_identity(tower_pal::pid())?;
@@ -182,6 +193,7 @@ pub async fn run(path: &Path) -> io::Result<i32> {
     let (commands, receiver) = mpsc::channel(1);
     let context = super::session::SessionContext {
         plan: plan.clone(),
+        token,
         state: state.clone(),
         publisher,
         commands: super::session::SessionCommands(receiver),

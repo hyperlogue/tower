@@ -3,6 +3,7 @@ mod app_server;
 mod client;
 mod injection;
 pub mod launcher;
+pub mod local;
 mod pool;
 mod session;
 pub use client::{attach, attach_with_terminal};
@@ -747,6 +748,7 @@ impl ManagedBackend for TerminalBackend {
                 .into_owned(),
             spec: spec.clone(),
             continue_turn: false,
+            embedding: None,
         };
         let binding = Binding {
             name: id.into(),

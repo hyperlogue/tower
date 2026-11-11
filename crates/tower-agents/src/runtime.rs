@@ -29,6 +29,16 @@ impl AgentSpec {
     }
 }
 
+/// A program that links the launcher and runs agents in its own terminal
+/// windows, with no Tower daemon or terminal pool behind them.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Embedding {
+    /// Executable that answers `hook <harness> <event>` and `__agent env`.
+    pub helper: String,
+    /// Directory that replaces Tower's own state directory.
+    pub state: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LauncherPlan {
     pub id: String,
@@ -40,6 +50,8 @@ pub struct LauncherPlan {
     /// The previous incarnation was mid-turn: nudge the agent once ready.
     #[serde(default)]
     pub continue_turn: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<Embedding>,
 }
 /// Sent to an agent whose turn a Tower or pool restart interrupted.
 pub const CONTINUE: &str =

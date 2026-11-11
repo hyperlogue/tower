@@ -108,12 +108,14 @@ impl AgentDefinition for Definition {
         let path = dir.join("claude-settings.json");
         save_json(&path, &json!({"hooks":nested(exe,h,&names)}))?;
         argv.extend(["--settings".into(), path.to_string_lossy().into_owned()]);
-        let mcp = dir.join("tower-mcp.json");
-        save_json(
-            &mcp,
-            &json!({"mcpServers":{"tower":{"command":exe,"args":["mcp"]}}}),
-        )?;
-        argv.extend(["--mcp-config".into(), mcp.to_string_lossy().into_owned()]);
+        if env.contains_key("TOWER_SOCKET") {
+            let mcp = dir.join("tower-mcp.json");
+            save_json(
+                &mcp,
+                &json!({"mcpServers":{"tower":{"command":exe,"args":["mcp"]}}}),
+            )?;
+            argv.extend(["--mcp-config".into(), mcp.to_string_lossy().into_owned()]);
+        }
         env.insert(
             "CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR".into(),
             "1".into(),

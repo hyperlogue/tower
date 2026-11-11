@@ -28,6 +28,19 @@ pub use pty::*;
 #[cfg(not(unix))]
 compile_error!("tower currently supports Linux and macOS");
 
+fn home() -> io::Result<PathBuf> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "HOME must be an absolute path"))
+}
+fn xdg(key: &str, fallback: &str) -> io::Result<PathBuf> {
+    match env::var_os(key).map(PathBuf::from) {
+        Some(path) if path.is_absolute() => Ok(path),
+        _ => Ok(home()?.join(fallback)),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Paths {
     pub state: PathBuf,
@@ -44,24 +57,25 @@ impl Paths {
         self.run.join("pool.sock")
     }
     pub fn discover() -> io::Result<Self> {
-        let home = env::var_os("HOME")
-            .map(PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidInput, "HOME must be an absolute path")
-            })?;
-        let xdg = |key: &str, fallback: PathBuf| {
-            env::var_os(key)
-                .map(PathBuf::from)
-                .filter(|p| p.is_absolute())
-                .unwrap_or(fallback)
-        };
-        let state = xdg("XDG_STATE_HOME", home.join(".local/state")).join("tower");
-        let config_home = xdg("XDG_CONFIG_HOME", home.join(".config"));
+        let state = xdg("XDG_STATE_HOME", ".local/state")?.join("tower");
+        Self::at(state, env::var_os("TOWER_SOCKET").map(PathBuf::from))
+    }
+    /// Paths for a program that keeps Tower's state under its own directory.
+    /// `TOWER_SOCKET` names a daemon such a program does not have.
+    pub fn rooted(state: PathBuf) -> io::Result<Self> {
+        if !state.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "state directory must be absolute",
+            ));
+        }
+        Self::at(state, None)
+    }
+    fn at(state: PathBuf, socket: Option<PathBuf>) -> io::Result<Self> {
+        let home = home()?;
+        let config_home = xdg("XDG_CONFIG_HOME", ".config")?;
         let run = state.join("run");
-        let socket = env::var_os("TOWER_SOCKET")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| run.join("towerd.sock"));
+        let socket = socket.unwrap_or_else(|| run.join("towerd.sock"));
         if !socket.is_absolute() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,

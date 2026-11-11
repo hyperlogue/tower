@@ -9,6 +9,7 @@ pub(crate) trait AgentAdapter: Send {
 }
 pub(crate) struct SessionContext {
     pub plan: LauncherPlan,
+    pub token: String,
     pub state: RuntimeState,
     pub publisher: SessionPublisher,
     pub commands: SessionCommands,

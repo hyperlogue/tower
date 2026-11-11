@@ -141,11 +141,12 @@ fn same_process(
 }
 pub async fn start(
     plan: &LauncherPlan,
+    paths: &tower_pal::Paths,
     invocation: &mut Invocation,
     events: mpsc::Sender<AgentEvent>,
     config: Config,
 ) -> io::Result<Server> {
-    let host = tower_agents::codex_host::ensure_configured(&tower_pal::Paths::discover()?, config)
+    let host = tower_agents::codex_host::ensure_configured(paths, config)
         .await
         .map_err(io::Error::other)?;
     if host.process.is_none() {
