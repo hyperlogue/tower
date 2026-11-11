@@ -99,6 +99,7 @@ pub fn inspect_process(pid: u32) -> io::Result<ProcessInfo> {
     let bytes = info
         .pvi_cdir
         .vip_path
+        .as_flattened()
         .iter()
         .take_while(|b| **b != 0)
         .map(|b| *b as u8)
@@ -113,6 +114,81 @@ pub fn inspect_process(pid: u32) -> io::Result<ProcessInfo> {
         cwd,
         tower_agent,
     })
+}
+/// Paths of the regular files `pid` holds open.
+#[cfg(target_os = "linux")]
+pub fn open_files(pid: u32) -> io::Result<Vec<PathBuf>> {
+    Ok(std::fs::read_dir(format!("/proc/{pid}/fd"))?
+        .take(65536)
+        .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+        .filter(|path| path.is_absolute())
+        .collect())
+}
+/// Paths of the regular files `pid` holds open.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+pub fn open_files(pid: u32) -> io::Result<Vec<PathBuf>> {
+    use std::os::unix::ffi::OsStrExt;
+    #[repr(C)]
+    struct VnodeFdInfoWithPath {
+        file: [u8; 24],
+        path: libc::vnode_info_path,
+    }
+    const PROC_PIDFDVNODEPATHINFO: libc::c_int = 2;
+    let raw = i32::try_from(pid).map_err(io::Error::other)?;
+    let mut fds = vec![
+        libc::proc_fdinfo {
+            proc_fd: 0,
+            proc_fdtype: 0
+        };
+        4096
+    ];
+    let entry = std::mem::size_of::<libc::proc_fdinfo>();
+    // proc_pidinfo fills at most the supplied buffer and returns the bytes written.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            raw,
+            libc::PROC_PIDLISTFDS,
+            0,
+            fds.as_mut_ptr().cast(),
+            (fds.len() * entry) as libc::c_int,
+        )
+    };
+    if written <= 0 {
+        return Err(io::Error::last_os_error());
+    }
+    fds.truncate(written as usize / entry);
+    let mut paths = Vec::new();
+    for fd in fds {
+        if fd.proc_fdtype != libc::PROX_FDTYPE_VNODE as u32 {
+            continue;
+        }
+        let mut info = std::mem::MaybeUninit::<VnodeFdInfoWithPath>::zeroed();
+        let size = std::mem::size_of::<VnodeFdInfoWithPath>() as libc::c_int;
+        if unsafe {
+            libc::proc_pidfdinfo(
+                raw,
+                fd.proc_fd,
+                PROC_PIDFDVNODEPATHINFO,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        } != size
+        {
+            continue;
+        }
+        let info = unsafe { info.assume_init() };
+        let bytes = info
+            .path
+            .vip_path
+            .as_flattened()
+            .iter()
+            .take_while(|b| **b != 0)
+            .map(|b| *b as u8)
+            .collect::<Vec<_>>();
+        paths.push(PathBuf::from(std::ffi::OsStr::from_bytes(&bytes)));
+    }
+    Ok(paths)
 }
 #[cfg(any(target_os = "macos", test))]
 fn mac_arguments(bytes: &[u8]) -> io::Result<(Vec<String>, Option<String>)> {

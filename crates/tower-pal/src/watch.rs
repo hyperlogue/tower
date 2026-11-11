@@ -93,6 +93,54 @@ impl TreeWatch {
     }
 }
 
+/// Recursive watch below `root` that reports which paths changed.
+pub struct PathWatch {
+    _watcher: notify::RecommendedWatcher,
+    changes: watch::Receiver<u64>,
+    pending: std::sync::Arc<std::sync::Mutex<Option<BTreeSet<PathBuf>>>>,
+}
+impl PathWatch {
+    pub fn new(root: &Path) -> io::Result<Self> {
+        let (updates, changes) = watch::channel(0u64);
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(Some(BTreeSet::new())));
+        let sink = pending.clone();
+        let mut watcher =
+            notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                let mut pending = sink.lock().unwrap_or_else(|e| e.into_inner());
+                match event {
+                    Ok(event) if matches!(event.kind, notify::EventKind::Access(_)) => return,
+                    Ok(event) if !event.need_rescan() => {
+                        if let Some(paths) = pending.as_mut() {
+                            paths.extend(event.paths);
+                        }
+                    }
+                    _ => *pending = None,
+                }
+                updates.send_modify(|revision| *revision = revision.wrapping_add(1));
+            })
+            .map_err(io::Error::other)?;
+        watcher
+            .watch(root, notify::RecursiveMode::Recursive)
+            .map_err(io::Error::other)?;
+        Ok(Self {
+            _watcher: watcher,
+            changes,
+            pending,
+        })
+    }
+    /// Waits for changes, then returns the changed paths, or `None` when
+    /// events were lost and the caller must rescan.
+    pub async fn changed(&mut self) -> Option<BTreeSet<PathBuf>> {
+        if self.changes.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(BTreeSet::new())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
