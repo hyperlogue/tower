@@ -75,12 +75,7 @@ impl Fixture {
         )
     }
     fn execute(&self, plan: &Value) -> Value {
-        let mut result = self.call(&[
-            "vcs",
-            "execute",
-            plan["plan_id"].as_str().unwrap(),
-            "--wait",
-        ]);
+        let mut result = self.call(&["vcs", "execute", plan["plan_id"].as_str().unwrap()]);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while result["state"] == "completed" && result["result"]["refresh_pending"] == true {
             assert!(
@@ -443,24 +438,25 @@ fn vcs_agents_are_per_phase_private_and_never_replayed_after_an_uncertain_push()
     );
     let b = AgentFixture::new(root, "agent-b");
     std::fs::write(&hold, "wait").unwrap();
-    assert_eq!(
-        f.rpc("vcs.execute", json!({"plan_id":plan_id,"auth":b.auth()}))["state"],
-        "running"
-    );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !std::fs::read_to_string(&log)
-        .unwrap_or_default()
-        .contains(r#""command":"receive""#)
-    {
-        assert!(std::time::Instant::now() < deadline);
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    assert_eq!(
-        f.rpc("vcs.operation", json!({"plan_id":plan_id}))["state"],
-        "running"
-    );
-    std::fs::remove_file(&hold).unwrap();
-    assert_eq!(f.call(&["vcs", "wait", plan_id])["state"], "completed");
+    let auth = b.auth();
+    std::thread::scope(|scope| {
+        let execution =
+            scope.spawn(|| f.rpc("vcs.execute", json!({"plan_id":plan_id,"auth":auth})));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains(r#""command":"receive""#)
+        {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            f.rpc("vcs.operation", json!({"plan_id":plan_id}))["state"],
+            "running"
+        );
+        std::fs::remove_file(&hold).unwrap();
+        assert_eq!(execution.join().unwrap()["state"], "completed");
+    });
     let calls: Vec<Value> = std::fs::read_to_string(&log)
         .unwrap()
         .lines()

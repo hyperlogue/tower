@@ -108,19 +108,21 @@ impl ServiceWorker {
                     .execute(move |s| s.vcs_claim(&request, peer, &p))
                     .await
                     .map_err(failure)??;
-                let record = op.record.clone();
+                let plan = op.record.plan_id.clone();
                 if let Some(auth) = auth {
-                    let permit = permit.take().expect("execution permit");
+                    let active = vcs.begin(&plan, permit.take().expect("execution permit"));
+                    // Detached so a disconnecting caller cannot abort the operation.
                     tokio::spawn(vcs.clone().execute(
                         self.service.clone(),
                         r.clone(),
                         peer,
                         op,
-                        permit,
                         auth,
+                        active,
                     ));
                 }
-                encode(record)
+                drop(permit);
+                encode(vcs.settled(&plan).await?)
             }
             _ => Err(RpcError::protocol(
                 -32601,

@@ -2,6 +2,7 @@ use crate::service::{Service, now_ms};
 use serde::Deserialize;
 use serde_json::json;
 use std::{
+    collections::BTreeSet,
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
@@ -90,6 +91,20 @@ pub(crate) struct Vcs {
     pub root: PathBuf,
     pub gate: Arc<tokio::sync::Semaphore>,
     refresh: tokio::sync::Mutex<Refresh>,
+    active: Arc<tokio::sync::watch::Sender<BTreeSet<String>>>,
+}
+/// Marks a plan as executing in this process and holds its worker slot until dropped.
+pub(crate) struct Active {
+    plan: String,
+    set: Arc<tokio::sync::watch::Sender<BTreeSet<String>>>,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+impl Drop for Active {
+    fn drop(&mut self) {
+        self.set.send_modify(|set| {
+            set.remove(&self.plan);
+        });
+    }
 }
 impl Vcs {
     pub fn new(
@@ -111,6 +126,7 @@ impl Vcs {
                 session_offset: 0,
                 checkout_offset: 0,
             }),
+            active: Arc::new(tokio::sync::watch::channel(BTreeSet::new()).0),
         })
     }
     pub fn binding(c: &StoredCheckout) -> Result<Binding> {
@@ -456,6 +472,22 @@ impl Vcs {
             let _ = tokio::time::timeout(Duration::from_secs(5), self.refresh(&c.record.id)).await;
         }
     }
+    pub fn begin(&self, plan: &str, permit: tokio::sync::OwnedSemaphorePermit) -> Active {
+        self.active.send_modify(|set| {
+            set.insert(plan.to_owned());
+        });
+        Active {
+            plan: plan.to_owned(),
+            set: self.active.clone(),
+            _permit: permit,
+        }
+    }
+    /// The operation record once no execution of `plan` is in flight here.
+    pub async fn settled(&self, plan: &str) -> Result<VcsOperation> {
+        let mut active = self.active.subscribe();
+        let _ = active.wait_for(|set| !set.contains(plan)).await;
+        Ok(self.operation(plan)?.record)
+    }
     pub fn operation(&self, id: &str) -> Result<StoredVcsOperation> {
         self.store.vcs_operation(id).map_err(|e| match e {
             tower_store::Error::NotFound => {
@@ -533,8 +565,8 @@ impl Vcs {
         request: Request,
         peer: tower_pal::Peer,
         mut op: StoredVcsOperation,
-        _permit: tokio::sync::OwnedSemaphorePermit,
         auth: tower_vcs::Authentication,
+        _active: Active,
     ) {
         let prepared = Self::prepared(&op);
         let result = match prepared {

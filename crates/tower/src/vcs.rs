@@ -79,15 +79,10 @@ pub enum VcsCommand {
     },
     Execute {
         plan: String,
-        #[arg(long)]
-        wait: bool,
         #[arg(long, value_enum)]
         auth: Option<Auth>,
     },
     Operation {
-        plan: String,
-    },
-    Wait {
         plan: String,
     },
     /// Release an uncertain operation reservation after inspecting native state.
@@ -124,8 +119,8 @@ pub async fn checkout(client: &mut Client, command: CheckoutCommand) -> Result<(
     print_json(&client.call(method, &params).await?)
 }
 pub async fn vcs(client: &mut Client, command: VcsCommand) -> Result<()> {
-    let (method, params, wait) = match command {
-        VcsCommand::Status { checkout } => ("vcs.status", json!({"checkout_id":checkout}), None),
+    let (method, params) = match command {
+        VcsCommand::Status { checkout } => ("vcs.status", json!({"checkout_id":checkout})),
         VcsCommand::Prepare {
             checkout,
             operation,
@@ -134,9 +129,8 @@ pub async fn vcs(client: &mut Client, command: VcsCommand) -> Result<()> {
         } => (
             "vcs.prepare",
             json!({"checkout_id":checkout,"operation":operation,"options":serde_json::from_str::<Value>(&options)?,"auth":authentication(client, auth).await?}),
-            None,
         ),
-        VcsCommand::Execute { plan, wait, auth } => {
+        VcsCommand::Execute { plan, auth } => {
             let op = serde_json::to_value(
                 client
                     .call("vcs.operation", &json!({"plan_id":plan}))
@@ -151,38 +145,17 @@ pub async fn vcs(client: &mut Client, command: VcsCommand) -> Result<()> {
             if op["state"] == "prepared" {
                 params["auth"] = authentication(client, selected).await?;
             }
-            (
-                "vcs.execute",
-                params,
-                (wait || matches!(selected, Auth::SshAgent)).then_some(plan),
-            )
+            ("vcs.execute", params)
         }
-        VcsCommand::Operation { plan } => ("vcs.operation", json!({"plan_id":plan}), None),
-        VcsCommand::Release { plan, yes } => {
-            ("vcs.release", json!({"plan_id":plan,"confirm":yes}), None)
-        }
-        VcsCommand::Wait { plan } => ("vcs.operation", json!({"plan_id":plan}), Some(plan)),
+        VcsCommand::Operation { plan } => ("vcs.operation", json!({"plan_id":plan})),
+        VcsCommand::Release { plan, yes } => ("vcs.release", json!({"plan_id":plan,"confirm":yes})),
     };
-    let mut result = serde_json::to_value(client.call(method, &params).await?)?;
-    let waiting = wait.is_some();
-    if let Some(plan) = wait {
-        let until = tokio::time::Instant::now() + std::time::Duration::from_secs(210);
-        while result["state"] == "running" && tokio::time::Instant::now() < until {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            result = serde_json::to_value(
-                client
-                    .call("vcs.operation", &json!({"plan_id":plan}))
-                    .await?,
-            )?;
-        }
-    }
+    let result = serde_json::to_value(client.call(method, &params).await?)?;
     print_json(&result)?;
-    if (waiting || method == "vcs.execute")
-        && matches!(result["state"].as_str(), Some("failed" | "unknown"))
-    {
+    if method == "vcs.execute" && matches!(result["state"].as_str(), Some("failed" | "unknown")) {
         return Err("VCS operation did not complete successfully; inspect its receipt".into());
     }
-    if waiting && result["state"] == "running" {
+    if method == "vcs.execute" && result["state"] == "running" {
         return Err("VCS operation is still running; query its operation receipt".into());
     }
     Ok(())

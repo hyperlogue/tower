@@ -128,7 +128,7 @@ VCS mutations use a reviewed plan followed by execution:
 ```sh
 tower-cli vcs prepare CHECKOUT_ID checkout.create --options \
   '{"name":"feature","target":{"kind":"new_branch","branch":"feature"}}'
-tower-cli vcs execute PLAN_ID --wait
+tower-cli vcs execute PLAN_ID
 tower-cli vcs operation PLAN_ID
 
 # Other operations use the same prepare/execute flow.
@@ -165,9 +165,10 @@ credentials can inspect checkouts; registration, binding, and mutation require
 local administrative authority. VCS methods accept checkout or plan IDs, never
 an arbitrary working-directory path. Paths enter through explicit registration.
 
-A `completed` receipt records native success. `result.refresh_pending` means
-checkout observations may still be catching up. Repeating execution of the same
-plan returns its retained receipt. Interrupted operations with uncertain effects
+`vcs execute` replies when the operation completes or fails. A `completed`
+receipt records native success. `result.refresh_pending` means checkout
+observations may still be catching up. Repeating execution of the same plan
+returns its retained receipt. Interrupted operations with uncertain effects
 stay `unknown` and are not retried. They reserve the repository until an
 administrator inspects Git state and any remaining processes, then runs
 `tower-cli vcs release PLAN_ID --yes`. Release preserves the unknown outcome.
@@ -182,8 +183,7 @@ tower-cli vcs execute PLAN_ID
 ```
 
 The CLI reads its own `SSH_AUTH_SOCK`. Execute uses the prepared authentication
-mode and waits for the operation to settle when that mode is `ssh_agent`.
-Use a fresh forwarded connection for execution after reviewing the plan.
+mode. Use a fresh forwarded connection for execution after reviewing the plan.
 `--auth host` explicitly selects host authentication; preparation defaults to it.
 Changing the authentication mode requires a new plan. Retrying a started or
 finished operation returns its receipt without requiring the old agent.
