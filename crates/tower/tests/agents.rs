@@ -1050,3 +1050,46 @@ fn codex_mode_switch_validates_history_and_preserves_the_shared_host() {
     assert_eq!(back["shared_process"], true);
     f.call(&["kill", id]);
 }
+
+#[test]
+fn unmanaged_claude_sessions_are_discovered_from_session_files() {
+    let f = Fixture::new();
+    f.call(&["ls"]);
+    let sessions = f.root.path().join(".claude/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+    let pid = child.id();
+    let start = tower_pal::process_identity(pid).unwrap().start_time;
+    let native = "0e9d6f8e-1111-4222-8333-444455556666";
+    let write = |status: &str| {
+        let staged = sessions.join("staged");
+        let file = serde_json::json!({"pid":pid,"procStart":start.to_string(),"sessionId":native,"cwd":f.root.path(),"status":status,"name":"Fixture","nameSource":"user"});
+        std::fs::write(&staged, file.to_string()).unwrap();
+        std::fs::rename(&staged, sessions.join(format!("{pid}.json"))).unwrap();
+    };
+    let find = |status: &str| {
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            let all = f.call(&["ls", "--all"]);
+            if let Some(row) = all
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|r| r["native_session_id"] == native && r["status"] == status)
+            {
+                return row.clone();
+            }
+            assert!(Instant::now() < until, "expected {status}: {all}");
+            thread::sleep(Duration::from_millis(40));
+        }
+    };
+    write("busy");
+    let row = find("working");
+    assert_eq!(row["ownership"], "registered");
+    assert_eq!(row["pid"], pid);
+    write("idle");
+    find("idle");
+    child.kill().unwrap();
+    child.wait().unwrap();
+    find("lost");
+}

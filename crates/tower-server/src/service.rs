@@ -1,6 +1,7 @@
 mod clipboard;
 mod enrollment;
 pub(crate) use enrollment::EnrollmentStep;
+pub(crate) use scan::ClaudeSession;
 mod events;
 mod execution;
 mod managed;
