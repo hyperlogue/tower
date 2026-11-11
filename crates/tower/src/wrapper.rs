@@ -1,5 +1,4 @@
 use crate::{Client, Result};
-use std::sync::atomic::Ordering;
 use tower_agents::{Harness, runtime::AgentSpec};
 use tower_protocol::{AgentCredential, RegisterResult};
 
@@ -52,7 +51,7 @@ pub async fn run(
         native_home: None,
     };
     let invocation = tower_agents::config::prepare(&spec, root.path(), &exe, env)?;
-    let stop = tower_pal::termination_flag()?;
+    let mut stop = tower_pal::Termination::new()?;
     let mut child = tower_pal::spawn_inherited(&invocation.argv, &invocation.env, &cwd)?;
     let pid = child.id().ok_or("Agent exited during launch")?;
     let identity = tower_pal::process_identity(pid)?;
@@ -72,16 +71,19 @@ pub async fn run(
         )
         .await?;
     let registered: RegisterResult = serde_json::from_value(serde_json::to_value(registered)?)?;
-    let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
-    let mut stopping = None;
+    let mut stopping = false;
+    let mut kill_at: Option<tokio::time::Instant> = None;
     let status = loop {
         tokio::select! {
-            result=child.wait()=>break result?,
-            _=tick.tick()=>{
-                if stop.load(Ordering::Relaxed) && stopping.is_none(){
-                    let _=tower_pal::terminate_process(pid,identity.start_time);stopping=Some(std::time::Instant::now());
-                }
-                if stopping.is_some_and(|t|t.elapsed()>std::time::Duration::from_secs(2)){let _=child.start_kill();}
+            result = child.wait() => break result?,
+            () = stop.recv(), if !stopping => {
+                stopping = true;
+                let _ = tower_pal::terminate_process(pid, identity.start_time);
+                kill_at = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(2));
+            }
+            () = tokio::time::sleep_until(kill_at.unwrap_or_else(tokio::time::Instant::now)), if kill_at.is_some() => {
+                kill_at = None;
+                let _ = child.start_kill();
             }
         }
     };

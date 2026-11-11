@@ -1,12 +1,5 @@
 use futures_util::future::BoxFuture;
-use std::{
-    io,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::Duration,
-};
+use std::{io, time::Duration};
 use tokio::sync::{mpsc, oneshot};
 use tower_agents::runtime::{LauncherPlan, RuntimeState};
 
@@ -78,19 +71,19 @@ pub(crate) async fn drive(
     mut updates: mpsc::Receiver<SessionUpdate>,
     commands: mpsc::Sender<SessionCommand>,
     mut state: RuntimeState,
-    terminated: Arc<AtomicBool>,
+    mut terminated: mpsc::Receiver<()>,
     mut persist: impl FnMut(&RuntimeState) -> io::Result<()>,
 ) -> io::Result<i32> {
-    let mut retry = tokio::time::interval(Duration::from_millis(250));
-    retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut dirty = false;
     let mut exited = None;
     loop {
         tokio::select! {
             biased;
-            _ = retry.tick() => {
-                if terminated.swap(false, Ordering::Relaxed) { let _ = commands.try_send(SessionCommand::Stop); }
-                if dirty && persist(&state).is_ok() { dirty = false; }
+            Some(()) = terminated.recv() => {
+                let _ = commands.try_send(SessionCommand::Stop);
+            }
+            _ = tokio::time::sleep(Duration::from_millis(250)), if dirty => {
+                if persist(&state).is_ok() { dirty = false; }
             }
             Some(update) = updates.recv(), if exited.is_none() => {
                 state = update.state;
@@ -130,7 +123,10 @@ pub(crate) async fn drive(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, atomic::AtomicUsize};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
     fn state() -> RuntimeState {
         serde_json::from_value(serde_json::json!({
             "id":"session","generation":"one","harness":"claude-code","status":"starting",
@@ -145,7 +141,7 @@ mod tests {
         let (publisher, updates) = SessionPublisher::channel();
         let (commands, receiver) = mpsc::channel(1);
         let mut control = SessionCommands(receiver);
-        let terminated = Arc::new(AtomicBool::new(false));
+        let (terminated, signal) = mpsc::channel(1);
         let storage = Arc::new(AtomicBool::new(false));
         let starts = Arc::new(AtomicUsize::new(0));
         let (failed, observed) = oneshot::channel();
@@ -165,7 +161,6 @@ mod tests {
         let saved = Arc::new(Mutex::new(Vec::new()));
         let output = saved.clone();
         let ready = storage.clone();
-        let signal = terminated.clone();
         let writer = tokio::spawn(drive(
             task,
             updates,
@@ -184,7 +179,7 @@ mod tests {
         assert!(!writer.is_finished());
         assert_eq!(starts.load(Ordering::SeqCst), 1);
         storage.store(true, Ordering::SeqCst);
-        terminated.store(true, Ordering::SeqCst);
+        terminated.send(()).await.unwrap();
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(2), writer)
                 .await
@@ -230,7 +225,7 @@ mod tests {
             updates,
             commands,
             state(),
-            Arc::new(AtomicBool::new(false)),
+            mpsc::channel(1).1,
             move |state| {
                 assert_eq!(state.exit_code, Some(7));
                 if attempts.fetch_add(1, Ordering::SeqCst) < 2 {

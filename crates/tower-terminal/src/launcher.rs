@@ -134,7 +134,7 @@ pub async fn run(path: &Path) -> io::Result<i32> {
     }
     let plan: LauncherPlan = serde_json::from_slice(&tower_pal::read_private(path)?)?;
     let _lock = SingletonLock::acquire(&Path::new(&plan.state_dir).join("launcher.lock"))?;
-    let terminated = tower_pal::termination_flag()?;
+    let terminated = tower_pal::Termination::new()?.into_channel();
     let identity = tower_pal::process_identity(tower_pal::pid())?;
     let mut state = RuntimeState {
         id: plan.id.clone(),

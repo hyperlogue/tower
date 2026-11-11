@@ -166,15 +166,38 @@ pub fn terminate_own_group() -> io::Result<()> {
     nix::sys::signal::killpg(nix::unistd::getpid(), nix::sys::signal::Signal::SIGTERM)
         .map_err(io::Error::from)
 }
-pub fn termination_flag() -> io::Result<std::sync::Arc<std::sync::atomic::AtomicBool>> {
-    let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    signal_hook::flag::register(signal_hook::consts::SIGTERM, flag.clone())?;
-    // Ctrl-C belongs to the foreground agent. Keep its supervisor alive.
-    signal_hook::flag::register(
-        signal_hook::consts::SIGINT,
-        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-    )?;
-    Ok(flag)
+/// SIGTERM requests for a supervisor. Creating it also stops Ctrl-C, which
+/// belongs to the foreground agent, from terminating the supervisor.
+pub struct Termination {
+    term: tokio::signal::unix::Signal,
+    _interrupt: tokio::signal::unix::Signal,
+}
+impl Termination {
+    pub fn new() -> io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            term: signal(SignalKind::terminate())?,
+            _interrupt: signal(SignalKind::interrupt())?,
+        })
+    }
+    pub async fn recv(&mut self) {
+        if self.term.recv().await.is_none() {
+            std::future::pending::<()>().await;
+        }
+    }
+    /// Forward each request into a channel for code that only selects on receivers.
+    pub fn into_channel(mut self) -> tokio::sync::mpsc::Receiver<()> {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        tokio::spawn(async move {
+            loop {
+                self.recv().await;
+                if tx.send(()).await.is_err() {
+                    break;
+                }
+            }
+        });
+        rx
+    }
 }
 pub fn symlink(source: &Path, destination: &Path) -> io::Result<()> {
     std::os::unix::fs::symlink(source, destination)
