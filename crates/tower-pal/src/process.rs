@@ -174,8 +174,101 @@ fn signal_process(pid: u32, start: u64, signal: rustix::process::Signal) -> io::
     }
 }
 
+/// Resolves when one process incarnation exits, without polling.
+pub struct ProcessExit(Option<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>>);
+impl ProcessExit {
+    /// Watch `pid` if it is still the incarnation that started at `start`.
+    /// A process that is already gone resolves immediately.
+    pub fn watch(pid: u32, start: u64) -> io::Result<Self> {
+        let Some(handle) = exit_handle(pid)? else {
+            return Ok(Self(None));
+        };
+        // The handle pins the PID, so a matching start time names this incarnation.
+        match process_identity(pid) {
+            Ok(identity) if identity.start_time == start => {}
+            _ => return Ok(Self(None)),
+        }
+        Ok(Self(Some(register(handle)?)))
+    }
+    pub async fn exited(self) {
+        if let Some(handle) = self.0 {
+            let _ = handle.readable().await;
+        }
+    }
+}
+#[allow(unsafe_code)]
+fn register(
+    handle: std::os::fd::OwnedFd,
+) -> io::Result<tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>> {
+    // The OwnedFd keeps the descriptor open until AsyncFd deregisters and drops it.
+    unsafe {
+        tokio::io::unix::AsyncFd::register_with_interest(handle, tokio::io::Interest::READABLE)
+    }
+    .map_err(io::Error::from)
+}
+#[cfg(target_os = "linux")]
+fn exit_handle(pid: u32) -> io::Result<Option<std::os::fd::OwnedFd>> {
+    let Some(process) =
+        rustix::process::Pid::from_raw(i32::try_from(pid).map_err(io::Error::other)?)
+    else {
+        return Err(io::Error::other("Invalid PID"));
+    };
+    match rustix::process::pidfd_open(process, rustix::process::PidfdFlags::NONBLOCK) {
+        Ok(handle) => Ok(Some(handle)),
+        Err(rustix::io::Errno::SRCH) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+#[cfg(target_os = "macos")]
+fn exit_handle(pid: u32) -> io::Result<Option<std::os::fd::OwnedFd>> {
+    use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
+    let queue = Kqueue::new()?;
+    let change = KEvent::new(
+        pid as usize,
+        EventFilter::EVFILT_PROC,
+        EvFlags::EV_ADD | EvFlags::EV_ONESHOT,
+        FilterFlag::NOTE_EXIT,
+        0,
+        0,
+    );
+    let zero = nix::libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    match queue.kevent(&[change], &mut [], Some(zero)) {
+        Ok(_) => Ok(Some(queue.into())),
+        Err(nix::errno::Errno::ESRCH) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn process_exit_resolves_when_the_watched_incarnation_ends() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("0.2")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let start = super::process_identity(pid).unwrap().start_time;
+        let wrong = super::ProcessExit::watch(pid, start.wrapping_add(1)).unwrap();
+        tokio::time::timeout(std::time::Duration::from_millis(50), wrong.exited())
+            .await
+            .unwrap();
+        let exit = super::ProcessExit::watch(pid, start).unwrap();
+        let waiter = tokio::spawn(exit.exited());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished());
+        tokio::task::spawn_blocking(move || child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .unwrap()
+            .unwrap();
+    }
     #[test]
     fn mac_empty_arguments_do_not_consume_the_ownership_marker() {
         let mut bytes = 3i32.to_ne_bytes().to_vec();

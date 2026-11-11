@@ -21,7 +21,7 @@ tempfile.workspace = true
 fs2 = "0.4"
 signal-hook = "0.3"
 rustix = { version = "1", features = ["process", "time"] }
-nix = { version = "0.31", features = ["process", "signal", "fs", "socket", "user", "poll"] }
+nix = { version = "0.31", features = ["process", "signal", "fs", "socket", "user", "poll", "event"] }
 libc = "0.2"
 
 [dev-dependencies]

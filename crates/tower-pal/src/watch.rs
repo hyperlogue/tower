@@ -56,6 +56,42 @@ impl FileWatch {
     }
 }
 
+/// Recursive watch below `root` that signals changes to files named `name`.
+pub struct TreeWatch {
+    _watcher: notify::RecommendedWatcher,
+    changes: watch::Receiver<u64>,
+}
+impl TreeWatch {
+    pub fn new(root: &Path, name: &'static str) -> io::Result<Self> {
+        let (updates, changes) = watch::channel(0u64);
+        let mut watcher =
+            notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                if event.is_ok_and(|event| {
+                    !matches!(event.kind, notify::EventKind::Access(_))
+                        && event
+                            .paths
+                            .iter()
+                            .any(|p| p.file_name().is_some_and(|n| n == name))
+                }) {
+                    updates.send_modify(|revision| *revision = revision.wrapping_add(1));
+                }
+            })
+            .map_err(io::Error::other)?;
+        watcher
+            .watch(root, notify::RecursiveMode::Recursive)
+            .map_err(io::Error::other)?;
+        Ok(Self {
+            _watcher: watcher,
+            changes,
+        })
+    }
+    pub async fn changed(&mut self) {
+        if self.changes.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

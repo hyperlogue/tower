@@ -11,7 +11,7 @@ mod unix;
 #[cfg(unix)]
 pub use unix::*;
 mod watch;
-pub use watch::FileWatch;
+pub use watch::{FileWatch, TreeWatch};
 mod metrics;
 pub use metrics::{HostSample, HostSampler};
 mod command;
