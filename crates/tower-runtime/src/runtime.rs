@@ -72,6 +72,7 @@ pub struct Runtime {
     journal: Arc<Journal>,
     owners: Mutex<BTreeMap<String, Arc<engine::Handle>>>,
     terminal: Arc<dyn ManagedBackend>,
+    terminal_changes: tokio::sync::watch::Receiver<u64>,
     authority: Authority,
     tasks: tokio::runtime::Handle,
 }
@@ -113,11 +114,16 @@ impl Runtime {
         let journal = Arc::new(Journal::new(database, limits)?);
         let live = recover(&paths, &journal).await?;
         journal.compact()?;
+        let (changed, terminal_changes) = tokio::sync::watch::channel(0u64);
+        terminal.watch(Arc::new(move || {
+            changed.send_modify(|n| *n = n.wrapping_add(1))
+        }));
         let runtime = Arc::new(Self {
             paths,
             journal,
             owners: Mutex::new(BTreeMap::new()),
             terminal,
+            terminal_changes,
             authority: Authority::default(),
             tasks: tokio::runtime::Handle::current(),
         });
@@ -269,6 +275,7 @@ impl Runtime {
                 self.context(),
                 b,
                 self.terminal.clone(),
+                self.terminal_changes.clone(),
                 normal,
                 control,
                 start == engine::Start::Continue,
@@ -729,6 +736,7 @@ mod tests {
             journal: Arc::new(Journal::open(&path.join("tower.db"), Limits::default()).unwrap()),
             owners: Mutex::new(BTreeMap::new()),
             terminal: Arc::new(NoTerminal),
+            terminal_changes: tokio::sync::watch::channel(0).1,
             authority: Authority::default(),
             tasks: tokio::runtime::Handle::current(),
         }

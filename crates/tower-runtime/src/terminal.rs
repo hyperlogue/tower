@@ -270,6 +270,7 @@ pub(crate) async fn run(
     ctx: engine::Context,
     b: Binding,
     backend: Arc<dyn ManagedBackend>,
+    changes: tokio::sync::watch::Receiver<u64>,
     mut normal: mpsc::Receiver<ExecutionCommand>,
     mut control: mpsc::Receiver<engine::Control>,
     recover: bool,
@@ -279,6 +280,7 @@ pub(crate) async fn run(
         &ctx,
         &b,
         backend.clone(),
+        changes,
         &mut normal,
         &mut control,
         recover,
@@ -297,6 +299,7 @@ async fn run_inner(
     ctx: &engine::Context,
     b: &Binding,
     backend: Arc<dyn ManagedBackend>,
+    mut changes: tokio::sync::watch::Receiver<u64>,
     normal: &mut mpsc::Receiver<ExecutionCommand>,
     control: &mut mpsc::Receiver<engine::Control>,
     recover: bool,
@@ -451,8 +454,10 @@ async fn run_inner(
         native
     };
     let mut native = native;
-    let started = tokio::time::Instant::now();
-    let mut tick = tokio::time::interval(Duration::from_millis(500));
+    let grace = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut grace_pending = !recover;
+    let mut observe_now = true;
+    let mut unavailable_until = None;
     loop {
         tokio::select! { biased;
             command = control.recv() => {
@@ -487,7 +492,19 @@ async fn run_inner(
                     }
                 }
             }
-            _ = tick.tick() => {
+            _ = async {
+                if observe_now { return }
+                tokio::select! {
+                    changed = changes.changed() => if changed.is_err() { std::future::pending().await },
+                    // An observation tolerated as not yet running is settled once the grace period ends.
+                    _ = tokio::time::sleep_until(grace), if grace_pending => {}
+                    _ = async { match unavailable_until { Some(at) => tokio::time::sleep_until(at).await, None => std::future::pending().await } } => {}
+                }
+            } => {
+                observe_now = false;
+                let unavailable = unavailable_until.take();
+                let in_grace = tokio::time::Instant::now() < grace;
+                grace_pending &= in_grace;
                 match observe(backend.clone(), native.clone()).await {
                     // The pool lost the session, for example when it was
                     // replaced: resume the conversation in the same runtime.
@@ -507,9 +524,16 @@ async fn run_inner(
                                 journal.finish_dispatch(b, id, true, Some(result(b, "completed")), None)?;
                             }
                         }
-                        if record(journal, b, observation, !recover && started.elapsed() < Duration::from_secs(5))? { return Ok(()) }
+                        if record(journal, b, observation, !recover && in_grace)? { return Ok(()) }
                     }
-                    Err(_) => { journal.fence(b, "terminal_unavailable", "unknown")?; }
+                    // The pool is briefly unreachable while it is replaced, and its return wakes this task.
+                    Err(_) => match unavailable {
+                        None => unavailable_until = Some(tokio::time::Instant::now() + Duration::from_secs(5)),
+                        Some(at) if tokio::time::Instant::now() >= at => {
+                            journal.fence(b, "terminal_unavailable", "unknown")?;
+                        }
+                        Some(at) => unavailable_until = Some(at),
+                    },
                 }
             }
             command = normal.recv() => {
