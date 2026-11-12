@@ -75,7 +75,7 @@ where
     let sinks = sinks::start(&paths, &service)?;
     let shutdown = Arc::new(Notify::new());
     let mut tasks = JoinSet::new();
-    let maintenance = tokio::spawn(maintain(service.clone(), paths.clone()));
+    let maintenance = tokio::spawn(maintain(service.clone()));
     let discovery = discovery::start(service.clone(), &paths.home);
     let checkout_refresh = tokio::spawn(service.vcs().observe_changes(service.events()));
     let signals = tower_pal::shutdown_signal();
@@ -124,24 +124,14 @@ where
     result
 }
 
-/// Runs maintenance when managed state files change, a watched process exits,
+/// Runs maintenance when a backend reports a change, a watched process exits,
 /// or a stored deadline falls due; otherwise it sleeps.
-async fn maintain(service: ServiceWorker, paths: Paths) {
+async fn maintain(service: ServiceWorker) {
     use std::collections::BTreeMap;
     use std::sync::atomic::Ordering;
     let wake = service.wake();
     let pool = wake.clone();
     service.watch_backends(std::sync::Arc::new(move || pool.run()));
-    let sessions = paths.state.join("sessions");
-    let mut states = match tower_pal::private_dir(&sessions)
-        .and_then(|_| tower_pal::TreeWatch::new(&sessions, "state.json"))
-    {
-        Ok(watch) => Some(watch),
-        Err(e) => {
-            eprintln!("tower: managed session state is unobservable: {e}");
-            None
-        }
-    };
     let mut exits: BTreeMap<(u32, u64), tokio::task::JoinHandle<()>> = BTreeMap::new();
     let mut managed = true;
     let mut due = true;
@@ -189,7 +179,6 @@ async fn maintain(service: ServiceWorker, paths: Paths) {
         });
         tokio::select! {
             _ = wake.notify.notified() => {}
-            _ = async { match &mut states { Some(w) => w.changed().await, None => std::future::pending().await } } => managed = true,
             _ = async { match sleep { Some(at) => tokio::time::sleep_until(at).await, None => std::future::pending().await } } => due = true,
         }
     }

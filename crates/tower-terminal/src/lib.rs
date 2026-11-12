@@ -594,6 +594,21 @@ impl ManagedBackend for TerminalBackend {
         })
     }
     fn watch(&self, wake: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        let sessions = self.paths.state.join("sessions");
+        match tower_pal::private_dir(&sessions)
+            .and_then(|_| tower_pal::TreeWatch::new(&sessions, "state.json"))
+        {
+            Ok(mut states) => {
+                let wake = wake.clone();
+                tokio::spawn(async move {
+                    loop {
+                        states.changed().await;
+                        wake();
+                    }
+                });
+            }
+            Err(e) => eprintln!("tower: managed session state is unobservable: {e}"),
+        }
         tokio::spawn(pool::watch(self.paths.clone(), wake));
     }
     fn cleanup(&self, session: &ManagedSession) -> Result<()> {
