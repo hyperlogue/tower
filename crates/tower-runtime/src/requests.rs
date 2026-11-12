@@ -46,6 +46,8 @@ impl LiveRequest {
 #[derive(Default)]
 pub(crate) struct Requests {
     items: Mutex<BTreeMap<String, LiveRequest>>,
+    /// Signals that a reply deadline may have started.
+    pub retired: tokio::sync::Notify,
 }
 impl Requests {
     pub fn insert(&self, mut request: LiveRequest, after_sequence: u64) -> Result<()> {
@@ -148,19 +150,31 @@ impl Requests {
         } else if let Some(r) = items.get_mut(id)
             && revision <= r.wire.request_revision
         {
-            if matches!(state, "answered" | "cancelled" | "stale") {
-                r.peer_retired.get_or_insert_with(Instant::now);
+            if matches!(state, "answered" | "cancelled" | "stale") && r.peer_retired.is_none() {
+                r.peer_retired = Some(Instant::now());
+                self.retired.notify_one();
             }
             r.announced = Some((connection.into(), revision));
         }
         Ok(())
     }
+    /// When a pending request the peer retired stops waiting for its native reply.
+    pub fn reply_deadline(&self) -> Result<Option<Instant>> {
+        Ok(self
+            .items
+            .lock()
+            .map_err(internal)?
+            .values()
+            .filter(|r| r.wire.state == "pending")
+            .filter_map(|r| r.peer_retired)
+            .min()
+            .map(|at| at + Duration::from_secs(30)))
+    }
     pub fn check_reply_timeout(&self) -> Result<()> {
-        if self.items.lock().map_err(internal)?.values().any(|r| {
-            r.wire.state == "pending"
-                && r.peer_retired
-                    .is_some_and(|at| at.elapsed() >= Duration::from_secs(30))
-        }) {
+        if self
+            .reply_deadline()?
+            .is_some_and(|at| at <= Instant::now())
+        {
             return Err(error(
                 "private_reply_lost",
                 "The peer retired a request without a native reply",

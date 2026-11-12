@@ -810,10 +810,34 @@ async fn run_inner(
         ResponseKind::Initialize,
     )
     .await?;
-    let mut tick = tokio::time::interval(Duration::from_millis(100));
     let started = tokio::time::Instant::now();
+    let handle = s.handle;
     let result: Result<()> = async {
         loop {
+            handle.requests.check_reply_timeout()?;
+            if s.text
+                .as_ref()
+                .is_some_and(|b| b.since.elapsed() >= Duration::from_millis(50))
+            {
+                s.flush_text()?;
+            }
+            if !s.ready() && started.elapsed() > Duration::from_secs(60) {
+                return Err(error("native_timeout", "Native initialization timed out"));
+            }
+            while s.ready()
+                && s.active.is_none()
+                && let Some(c) = s.queue.pop_front()
+            {
+                dispatch(ctx, &mut s, &mut input, c).await?;
+            }
+            let due = [
+                handle.requests.reply_deadline()?,
+                s.text.as_ref().map(|b| b.since + Duration::from_millis(50)),
+                (!s.ready()).then_some(started + Duration::from_secs(60)),
+            ]
+            .into_iter()
+            .flatten()
+            .min();
             tokio::select! {biased;
                 command=control.recv()=>{
                     match command {
@@ -850,24 +874,8 @@ async fn run_inner(
                         return Err(error("runtime_lost", "Runtime command channel closed"));
                     }
                 }
-                _=tick.tick()=>{
-                    s.handle.requests.check_reply_timeout()?;
-                    if s.text
-                        .as_ref()
-                        .is_some_and(|b| b.since.elapsed() >= Duration::from_millis(50))
-                    {
-                        s.flush_text()?;
-                    }
-                    if !s.ready() && started.elapsed() > Duration::from_secs(60) {
-                        return Err(error("native_timeout", "Native initialization timed out"));
-                    }
-                    if s.ready()
-                        && s.active.is_none()
-                        && let Some(c) = s.queue.pop_front()
-                    {
-                        dispatch(ctx, &mut s, &mut input, c).await?;
-                    }
-                }
+                _=handle.requests.retired.notified()=>{}
+                _=async { match due { Some(at) => tokio::time::sleep_until(at).await, None => std::future::pending().await } }=>{}
             }
         }
     }
