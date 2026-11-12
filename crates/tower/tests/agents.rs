@@ -33,7 +33,20 @@ impl Fixture {
             std::fs::write(&path, script).unwrap();
             tower_pal::make_executable(&path).unwrap();
         }
-        Self { root }
+        let fixture = Self { root };
+        fixture.config("");
+        fixture
+    }
+    /// Writes daemon config. The process scan is off unless a test enables it:
+    /// it would register agent processes from other tests and the host.
+    fn config(&self, extra: &str) {
+        let dir = self.root.path().join("c/tower");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            format!("[scan]\nenabled=false\n{extra}"),
+        )
+        .unwrap();
     }
     fn command(&self, args: &[&str]) -> Command {
         self.program(env!("CARGO_BIN_EXE_tower-cli"), args)
@@ -182,7 +195,7 @@ fn all_nine_harnesses_report_state_survive_daemon_restart_and_resume() {
     }
     f.call(&["daemon", "stop"]);
     let all = f.call(&["ls", "--all"]);
-    assert_eq!(all.as_array().unwrap().len(), 9);
+    assert_eq!(all.as_array().unwrap().len(), 9, "{all}");
     assert!(
         all.as_array()
             .unwrap()
@@ -656,7 +669,11 @@ fn scanner_does_not_allocate_an_id_for_a_managed_process() {
     let f = Fixture::new();
     let config = f.root.path().join("c/tower");
     std::fs::create_dir_all(&config).unwrap();
-    std::fs::write(config.join("config.toml"), "[scan]\ninterval_s=1\n").unwrap();
+    std::fs::write(
+        config.join("config.toml"),
+        "[scan]\nenabled=true\ninterval_s=1\n",
+    )
+    .unwrap();
     let opened = f.call(&["launch", "claude", "--headless"]);
     let id = opened["id"].as_str().unwrap();
     f.wait(id, "idle");
@@ -683,7 +700,7 @@ fn configured_pty_delivery_uses_the_supervisor_gate_and_rejects_busy_targets() {
     let f = Fixture::new();
     let config = f.root.path().join("c/tower");
     std::fs::create_dir_all(&config).unwrap();
-    std::fs::write(config.join("config.toml"), "[inject.opencode]\npty=true\n").unwrap();
+    f.config("[inject.opencode]\npty=true\n");
     let script = f.root.path().join("bin/opencode");
     std::fs::write(&script,r#"#!/bin/sh
 stty raw -echo
@@ -718,7 +735,7 @@ cat
     assert!(!second.status.success());
     let error: Value = serde_json::from_slice(&second.stdout).unwrap();
     assert_eq!(error["error"]["data"]["reason"], "target_busy_pty");
-    std::fs::write(config.join("config.toml"), "[inject.opencode]\npty=false\n").unwrap();
+    f.config("[inject.opencode]\npty=false\n");
     assert_eq!(f.call(&["get", id])["caps"]["message"], "none");
     f.call(&["kill", id]);
 }
@@ -728,7 +745,7 @@ fn pool_upgrade_nudges_an_agent_that_was_working() {
     let f = Fixture::new();
     let config = f.root.path().join("c/tower");
     std::fs::create_dir_all(&config).unwrap();
-    std::fs::write(config.join("config.toml"), "[inject.opencode]\npty=true\n").unwrap();
+    f.config("[inject.opencode]\npty=true\n");
     let script = f.root.path().join("bin/opencode");
     std::fs::write(&script,r#"#!/bin/sh
 stty raw -echo
@@ -826,12 +843,7 @@ fn terminal_launch_starts_by_default_and_defer_is_explicit() {
 #[test]
 fn non_codex_launch_does_not_load_codex_adapter_settings() {
     let f = Fixture::new();
-    std::fs::create_dir_all(f.root.path().join("c/tower")).unwrap();
-    std::fs::write(
-        f.root.path().join("c/tower/config.toml"),
-        "[codex]\nendpoint=42\n",
-    )
-    .unwrap();
+    f.config("[codex]\nendpoint=42\n");
     let opened = f.call(&["launch", "pi", "--headless"]);
     f.wait(opened["id"].as_str().unwrap(), "idle");
 }
@@ -967,12 +979,7 @@ done
 fn codex_native_mode_uses_hooks_queue_and_its_own_process_without_a_host() {
     let f = Fixture::new();
     native_codex(&f);
-    std::fs::create_dir_all(f.root.path().join("c/tower")).unwrap();
-    std::fs::write(
-        f.root.path().join("c/tower/config.toml"),
-        "[codex]\nendpoint=42\n",
-    )
-    .unwrap();
+    f.config("[codex]\nendpoint=42\n");
     let opened = f.call(&["launch", "codex", "--mode", "native", "--headless"]);
     let id = opened["id"].as_str().unwrap();
     let row = f.wait(id, "idle");
@@ -1192,3 +1199,4 @@ fn unmanaged_codex_rollouts_are_discovered_from_their_writer() {
     child.kill().unwrap();
     child.wait().unwrap();
 }
+
