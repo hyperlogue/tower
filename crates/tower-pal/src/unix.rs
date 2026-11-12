@@ -92,7 +92,10 @@ pub fn private_file(path: &Path, create: bool) -> io::Result<File> {
     if !metadata.is_file() || metadata.uid() != uid() {
         return Err(denied("invalid private file owner or type"));
     }
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    // Changing the mode notifies file watchers, so leave a correct one alone.
+    if metadata.permissions().mode() & 0o7777 != 0o600 {
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
     Ok(file)
 }
 pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
