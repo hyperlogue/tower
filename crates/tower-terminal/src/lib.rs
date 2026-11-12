@@ -29,6 +29,7 @@ pub struct TerminalBackend {
             tower_agents::inventory::InventoryResult,
         )>,
     >,
+    changes: std::sync::OnceLock<tokio::sync::watch::Sender<u64>>,
 }
 impl TerminalBackend {
     pub fn new(paths: Paths) -> Self {
@@ -36,7 +37,37 @@ impl TerminalBackend {
             paths,
             inventory: Default::default(),
             codex_inventory: Default::default(),
+            changes: Default::default(),
         }
+    }
+    /// One pool subscription and state watch shared by every `watch` caller.
+    fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changes
+            .get_or_init(|| {
+                let (changed, _) = tokio::sync::watch::channel(0u64);
+                let bump = {
+                    let changed = changed.clone();
+                    std::sync::Arc::new(move || changed.send_modify(|n| *n = n.wrapping_add(1)))
+                };
+                let sessions = self.paths.state.join("sessions");
+                match tower_pal::private_dir(&sessions)
+                    .and_then(|_| tower_pal::TreeWatch::new(&sessions, "state.json"))
+                {
+                    Ok(mut states) => {
+                        let bump = bump.clone();
+                        tokio::spawn(async move {
+                            loop {
+                                states.changed().await;
+                                bump();
+                            }
+                        });
+                    }
+                    Err(e) => eprintln!("tower: managed session state is unobservable: {e}"),
+                }
+                tokio::spawn(pool::watch(self.paths.clone(), bump));
+                changed
+            })
+            .subscribe()
     }
     fn codex_history(&self, refresh: bool) -> Result<tower_agents::inventory::InventoryResult> {
         let config = tower_agents::codex_service::Config::load(&self.paths)
@@ -594,22 +625,12 @@ impl ManagedBackend for TerminalBackend {
         })
     }
     fn watch(&self, wake: std::sync::Arc<dyn Fn() + Send + Sync>) {
-        let sessions = self.paths.state.join("sessions");
-        match tower_pal::private_dir(&sessions)
-            .and_then(|_| tower_pal::TreeWatch::new(&sessions, "state.json"))
-        {
-            Ok(mut states) => {
-                let wake = wake.clone();
-                tokio::spawn(async move {
-                    loop {
-                        states.changed().await;
-                        wake();
-                    }
-                });
+        let mut changes = self.changes();
+        tokio::spawn(async move {
+            while changes.changed().await.is_ok() {
+                wake();
             }
-            Err(e) => eprintln!("tower: managed session state is unobservable: {e}"),
-        }
-        tokio::spawn(pool::watch(self.paths.clone(), wake));
+        });
     }
     fn cleanup(&self, session: &ManagedSession) -> Result<()> {
         if let Ok(binding) = binding(session)
