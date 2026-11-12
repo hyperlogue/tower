@@ -135,7 +135,18 @@ async fn terminal_launch_attaches_and_recovers_without_replay_or_structured_cont
     .await
     .unwrap();
     assert!(snapshot.to_string().contains("TERMINAL-READY"));
-    let pid = f.rpc("agent.get", json!({"id":id}))["pid"].clone();
+    // The runtime reports the agent's PID on its next observation of the pool.
+    let pid = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let pid = f.rpc("agent.get", json!({"id":id}))["pid"].clone();
+            if pid.is_number() {
+                break pid;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
     for kind in ["prompt", "reply", "configure", "resume"] {
         let unsupported = s
             .call(
@@ -235,6 +246,14 @@ async fn terminal_pool_loss_fences_a_session_that_cannot_resume() {
     let s = Server::start_modes(&f, false, true).await;
     consent(&f);
     let (launch_command, id) = launch(&f, &s, "pool-loss", "pi").await;
+    // Lose the pool only once the agent inside it is running.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !f.root.path().join("pi-starts").exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
     let socket = tower_pal::connect(&f.root.path().join("state/tower/run/pool.sock"))
         .await
         .unwrap();

@@ -390,10 +390,6 @@ async fn managed_adapters_preserve_receipts_permissions_and_continue_across_rest
             "prompt",
             json!({"content":[{"type":"text","text":text}]}),
         );
-        assert_eq!(
-            s.call("command.execute", held).await["result"]["state"],
-            "accepted"
-        );
         let dispatches = f.root.path().join("dispatches");
         let delivered = |text: &str| {
             std::fs::read_to_string(&dispatches)
@@ -403,6 +399,10 @@ async fn managed_adapters_preserve_receipts_permissions_and_continue_across_rest
                 .count()
         };
         let before_held = delivered(text);
+        assert_eq!(
+            s.call("command.execute", held).await["result"]["state"],
+            "accepted"
+        );
         let until = std::time::Instant::now() + Duration::from_secs(10);
         while delivered(text) == before_held
             || f.rpc("agent.get", json!({"id":id}))["status"] != "working"
