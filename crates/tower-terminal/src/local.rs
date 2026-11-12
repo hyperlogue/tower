@@ -7,7 +7,11 @@ use std::{
     io,
     path::{Path, PathBuf},
 };
-use tower_agents::runtime::{AgentSpec, Embedding, LauncherPlan, RuntimeState};
+use tower_agents::{
+    Harness,
+    inventory::Candidate,
+    runtime::{AgentSpec, Embedding, LauncherPlan, RuntimeState},
+};
 use tower_pal::Paths;
 
 pub struct Local {
@@ -79,6 +83,117 @@ impl Local {
         let path = root.join("plan.json");
         tower_pal::write_private(&path, &serde_json::to_vec(&plan)?)?;
         Ok(path)
+    }
+
+    /// Finds a conversation the agent already holds, as the agent's own
+    /// history or the configured Codex app-server records it. Codex in
+    /// app-server mode is asked over its socket: call this off an async
+    /// runtime.
+    pub fn conversation(
+        &self,
+        harness: Harness,
+        mode: Option<&str>,
+        native_id: &str,
+    ) -> io::Result<Candidate> {
+        if harness != Harness::Codex || mode == Some("native") {
+            return tower_agents::inventory::Inventory::default().resolve(
+                &tower_pal::environment(),
+                harness,
+                native_id,
+            );
+        }
+        if !tower_agents::events::native_id(native_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid native session identity",
+            ));
+        }
+        let config = tower_agents::codex_service::Config::endpoint(
+            &self.paths,
+            self.embedding.codex_endpoint.as_deref(),
+        )
+        .map_err(io::Error::other)?;
+        let read = async {
+            let host = tower_agents::codex_host::ensure_configured(&self.paths, config).await?;
+            let mut client =
+                tower_agents::codex_service::Client::connect(&host.config.endpoint).await?;
+            let response = client
+                .request(
+                    "thread/read",
+                    serde_json::json!({"threadId":native_id,"includeTurns":false}),
+                )
+                .await?;
+            Ok::<_, tower_agents::codex_service::Error>(
+                crate::codex_candidate(&response["thread"], &host.config.endpoint)
+                    .filter(|candidate| candidate.native.id == native_id),
+            )
+        };
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?
+            .block_on(tokio::time::timeout(
+                std::time::Duration::from_secs(20),
+                read,
+            ))
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Codex did not answer"))?
+            .map_err(io::Error::other)?
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "native conversation was not found")
+            })
+    }
+
+    /// Records a launch of `id` that continues `conversation` where the agent
+    /// left it, in the directory the conversation ran in.
+    pub fn prepare_conversation(
+        &self,
+        id: &str,
+        conversation: Candidate,
+        mode: Option<String>,
+        args: Vec<String>,
+    ) -> io::Result<PathBuf> {
+        self.prepare(
+            id,
+            AgentSpec {
+                harness: conversation.harness,
+                cwd: conversation.cwd,
+                args,
+                mode,
+                resume: Some(conversation.native),
+                fork: false,
+                native_home: conversation.namespace,
+            },
+        )
+    }
+
+    /// Records a new launch of the ended session `id` that continues its
+    /// conversation with the options it was started with.
+    pub fn prepare_restart(&self, id: &str) -> io::Result<PathBuf> {
+        let unavailable = |reason| io::Error::new(io::ErrorKind::NotFound, reason);
+        let last = self
+            .sessions()?
+            .into_iter()
+            .filter(|s| s.plan.id == id)
+            .max_by_key(|s| s.state.updated_at)
+            .ok_or_else(|| unavailable("session is not recorded"))?;
+        if last.state.private.get("native_resumable") == Some(&serde_json::Value::Bool(false)) {
+            return Err(unavailable("this native conversation is ephemeral"));
+        }
+        let mut spec = last.plan.spec;
+        spec.resume =
+            Some(last.state.native.ok_or_else(|| {
+                unavailable("the agent has not reported a native session identity")
+            })?);
+        spec.native_home = last
+            .state
+            .private
+            .get("native_home")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .or(spec.native_home);
+        spec.cwd = last.state.cwd;
+        spec.args = tower_agents::config::resume_options(spec.harness, &spec.args)?;
+        spec.fork = false;
+        self.prepare(id, spec)
     }
 
     /// Every recorded launch, including finished ones that [`forget`] has

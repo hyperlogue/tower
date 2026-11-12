@@ -140,6 +140,22 @@ async fn embedder_runs_watches_and_stops_a_session_without_daemon_or_pool() {
     let ended = await_session(&local, &mut watch, "exit record", |s| !s.live).await;
     assert_eq!(ended.state.status, "exited");
     assert!(ended.state.stop_requested);
+
+    // A restart keeps the id and continues the conversation the agent named.
+    let plan = local.prepare_restart("one").unwrap();
+    let plan: tower_agents::runtime::LauncherPlan =
+        serde_json::from_slice(&std::fs::read(plan).unwrap()).unwrap();
+    assert_ne!(plan.generation, ended.plan.generation);
+    assert_eq!(plan.spec.resume.unwrap().id, "native-claude");
+    assert_eq!(plan.spec.cwd, work.to_string_lossy());
+    assert!(local.prepare_restart("absent").is_err());
+    assert_eq!(
+        local
+            .conversation(tower_agents::Harness::ClaudeCode, None, "not/an/id")
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::InvalidInput
+    );
     local.forget("one").unwrap();
     assert!(local.sessions().unwrap().is_empty());
 }
