@@ -80,6 +80,14 @@ impl ManagedBackend for Backend {
     fn protocol(&self) -> &str {
         &self.protocol
     }
+    fn watch(&self, wake: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        let mut runtimes = tower_store::table_changes("runtimes");
+        tokio::spawn(async move {
+            while runtimes.changed().await.is_ok() {
+                wake();
+            }
+        });
+    }
     fn harnesses(&self) -> Vec<tower_protocol::HarnessInfo> {
         self.runtime
             .controls()

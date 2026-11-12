@@ -17,6 +17,19 @@ static CHANGES: std::sync::LazyLock<tokio::sync::watch::Sender<u64>> =
 pub fn touch() {
     CHANGES.send_modify(|n| *n = n.wrapping_add(1));
 }
+static TABLES: std::sync::LazyLock<
+    Mutex<std::collections::BTreeMap<String, tokio::sync::watch::Sender<u64>>>,
+> = std::sync::LazyLock::new(Default::default);
+/// Wakes when rows of `table` are written in this process, including writes
+/// later rolled back.
+pub fn table_changes(table: &str) -> tokio::sync::watch::Receiver<u64> {
+    TABLES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(table.to_owned())
+        .or_insert_with(|| tokio::sync::watch::channel(0).0)
+        .subscribe()
+}
 /// Wakes after any database commit or [`touch`] in this process.
 pub fn changes() -> tokio::sync::watch::Receiver<u64> {
     CHANGES.subscribe()
@@ -111,6 +124,11 @@ impl Database {
         conn.commit_hook(Some(|| {
             touch();
             false
+        }))?;
+        conn.update_hook(Some(|_, _: &str, table: &str, _| {
+            if let Some(changes) = TABLES.lock().unwrap_or_else(|e| e.into_inner()).get(table) {
+                changes.send_modify(|n| *n = n.wrapping_add(1));
+            }
         }))?;
         Ok(Self {
             conn: Mutex::new(conn),
