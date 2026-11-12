@@ -53,6 +53,18 @@ pub(crate) fn start(service: ServiceWorker, home: &Path) -> Vec<tokio::task::Joi
     ] {
         tasks.push(tokio::spawn(transcripts(service.clone(), spec)));
     }
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".local/share"));
+    let database = std::env::var("OPENCODE_DB")
+        .ok()
+        .filter(|v| !v.is_empty() && v != ":memory:")
+        .unwrap_or_else(|| "opencode.db".into());
+    tasks.push(tokio::spawn(opencode_sessions(
+        service,
+        data.join("opencode").join(database),
+    )));
     tasks
 }
 
@@ -421,13 +433,25 @@ fn writer_by_directory(
         }
     }?;
     let cwd = std::fs::canonicalize(&cwd).unwrap_or_else(|_| PathBuf::from(cwd));
-    let candidates = harness_processes(spec.executable)
-        .filter(|(_, _, dir)| *dir == cwd)
+    process_in(spec.executable, &cwd, |c| {
+        sessions.values().any(|s| (s.pid, s.start) == c)
+    })
+}
+
+/// The `executable` process running in `cwd`. A process `taken` by another
+/// session counts only when it is the sole candidate: it started a new one.
+fn process_in(
+    executable: &str,
+    cwd: &Path,
+    taken: impl Fn((u32, u64)) -> bool,
+) -> Option<(u32, u64)> {
+    let candidates = harness_processes(executable)
+        .filter(|(_, _, dir)| dir == cwd)
         .map(|(pid, start, _)| (pid, start))
         .collect::<Vec<_>>();
     let free = candidates
         .iter()
-        .filter(|c| !sessions.values().any(|s| (s.pid, s.start) == **c))
+        .filter(|c| !taken(**c))
         .collect::<Vec<_>>();
     match free.as_slice() {
         [only] => Some(**only),
@@ -436,9 +460,10 @@ fn writer_by_directory(
     }
 }
 
-/// Running processes of `executable` that host their own sessions.
+/// Running processes of `executable` that host their own sessions. A launcher
+/// script and the binary it runs count once, as the launcher.
 fn harness_processes(executable: &str) -> impl Iterator<Item = (u32, u64, PathBuf)> {
-    tower_pal::processes()
+    let found = tower_pal::processes()
         .unwrap_or_default()
         .into_iter()
         .filter(move |pid| {
@@ -455,10 +480,16 @@ fn harness_processes(executable: &str) -> impl Iterator<Item = (u32, u64, PathBu
             // A shared Codex app-server hosts sessions for other clients.
             (named && !process.argv.iter().take(3).any(|s| s == "app-server")).then_some((
                 pid,
-                process.identity.start_time,
+                process.identity,
                 process.cwd,
             ))
         })
+        .collect::<Vec<_>>();
+    let pids = found.iter().map(|(pid, ..)| *pid).collect::<BTreeSet<_>>();
+    found
+        .into_iter()
+        .filter(move |(_, identity, _)| !pids.contains(&identity.parent))
+        .map(|(pid, identity, cwd)| (pid, identity.start_time, cwd))
 }
 
 struct Transcript {
@@ -562,6 +593,130 @@ impl Transcript {
             display_name: None,
         })
     }
+}
+
+/// Follows OpenCode's session database. Releases with a `session_v2` table
+/// record when each session turns busy or idle; older ones only record that a
+/// session changed, so their status is unknown.
+async fn opencode_sessions(service: ServiceWorker, database: PathBuf) {
+    let Some(dir) = database.parent().map(Path::to_path_buf) else {
+        return;
+    };
+    if !appear(&dir, "OpenCode sessions").await {
+        return;
+    }
+    let mut wal = database.clone().into_os_string();
+    wal.push("-wal");
+    let mut watch = match tower_pal::FileWatch::new(&[database.clone(), wal.into()]) {
+        Ok(watch) => watch,
+        Err(e) => {
+            eprintln!("tower: OpenCode sessions are unobservable: {e}");
+            return;
+        }
+    };
+    let mut since = 0;
+    // Sessions bound to the live process that runs them, with the last report.
+    let mut bound: BTreeMap<String, (u32, u64, service::NativeSession)> = BTreeMap::new();
+    loop {
+        let path = database.clone();
+        let rows = tokio::task::spawn_blocking(move || opencode_rows(&path, since))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default();
+        bound.retain(|_, (pid, start, _)| {
+            tower_pal::process_identity(*pid).is_ok_and(|p| p.start_time == *start)
+        });
+        for row in rows {
+            since = since.max(row.changed);
+            let writer = match bound.get(&row.id) {
+                Some((pid, start, _)) => Some((*pid, *start)),
+                None => {
+                    let cwd = std::fs::canonicalize(&row.directory)
+                        .unwrap_or_else(|_| PathBuf::from(&row.directory));
+                    process_in("opencode", &cwd, |c| {
+                        bound.values().any(|(pid, start, _)| (*pid, *start) == c)
+                    })
+                }
+            };
+            let Some((pid, start)) = writer else { continue };
+            let found = service::NativeSession {
+                harness: "opencode",
+                pid,
+                start,
+                native: row.id.clone(),
+                cwd: row.directory,
+                status: row.status,
+                display_name: row.title.filter(|t| !t.is_empty()),
+            };
+            if bound.get(&row.id).is_some_and(|(.., last)| *last == found) {
+                continue;
+            }
+            let report = found.clone();
+            if matches!(
+                service
+                    .execute(move |s| s.observe_native_session(report))
+                    .await,
+                Ok(Ok(true))
+            ) {
+                bound.retain(|_, (p, s, _)| (*p, *s) != (pid, start));
+                bound.insert(row.id, (pid, start, found));
+            }
+        }
+        watch.changed().await;
+    }
+}
+
+struct OpencodeRow {
+    id: String,
+    directory: String,
+    title: Option<String>,
+    changed: i64,
+    status: &'static str,
+}
+
+/// The most recently changed top-level session in each directory, among those
+/// changed after `since` (milliseconds).
+fn opencode_rows(database: &Path, since: i64) -> rusqlite::Result<Vec<OpencodeRow>> {
+    let db = rusqlite::Connection::open_with_flags(
+        database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    db.busy_timeout(Duration::from_secs(1))?;
+    let tracked: bool = db.query_row(
+        "SELECT count(*) = 2 FROM pragma_table_info('session_v2') WHERE name IN ('time_busy', 'time_idle')",
+        [],
+        |r| r.get(0),
+    )?;
+    let query = if tracked {
+        "SELECT id, directory, title, max(max(time_updated, coalesce(time_busy, 0), coalesce(time_idle, 0))) AS changed, time_busy, time_idle
+         FROM session_v2
+         WHERE parent_id IS NULL AND time_archived IS NULL
+           AND max(time_updated, coalesce(time_busy, 0), coalesce(time_idle, 0)) > ?1
+         GROUP BY directory"
+    } else {
+        "SELECT id, directory, title, max(time_updated) AS changed, NULL, NULL
+         FROM session
+         WHERE parent_id IS NULL AND time_archived IS NULL AND time_updated > ?1
+         GROUP BY directory"
+    };
+    let mut statement = db.prepare(query)?;
+    let rows = statement.query_map([since], |r| {
+        let busy: Option<i64> = r.get(4)?;
+        let idle: Option<i64> = r.get(5)?;
+        Ok(OpencodeRow {
+            id: r.get(0)?,
+            directory: r.get(1)?,
+            title: r.get(2)?,
+            changed: r.get(3)?,
+            status: match (tracked, busy, idle) {
+                (false, ..) => "unknown",
+                (true, Some(busy), idle) if idle.is_none_or(|idle| busy > idle) => "working",
+                (true, ..) => "idle",
+            },
+        })
+    })?;
+    rows.collect()
 }
 
 #[cfg(test)]

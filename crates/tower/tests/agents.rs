@@ -1201,7 +1201,7 @@ fn unmanaged_codex_rollouts_are_discovered_from_their_writer() {
 }
 
 #[test]
-fn unmanaged_pi_grok_and_reasonix_sessions_are_discovered_from_their_files() {
+fn unmanaged_pi_grok_reasonix_and_opencode_sessions_are_discovered_from_their_files() {
     let f = Fixture::new();
     let home = f.root.path();
     let work = home.join("work");
@@ -1296,7 +1296,28 @@ fn unmanaged_pi_grok_and_reasonix_sessions_are_discovered_from_their_files() {
     append(&dir.join("events.jsonl"), json!({"type":"turn_ended"}));
     find("grok", "01ab", "idle", grok.id());
 
-    for child in [&mut reasonix, &mut pi, &mut grok] {
+    // OpenCode records busy and idle times in its session database.
+    let mut opencode = spawn("opencode", None);
+    let data = home.join(".local/share/opencode");
+    std::fs::create_dir_all(&data).unwrap();
+    let db = rusqlite::Connection::open(data.join("opencode.db")).unwrap();
+    db.execute_batch(
+        "CREATE TABLE session_v2 (id text PRIMARY KEY, parent_id text, directory text NOT NULL,
+           title text, time_updated integer NOT NULL, time_archived integer,
+           time_busy integer, time_idle integer);",
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO session_v2 VALUES ('ses_1', NULL, ?1, 'Fix it', 10, NULL, 11, NULL)",
+        [work.to_str().unwrap()],
+    )
+    .unwrap();
+    find("opencode", "ses_1", "working", opencode.id());
+    db.execute("UPDATE session_v2 SET time_idle = 12", [])
+        .unwrap();
+    find("opencode", "ses_1", "idle", opencode.id());
+
+    for child in [&mut reasonix, &mut pi, &mut grok, &mut opencode] {
         child.kill().unwrap();
         child.wait().unwrap();
     }

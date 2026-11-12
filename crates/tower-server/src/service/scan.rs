@@ -146,6 +146,7 @@ pub(crate) struct ClaudeSession {
     name_source: Option<String>,
 }
 /// A harness session observed from its own files rather than from a hook.
+#[derive(Clone, PartialEq)]
 pub(crate) struct NativeSession {
     pub(crate) harness: &'static str,
     pub(crate) pid: u32,
