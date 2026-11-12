@@ -1200,3 +1200,104 @@ fn unmanaged_codex_rollouts_are_discovered_from_their_writer() {
     child.wait().unwrap();
 }
 
+#[test]
+fn unmanaged_pi_grok_and_reasonix_sessions_are_discovered_from_their_files() {
+    let f = Fixture::new();
+    let home = f.root.path();
+    let work = home.join("work");
+    std::fs::create_dir(&work).unwrap();
+    let standalone = home.join("standalone");
+    std::fs::create_dir(&standalone).unwrap();
+    // Each fake harness holds its first argument open (if any) until stdin closes.
+    let spawn = |name: &str, held: Option<&std::path::Path>| {
+        let bin = standalone.join(name);
+        std::fs::write(&bin, "#!/bin/sh\n[ -n \"$1\" ] && exec 3>>\"$1\"\nread _\n").unwrap();
+        tower_pal::make_executable(&bin).unwrap();
+        let mut command = Command::new(&bin);
+        command.current_dir(&work).stdin(Stdio::piped());
+        if let Some(held) = held {
+            std::fs::create_dir_all(held.parent().unwrap()).unwrap();
+            command.arg(held);
+        }
+        let child = command.spawn().unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        while held.is_some_and(|held| {
+            !tower_pal::open_files(child.id()).is_ok_and(|files| files.iter().any(|f| f == held))
+        }) {
+            assert!(Instant::now() < until, "{name} never opened its file");
+            thread::sleep(Duration::from_millis(20));
+        }
+        child
+    };
+    let find = |harness: &str, native: &str, status: &str, pid: u32| {
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            let all = f.call(&["ls", "--all"]);
+            if all.as_array().unwrap().iter().any(|r| {
+                r["harness"] == harness
+                    && r["native_session_id"] == native
+                    && r["status"] == status
+                    && r["pid"] == pid
+            }) {
+                return;
+            }
+            assert!(Instant::now() < until, "expected {harness} {status}: {all}");
+            thread::sleep(Duration::from_millis(40));
+        }
+    };
+    let append = |path: &std::path::Path, line: Value| {
+        use std::io::Write;
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        writeln!(file, "{line}").unwrap();
+    };
+
+    // Reasonix holds its lease from launch, so the daemon finds it at startup.
+    let lease = home.join(".reasonix/projects/-work/sessions/20261112-1.5-model.jsonl.lease.lock");
+    let mut reasonix = spawn("reasonix", Some(&lease));
+    f.call(&["ls"]);
+    find("reasonix", "20261112-1.5-model", "unknown", reasonix.id());
+
+    // Pi keeps no file open; its session is matched by working directory.
+    let mut pi = spawn("pi", None);
+    let session = home.join(".pi/agent/sessions/--work--/2026-11-12T00-00-00-000Z_p1.jsonl");
+    append(
+        &session,
+        json!({"type":"session","version":3,"id":"p1","cwd":work}),
+    );
+    append(
+        &session,
+        json!({"type":"message","message":{"role":"user"}}),
+    );
+    find("pi", "p1", "working", pi.id());
+    append(
+        &session,
+        json!({"type":"message","message":{"role":"assistant","stopReason":"stop"}}),
+    );
+    find("pi", "p1", "idle", pi.id());
+
+    // Grok holds lock files in its session directory.
+    let dir = home
+        .join(".grok/sessions")
+        .join(work.to_str().unwrap().replace('/', "%2F"))
+        .join("01ab");
+    let mut grok = spawn("grok", Some(&dir.join("chat_history.jsonl.lock")));
+    append(&dir.join("events.jsonl"), json!({"type":"turn_started"}));
+    find("grok", "01ab", "working", grok.id());
+    append(
+        &dir.join("events.jsonl"),
+        json!({"type":"permission_requested"}),
+    );
+    find("grok", "01ab", "waiting_approval", grok.id());
+    append(&dir.join("events.jsonl"), json!({"type":"turn_ended"}));
+    find("grok", "01ab", "idle", grok.id());
+
+    for child in [&mut reasonix, &mut pi, &mut grok] {
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+}

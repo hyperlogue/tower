@@ -76,18 +76,7 @@ where
     let shutdown = Arc::new(Notify::new());
     let mut tasks = JoinSet::new();
     let maintenance = tokio::spawn(maintain(service.clone(), paths.clone()));
-    let claude_dir = std::env::var_os("CLAUDE_CONFIG_DIR")
-        .filter(|v| !v.is_empty())
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| paths.home.join(".claude"))
-        .join("sessions");
-    let claude = tokio::spawn(discovery::claude_sessions(service.clone(), claude_dir));
-    let codex_dir = std::env::var_os("CODEX_HOME")
-        .filter(|v| !v.is_empty())
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| paths.home.join(".codex"))
-        .join("sessions");
-    let codex = tokio::spawn(discovery::codex_rollouts(service.clone(), codex_dir));
+    let discovery = discovery::start(service.clone(), &paths.home);
     let checkout_refresh = tokio::spawn(service.vcs().observe_changes(service.events()));
     let signals = tower_pal::shutdown_signal();
     tokio::pin!(signals);
@@ -120,8 +109,9 @@ where
     http.shutdown().await;
     tasks.abort_all();
     maintenance.abort();
-    claude.abort();
-    codex.abort();
+    for task in &discovery {
+        task.abort();
+    }
     checkout_refresh.abort();
     let _ = checkout_refresh.await;
     while tasks.join_next().await.is_some() {}

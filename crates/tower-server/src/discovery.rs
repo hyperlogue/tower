@@ -1,11 +1,60 @@
 //! Discovers unmanaged agent sessions from the files their harnesses write.
 use crate::{service, worker::ServiceWorker};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     io::{BufRead, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime},
 };
+
+/// Starts one discovery task per harness that leaves followable files.
+pub(crate) fn start(service: ServiceWorker, home: &Path) -> Vec<tokio::task::JoinHandle<()>> {
+    let dir = |var: &str, default: &str| {
+        std::env::var_os(var)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(default))
+    };
+    let mut tasks = vec![tokio::spawn(claude_sessions(
+        service.clone(),
+        dir("CLAUDE_CONFIG_DIR", ".claude").join("sessions"),
+    ))];
+    for spec in [
+        Spec {
+            harness: "codex",
+            executable: "codex",
+            root: dir("CODEX_HOME", ".codex").join("sessions"),
+            format: Format::Codex,
+        },
+        Spec {
+            harness: "pi",
+            executable: "pi",
+            root: dir("PI_CODING_AGENT_DIR", ".pi/agent").join("sessions"),
+            format: Format::Pi,
+        },
+        Spec {
+            harness: "omp",
+            executable: "omp",
+            root: home.join(".omp/agent/sessions"),
+            format: Format::Pi,
+        },
+        Spec {
+            harness: "grok",
+            executable: "grok",
+            root: dir("GROK_HOME", ".grok").join("sessions"),
+            format: Format::Grok,
+        },
+        Spec {
+            harness: "reasonix",
+            executable: "reasonix",
+            root: dir("REASONIX_HOME", ".reasonix").join("projects"),
+            format: Format::Reasonix,
+        },
+    ] {
+        tasks.push(tokio::spawn(transcripts(service.clone(), spec)));
+    }
+    tasks
+}
 
 /// Waits until `dir` exists. Returns false when it cannot be observed.
 async fn appear(dir: &Path, what: &str) -> bool {
@@ -23,7 +72,7 @@ async fn appear(dir: &Path, what: &str) -> bool {
 }
 
 /// Follows `~/.claude/sessions/<pid>.json`, which Claude Code writes at launch.
-pub(crate) async fn claude_sessions(service: ServiceWorker, dir: PathBuf) {
+async fn claude_sessions(service: ServiceWorker, dir: PathBuf) {
     if !appear(&dir, "Claude sessions").await {
         return;
     }
@@ -67,23 +116,187 @@ pub(crate) async fn claude_sessions(service: ServiceWorker, dir: PathBuf) {
     }
 }
 
-/// Follows Codex rollouts under `$CODEX_HOME/sessions`. A rollout names no
-/// process, so the writer is the standalone Codex process holding it open.
-pub(crate) async fn codex_rollouts(service: ServiceWorker, root: PathBuf) {
-    if !appear(&root, "Codex rollouts").await {
+/// A harness transcript layout that Tower can follow without hooks.
+#[derive(Clone, Copy, PartialEq)]
+enum Format {
+    /// `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl`, held open by its writer.
+    Codex,
+    /// `<agent>/sessions/<cwd>/<time>_<id>.jsonl` (Pi and its omp fork).
+    Pi,
+    /// `$GROK_HOME/sessions/<cwd>/<id>/events.jsonl`.
+    Grok,
+    /// `$REASONIX_HOME/projects/<cwd>/sessions/<id>.jsonl.lease.lock`, held from launch.
+    Reasonix,
+}
+struct Spec {
+    harness: &'static str,
+    executable: &'static str,
+    root: PathBuf,
+    format: Format,
+}
+impl Format {
+    /// The followed file for a path below `root`, if it belongs to a session.
+    fn tracked(self, root: &Path, path: &Path) -> Option<PathBuf> {
+        let rest = path.strip_prefix(root).ok()?;
+        let parts = rest.iter().collect::<Vec<_>>();
+        let name = path.file_name()?.to_str()?;
+        match self {
+            Format::Codex => (name.starts_with("rollout-") && name.ends_with(".jsonl"))
+                .then(|| path.to_path_buf()),
+            Format::Pi => {
+                (parts.len() == 2 && name.ends_with(".jsonl")).then(|| path.to_path_buf())
+            }
+            // Any file a running Grok holds in its session directory names the session.
+            Format::Grok => {
+                (parts.len() >= 3).then(|| root.join(parts[0]).join(parts[1]).join("events.jsonl"))
+            }
+            Format::Reasonix => {
+                (parts.len() == 3 && parts[1] == "sessions" && name.ends_with(".jsonl.lease.lock"))
+                    .then(|| path.to_path_buf())
+            }
+        }
+    }
+    /// Whether a file is only ever written by a process that holds it open.
+    fn exact(self) -> bool {
+        matches!(self, Format::Codex | Format::Reasonix)
+    }
+    /// Native ID and working directory known without reading lines.
+    fn named(self, path: &Path) -> Option<(String, Option<String>)> {
+        match self {
+            Format::Grok => {
+                let session = path.parent()?;
+                let cwd = percent_decode(session.parent()?.file_name()?.to_str()?)?;
+                Some((session.file_name()?.to_str()?.to_owned(), Some(cwd)))
+            }
+            Format::Reasonix => Some((
+                path.file_name()?
+                    .to_str()?
+                    .strip_suffix(".jsonl.lease.lock")?
+                    .to_owned(),
+                None,
+            )),
+            Format::Codex | Format::Pi => None,
+        }
+    }
+    /// Native ID and working directory from the first line.
+    fn header(self, line: &[u8]) -> Option<(String, Option<String>)> {
+        let value: serde_json::Value = serde_json::from_slice(line).ok()?;
+        let (id, cwd) = match self {
+            Format::Codex => {
+                let payload = (value["type"] == "session_meta").then_some(&value["payload"])?;
+                // Subagent threads run inside their parent's process.
+                payload["source"].is_string().then_some(())?;
+                (&payload["id"], &payload["cwd"])
+            }
+            Format::Pi => {
+                (value["type"] == "session").then_some(())?;
+                (&value["id"], &value["cwd"])
+            }
+            Format::Grok | Format::Reasonix => return None,
+        };
+        Some((id.as_str()?.to_owned(), Some(cwd.as_str()?.to_owned())))
+    }
+    fn initial(self) -> &'static str {
+        if self == Format::Reasonix {
+            "unknown"
+        } else {
+            "idle"
+        }
+    }
+    fn status(self, line: &[u8]) -> Option<&'static str> {
+        let text = std::str::from_utf8(line).ok()?;
+        let has = |kind: &str| text.contains(&format!("\"type\":\"{kind}\""));
+        match self {
+            Format::Codex => {
+                if !text.contains("\"event_msg\"") {
+                    return None;
+                }
+                let kind = ["task_started", "task_complete", "turn_aborted"]
+                    .into_iter()
+                    .find(|k| has(k))?;
+                let value: serde_json::Value = serde_json::from_str(text).ok()?;
+                (value["type"] == "event_msg" && value["payload"]["type"] == kind).then_some(
+                    if kind == "task_started" {
+                        "working"
+                    } else {
+                        "idle"
+                    },
+                )
+            }
+            Format::Pi => {
+                if !has("message") {
+                    return None;
+                }
+                let value: serde_json::Value = serde_json::from_str(text).ok()?;
+                if value["type"] != "message" {
+                    return None;
+                }
+                let message = &value["message"];
+                match message["role"].as_str()? {
+                    "user" | "toolResult" => Some("working"),
+                    "assistant" if message["stopReason"] == "toolUse" => Some("working"),
+                    "assistant" => Some("idle"),
+                    _ => None,
+                }
+            }
+            Format::Grok => {
+                let kind = [
+                    "turn_started",
+                    "turn_ended",
+                    "permission_requested",
+                    "permission_resolved",
+                ]
+                .into_iter()
+                .find(|k| has(k))?;
+                let value: serde_json::Value = serde_json::from_str(text).ok()?;
+                (value["type"] == kind).then_some(match kind {
+                    "turn_ended" => "idle",
+                    "permission_requested" => "waiting_approval",
+                    _ => "working",
+                })
+            }
+            Format::Reasonix => None,
+        }
+    }
+}
+
+fn percent_decode(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = std::str::from_utf8(bytes.get(i + 1..i + 3)?).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Follows one harness's transcripts and reports the sessions they belong to.
+/// Transcripts name no process: the writer is the harness process holding the
+/// file open or, for harnesses that close between writes, the only otherwise
+/// unclaimed harness process in the session's directory.
+async fn transcripts(service: ServiceWorker, spec: Spec) {
+    let what = format!("{} sessions", spec.harness);
+    if !appear(&spec.root, &what).await {
         return;
     }
-    let mut watch = match tower_pal::PathWatch::new(&root) {
+    let mut watch = match tower_pal::PathWatch::new(&spec.root) {
         Ok(watch) => watch,
         Err(e) => {
-            eprintln!("tower: Codex rollouts are unobservable: {e}");
+            eprintln!("tower: {what} are unobservable: {e}");
             return;
         }
     };
-    let root = std::fs::canonicalize(&root).unwrap_or(root);
-    let mut rollouts: BTreeMap<PathBuf, Rollout> = BTreeMap::new();
-    // Rollouts written by shared app-servers or Tower itself have no standalone
-    // writer; look again only after a while so their writes stay cheap.
+    let root = std::fs::canonicalize(&spec.root).unwrap_or_else(|_| spec.root.clone());
+    let mut sessions: BTreeMap<PathBuf, Transcript> = BTreeMap::new();
+    // Files with no standalone writer (shared app-servers, Tower itself, or an
+    // ambiguous directory) are looked at again only after a while.
     let mut unheld: BTreeMap<PathBuf, Instant> = BTreeMap::new();
     let mut changed = None;
     loop {
@@ -92,101 +305,181 @@ pub(crate) async fn codex_rollouts(service: ServiceWorker, root: PathBuf) {
             Some(paths) => paths,
             None => {
                 unheld.clear();
-                holders = Some(held_rollouts(&root));
-                holders
-                    .iter()
-                    .flat_map(|h| h.keys().cloned())
-                    .collect::<std::collections::BTreeSet<_>>()
+                let held = held_files(&spec, &root);
+                let mut paths = held.keys().cloned().collect::<BTreeSet<_>>();
+                if !spec.format.exact() {
+                    paths.extend(newest_per_directory(&spec, &root));
+                }
+                holders = Some(held);
+                paths
             }
         };
         unheld.retain(|_, at| at.elapsed() < Duration::from_secs(2));
+        let paths = paths
+            .iter()
+            .filter_map(|p| spec.format.tracked(&root, p))
+            .collect::<BTreeSet<_>>();
         for path in paths {
-            if !is_rollout(&root, &path) || unheld.contains_key(&path) {
+            if unheld.contains_key(&path) {
                 continue;
             }
-            let current = rollouts.remove(&path).filter(Rollout::alive);
-            let Some(mut rollout) = current.or_else(|| {
-                let (pid, start) = *holders
-                    .get_or_insert_with(|| held_rollouts(&root))
-                    .get(&path)?;
-                Some(Rollout::new(pid, start))
-            }) else {
-                // A new file can be seen before its creator's descriptor is installed.
-                if std::fs::metadata(&path).is_ok_and(|m| m.len() > 0) {
-                    unheld.insert(path, Instant::now());
+            let current = sessions.remove(&path).filter(Transcript::alive);
+            let mut session = match current {
+                Some(session) => session,
+                None => {
+                    let held = holders.get_or_insert_with(|| held_files(&spec, &root));
+                    let writer = match held.get(&path) {
+                        Some(&writer) => Some(writer),
+                        None if spec.format.exact() => None,
+                        None => writer_by_directory(&spec, &path, &sessions),
+                    };
+                    let Some((pid, start)) = writer else {
+                        // A new file can be seen before its creator's descriptor is installed.
+                        if std::fs::metadata(&path).is_ok_and(|m| m.len() > 0) {
+                            unheld.insert(path, Instant::now());
+                        }
+                        continue;
+                    };
+                    Transcript::new(spec.format, pid, start)
                 }
-                continue;
             };
-            if let Some(session) = rollout.read(&path) {
+            if let Some(found) = session.read(spec.harness, &path) {
                 let accepted = service
-                    .execute(move |s| s.observe_native_session(session))
+                    .execute(move |s| s.observe_native_session(found))
                     .await;
-                rollout.ignored = !matches!(accepted, Ok(Ok(true)));
+                session.ignored = !matches!(accepted, Ok(Ok(true)));
             }
-            rollouts.insert(path, rollout);
+            sessions.insert(path, session);
         }
-        rollouts.retain(|_, r| r.alive());
+        sessions.retain(|_, s| s.alive());
         changed = watch.changed().await;
     }
 }
 
-fn is_rollout(root: &Path, path: &Path) -> bool {
-    path.starts_with(root)
-        && path.extension().is_some_and(|e| e == "jsonl")
-        && path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.starts_with("rollout-"))
-}
-
-/// Rollouts open in running standalone Codex processes, with their holder.
-fn held_rollouts(root: &Path) -> BTreeMap<PathBuf, (u32, u64)> {
-    codex_processes()
-        .flat_map(|(pid, start)| {
+/// Followed files open in running harness processes, with their holder.
+fn held_files(spec: &Spec, root: &Path) -> BTreeMap<PathBuf, (u32, u64)> {
+    harness_processes(spec.executable)
+        .flat_map(|(pid, start, _)| {
             tower_pal::open_files(pid)
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|path| is_rollout(root, path))
+                .filter_map(|path| spec.format.tracked(root, &path))
                 .map(move |path| (path, (pid, start)))
         })
         .collect()
 }
 
-/// Codex processes that run their own sessions, excluding shared app-servers.
-fn codex_processes() -> impl Iterator<Item = (u32, u64)> {
+/// The most recently written transcript in each working directory, which is
+/// the one a running harness there would be appending to.
+fn newest_per_directory(spec: &Spec, root: &Path) -> Vec<PathBuf> {
+    let entries = |dir: &Path| {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .take(100_000)
+            .map(|e| e.path())
+            .collect::<Vec<_>>()
+    };
+    let modified = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
+    entries(root)
+        .into_iter()
+        .filter(|dir| dir.is_dir())
+        .filter_map(|dir| {
+            entries(&dir)
+                .into_iter()
+                .filter_map(|path| {
+                    let tracked = spec
+                        .format
+                        .tracked(root, &path)
+                        .or_else(|| spec.format.tracked(root, &path.join("events.jsonl")))?;
+                    Some((modified(&tracked)?, tracked))
+                })
+                .max()
+                .map(|(_, path)| path)
+        })
+        .collect()
+}
+
+/// The harness process in the transcript's working directory. A process already
+/// following another transcript counts only when it is the sole candidate: it
+/// started a new conversation.
+fn writer_by_directory(
+    spec: &Spec,
+    path: &Path,
+    sessions: &BTreeMap<PathBuf, Transcript>,
+) -> Option<(u32, u64)> {
+    let cwd = match spec.format.named(path) {
+        Some((_, cwd)) => cwd,
+        None => {
+            let mut first = Vec::new();
+            std::io::BufReader::new(std::fs::File::open(path).ok()?)
+                .take(1 << 20)
+                .read_until(b'\n', &mut first)
+                .ok()?;
+            spec.format.header(&first)?.1
+        }
+    }?;
+    let cwd = std::fs::canonicalize(&cwd).unwrap_or_else(|_| PathBuf::from(cwd));
+    let candidates = harness_processes(spec.executable)
+        .filter(|(_, _, dir)| *dir == cwd)
+        .map(|(pid, start, _)| (pid, start))
+        .collect::<Vec<_>>();
+    let free = candidates
+        .iter()
+        .filter(|c| !sessions.values().any(|s| (s.pid, s.start) == **c))
+        .collect::<Vec<_>>();
+    match free.as_slice() {
+        [only] => Some(**only),
+        [] if candidates.len() == 1 => Some(candidates[0]),
+        _ => None,
+    }
+}
+
+/// Running processes of `executable` that host their own sessions.
+fn harness_processes(executable: &str) -> impl Iterator<Item = (u32, u64, PathBuf)> {
     tower_pal::processes()
         .unwrap_or_default()
         .into_iter()
-        .filter(|pid| tower_pal::process_name(*pid).is_ok_and(|n| n == "codex"))
-        .filter_map(|pid| {
+        .filter(move |pid| {
+            tower_pal::process_name(*pid)
+                .is_ok_and(|n| n == executable || matches!(n.as_str(), "node" | "bun"))
+        })
+        .filter_map(move |pid| {
             let process = tower_pal::inspect_process(pid).ok()?;
-            let codex = process
+            let named = process
                 .argv
                 .iter()
                 .take(2)
-                .any(|arg| Path::new(arg).file_name().is_some_and(|n| n == "codex"));
-            (codex && !process.argv.iter().take(3).any(|s| s == "app-server"))
-                .then_some((pid, process.identity.start_time))
+                .any(|arg| Path::new(arg).file_name().is_some_and(|n| n == executable));
+            // A shared Codex app-server hosts sessions for other clients.
+            (named && !process.argv.iter().take(3).any(|s| s == "app-server")).then_some((
+                pid,
+                process.identity.start_time,
+                process.cwd,
+            ))
         })
 }
 
-struct Rollout {
+struct Transcript {
+    format: Format,
     pid: u32,
     start: u64,
     offset: u64,
-    meta: Option<(String, String)>,
+    identity: Option<(String, Option<String>)>,
     status: &'static str,
     reported: Option<&'static str>,
     ignored: bool,
 }
-impl Rollout {
-    fn new(pid: u32, start: u64) -> Self {
+impl Transcript {
+    fn new(format: Format, pid: u32, start: u64) -> Self {
         Self {
+            format,
             pid,
             start,
             offset: 0,
-            meta: None,
-            status: "idle",
+            identity: None,
+            status: format.initial(),
             reported: None,
             ignored: false,
         }
@@ -195,26 +488,35 @@ impl Rollout {
         tower_pal::process_identity(self.pid).is_ok_and(|p| p.start_time == self.start)
     }
     /// Reads appended lines and returns the session when its status changed.
-    fn read(&mut self, path: &Path) -> Option<service::NativeSession> {
+    fn read(&mut self, harness: &'static str, path: &Path) -> Option<service::NativeSession> {
         const TAIL: u64 = 1 << 20;
-        let mut file = std::fs::File::open(path).ok()?;
-        let len = file.metadata().ok()?.len();
-        if len < self.offset {
-            *self = Self::new(self.pid, self.start);
+        if self.identity.is_none() {
+            self.identity = self.format.named(path);
         }
-        let mut reader = std::io::BufReader::new(&mut file);
-        if self.meta.is_none() {
-            let mut first = Vec::new();
-            reader
-                .by_ref()
-                .take(TAIL)
-                .read_until(b'\n', &mut first)
-                .ok()?;
-            if first.last() != Some(&b'\n') {
-                return None;
+        if self.format != Format::Reasonix {
+            let mut file = std::fs::File::open(path).ok()?;
+            let len = file.metadata().ok()?.len();
+            if len < self.offset {
+                let named = self.format.named(path);
+                *self = Self {
+                    identity: named,
+                    ..Self::new(self.format, self.pid, self.start)
+                };
             }
-            self.meta = Some(session_meta(&first)?);
-            self.offset = first.len() as u64;
+            let mut reader = std::io::BufReader::new(&mut file);
+            if self.identity.is_none() {
+                let mut first = Vec::new();
+                reader
+                    .by_ref()
+                    .take(TAIL)
+                    .read_until(b'\n', &mut first)
+                    .ok()?;
+                if first.last() != Some(&b'\n') {
+                    return None;
+                }
+                self.identity = Some(self.format.header(&first)?);
+                self.offset = first.len() as u64;
+            }
             if len.saturating_sub(self.offset) > TAIL {
                 self.offset = len - TAIL;
                 reader.seek(SeekFrom::Start(self.offset)).ok()?;
@@ -222,28 +524,36 @@ impl Rollout {
                 reader.read_until(b'\n', &mut partial).ok()?;
                 self.offset += partial.len() as u64;
             }
-        }
-        reader.seek(SeekFrom::Start(self.offset)).ok()?;
-        let mut line = Vec::new();
-        loop {
-            line.clear();
-            match reader.read_until(b'\n', &mut line) {
-                Ok(n) if n > 0 && line.last() == Some(&b'\n') => {
-                    self.offset += n as u64;
-                    if let Some(status) = turn_status(&line) {
-                        self.status = status;
+            reader.seek(SeekFrom::Start(self.offset)).ok()?;
+            let mut line = Vec::new();
+            loop {
+                line.clear();
+                match reader.read_until(b'\n', &mut line) {
+                    Ok(n) if n > 0 && line.last() == Some(&b'\n') => {
+                        self.offset += n as u64;
+                        if let Some(status) = self.format.status(&line) {
+                            self.status = status;
+                        }
                     }
+                    _ => break,
                 }
-                _ => break,
             }
         }
         if self.ignored || self.reported == Some(self.status) {
             return None;
         }
+        let (native, cwd) = self.identity.clone()?;
+        let cwd = match cwd {
+            Some(cwd) => cwd,
+            None => tower_pal::inspect_process(self.pid)
+                .ok()?
+                .cwd
+                .to_string_lossy()
+                .into_owned(),
+        };
         self.reported = Some(self.status);
-        let (native, cwd) = self.meta.clone()?;
         Some(service::NativeSession {
-            harness: "codex",
+            harness,
             pid: self.pid,
             start: self.start,
             native,
@@ -254,53 +564,100 @@ impl Rollout {
     }
 }
 
-/// The thread ID and working directory of a top-level (non-subagent) rollout.
-fn session_meta(line: &[u8]) -> Option<(String, String)> {
-    let value: serde_json::Value = serde_json::from_slice(line).ok()?;
-    let payload = (value["type"] == "session_meta").then_some(&value["payload"])?;
-    payload["source"].is_string().then_some(())?;
-    Some((
-        payload["id"].as_str()?.to_owned(),
-        payload["cwd"].as_str()?.to_owned(),
-    ))
-}
-
-fn turn_status(line: &[u8]) -> Option<&'static str> {
-    let text = std::str::from_utf8(line).ok()?;
-    if !text.contains("\"event_msg\"") {
-        return None;
-    }
-    let kind = ["task_started", "task_complete", "turn_aborted"]
-        .into_iter()
-        .find(|k| text.contains(&format!("\"type\":\"{k}\"")))?;
-    let value: serde_json::Value = serde_json::from_str(text).ok()?;
-    (value["type"] == "event_msg" && value["payload"]["type"] == kind).then_some(
-        if kind == "task_started" {
-            "working"
-        } else {
-            "idle"
-        },
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
-    fn rollout_lines_yield_identity_and_turn_status() {
+    fn transcript_lines_yield_identity_and_turn_status() {
+        let codex = Format::Codex;
         let meta = br#"{"type":"session_meta","payload":{"id":"t1","cwd":"/w","source":"cli"}}"#;
-        assert_eq!(session_meta(meta), Some(("t1".into(), "/w".into())));
+        assert_eq!(codex.header(meta), Some(("t1".into(), Some("/w".into()))));
         let child = br#"{"type":"session_meta","payload":{"id":"t2","cwd":"/w","source":{"subagent":"review"}}}"#;
-        assert_eq!(session_meta(child), None);
+        assert_eq!(codex.header(child), None);
         let event = |kind: &str| format!(r#"{{"type":"event_msg","payload":{{"type":"{kind}"}}}}"#);
         assert_eq!(
-            turn_status(event("task_started").as_bytes()),
+            codex.status(event("task_started").as_bytes()),
             Some("working")
         );
-        assert_eq!(turn_status(event("task_complete").as_bytes()), Some("idle"));
-        assert_eq!(turn_status(event("turn_aborted").as_bytes()), Some("idle"));
-        assert_eq!(turn_status(event("token_count").as_bytes()), None);
+        assert_eq!(
+            codex.status(event("task_complete").as_bytes()),
+            Some("idle")
+        );
+        assert_eq!(codex.status(event("turn_aborted").as_bytes()), Some("idle"));
+        assert_eq!(codex.status(event("token_count").as_bytes()), None);
         let item = br#"{"type":"response_item","payload":{"text":"\"type\":\"task_started\""}}"#;
-        assert_eq!(turn_status(item), None);
+        assert_eq!(codex.status(item), None);
+
+        let pi = Format::Pi;
+        let header = br#"{"type":"session","version":3,"id":"p1","cwd":"/w"}"#;
+        assert_eq!(pi.header(header), Some(("p1".into(), Some("/w".into()))));
+        let message = |role: &str, stop: &str| {
+            format!(r#"{{"type":"message","message":{{"role":"{role}","stopReason":"{stop}"}}}}"#)
+        };
+        assert_eq!(pi.status(message("user", "").as_bytes()), Some("working"));
+        assert_eq!(
+            pi.status(message("assistant", "toolUse").as_bytes()),
+            Some("working")
+        );
+        assert_eq!(
+            pi.status(message("assistant", "stop").as_bytes()),
+            Some("idle")
+        );
+        assert_eq!(
+            pi.status(message("assistant", "aborted").as_bytes()),
+            Some("idle")
+        );
+
+        let grok = Format::Grok;
+        let event = |kind: &str| format!(r#"{{"ts":"t","type":"{kind}"}}"#);
+        assert_eq!(
+            grok.status(event("turn_started").as_bytes()),
+            Some("working")
+        );
+        assert_eq!(
+            grok.status(event("permission_requested").as_bytes()),
+            Some("waiting_approval")
+        );
+        assert_eq!(
+            grok.status(event("permission_resolved").as_bytes()),
+            Some("working")
+        );
+        assert_eq!(grok.status(event("turn_ended").as_bytes()), Some("idle"));
+        assert_eq!(grok.status(event("phase_changed").as_bytes()), None);
+    }
+    #[test]
+    fn layouts_map_files_to_sessions() {
+        let root = Path::new("/h/sessions");
+        let grok = Format::Grok;
+        let lock = root.join("%2Fw%2Fa b/01ab/chat_history.jsonl.lock");
+        let events = root.join("%2Fw%2Fa b/01ab/events.jsonl");
+        assert_eq!(grok.tracked(root, &lock), Some(events.clone()));
+        assert_eq!(
+            grok.tracked(root, &root.join("%2Fw/prompt_history.jsonl")),
+            None
+        );
+        assert_eq!(
+            grok.named(&events),
+            Some(("01ab".into(), Some("/w/a b".into())))
+        );
+        let reasonix = Format::Reasonix;
+        let root = Path::new("/h/projects");
+        let lease = root.join("-w/sessions/20261112-1.2-m.jsonl.lease.lock");
+        assert_eq!(reasonix.tracked(root, &lease), Some(lease.clone()));
+        assert_eq!(
+            reasonix.named(&lease),
+            Some(("20261112-1.2-m".into(), None))
+        );
+        assert_eq!(
+            reasonix.tracked(root, &root.join("-w/sessions/x.jsonl")),
+            None
+        );
+        let pi = Format::Pi;
+        let root = Path::new("/h/agent/sessions");
+        assert!(pi.tracked(root, &root.join("--w--/t_p1.jsonl")).is_some());
+        assert!(
+            pi.tracked(root, &root.join("--w--/sub/t_p1.jsonl"))
+                .is_none()
+        );
     }
 }
