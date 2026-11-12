@@ -846,6 +846,25 @@ impl Service {
                 detail.insert(key.into(), s.into());
             }
         }
+        // The hook already cut these to one display line each; the bounds
+        // keep a conversation from being stored through this path.
+        let line = |v: &serde_json::Value, max| {
+            v.as_str()
+                .filter(|s| s.chars().count() <= max && !s.chars().any(char::is_control))
+                .map(str::to_owned)
+        };
+        if let Some(prompt) = line(&p.detail["last_prompt"], 500) {
+            detail.insert("last_prompt".into(), prompt.into());
+        }
+        if let Some(commands) = p.detail["background_commands"].as_array()
+            && commands.len() <= 16
+            && let Some(commands) = commands
+                .iter()
+                .map(|c| line(c, 200))
+                .collect::<Option<Vec<_>>>()
+        {
+            detail.insert("background_commands".into(), commands.into());
+        }
         for key in ["effort", "phase"] {
             if p.detail.get(key).is_some_and(serde_json::Value::is_null) {
                 detail.insert(key.into(), serde_json::Value::Null);

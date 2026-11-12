@@ -73,6 +73,12 @@ pub struct AgentDetail {
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub background_jobs: Option<u32>,
+    /// The start of the user's latest prompt, never the conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_prompt: Option<String>,
+    /// What each live background job runs, while the agent rests on them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub background_commands: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -32,28 +32,37 @@ impl AgentDefinition for Definition {
         value: &serde_json::Value,
         event: &mut crate::events::AgentEvent,
     ) {
-        if let Some(tasks) = value.get("backgroundTasks").and_then(Value::as_array) {
-            event.background_jobs = Some(
-                tasks
-                    .iter()
-                    .filter(|t| {
-                        !matches!(
-                            t.get("status").and_then(Value::as_str),
-                            Some("completed" | "failed" | "cancelled")
-                        )
-                    })
-                    .count()
-                    .min(u32::MAX as usize) as u32,
-            );
+        let tasks = value.get("backgroundTasks").and_then(Value::as_array);
+        let crons = value.get("sessionCrons").and_then(Value::as_array);
+        if tasks.is_none() && crons.is_none() {
+            return;
         }
-        if let Some(crons) = value.get("sessionCrons").and_then(Value::as_array) {
-            event.background_jobs = Some(
-                event
-                    .background_jobs
-                    .unwrap_or(0)
-                    .saturating_add(crons.len().min(u32::MAX as usize) as u32),
-            );
-        }
+        let text = |value: &Value, keys: &[&str]| {
+            keys.iter()
+                .find_map(|key| value.get(key).and_then(Value::as_str))
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_owned)
+        };
+        let tasks = tasks.into_iter().flatten().filter(|t| {
+            !matches!(
+                t.get("status").and_then(Value::as_str),
+                Some("completed" | "failed" | "cancelled")
+            )
+        });
+        let named: Vec<_> = tasks
+            .map(|t| {
+                text(t, &["command", "description", "agentType", "type"])
+                    .unwrap_or_else(|| "task".into())
+            })
+            .chain(
+                crons
+                    .into_iter()
+                    .flatten()
+                    .map(|c| text(c, &["prompt", "schedule"]).unwrap_or_else(|| "loop".into())),
+            )
+            .collect();
+        event.background_jobs = Some(named.len().min(u32::MAX as usize) as u32);
+        event.background_commands = Some(named);
     }
     fn hook_session(&self, _env: &Environment) -> Box<dyn crate::hook::HookSession> {
         Box::new(crate::hook::Stateless)

@@ -93,6 +93,15 @@ pub fn report(harness: &str, event: &str) -> Result<()> {
         _ => None,
     };
     let mut report = json!({"harness":h.id(),"native_session_id":native,"pid":found,"cwd":cwd,"display_name":parsed.title,"kind":parsed.kind,"status":status,"detail":{"last_tool":parsed.tool,"model":parsed.model,"effort":parsed.effort,"phase":phase,"context_tokens":parsed.context_tokens},"delivery":endpoint});
+    let detail = report["detail"].as_object_mut().unwrap();
+    if let Some(prompt) = &parsed.prompt {
+        detail.insert("last_prompt".into(), json!(prompt));
+    }
+    if let Some(commands) = &parsed.background_commands {
+        detail.insert("background_commands".into(), json!(commands));
+    } else if parsed.kind == EventKind::Working {
+        detail.insert("background_commands".into(), json!([]));
+    }
     if parsed.effort.is_none() && !parsed.clear_effort {
         report["detail"].as_object_mut().unwrap().remove("effort");
     }

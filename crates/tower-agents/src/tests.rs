@@ -198,6 +198,77 @@ fn state() -> RuntimeState {
     }
 }
 #[test]
+fn state_keeps_one_line_of_the_last_prompt_and_live_background_commands() {
+    let mut s = state();
+    let apply = |s: &mut RuntimeState, h, event, payload: Value| {
+        events::apply(
+            s,
+            events::parse(h, event, &serde_json::to_vec(&payload).unwrap()).unwrap(),
+            42,
+        )
+    };
+    let long = format!("fix the\n  parser\t{}", "x".repeat(600));
+    apply(
+        &mut s,
+        Harness::ClaudeCode,
+        "UserPromptSubmit",
+        json!({"session_id":"root","prompt":long}),
+    );
+    let prompt = s.detail.last_prompt.clone().unwrap();
+    assert!(prompt.starts_with("fix the parser x"));
+    assert_eq!(prompt.chars().count(), 500);
+    apply(
+        &mut s,
+        Harness::ClaudeCode,
+        "PreToolUse",
+        json!({"session_id":"root","tool_name":"Bash","prompt":"tool-body"}),
+    );
+    assert_eq!(s.detail.last_prompt.as_deref(), Some(prompt.as_str()));
+
+    let mut s = state();
+    s.harness = Harness::Grok;
+    apply(
+        &mut s,
+        Harness::Grok,
+        "Stop",
+        json!({"sessionId":"root","backgroundTasks":[
+            {"type":"shell","status":"running","command":"npm run\ndev"},
+            {"type":"shell","status":"completed","command":"cargo build"},
+            {"type":"subagent","description":"refactor the parser"}
+        ],"sessionCrons":[{"schedule":"*/5 * * * *"}]}),
+    );
+    assert_eq!(s.detail.phase.as_deref(), Some("background"));
+    assert_eq!(s.detail.background_jobs, Some(3));
+    assert_eq!(
+        s.detail.background_commands,
+        ["*/5 * * * *", "npm run dev", "refactor the parser"]
+    );
+    apply(
+        &mut s,
+        Harness::Grok,
+        "UserPromptSubmit",
+        json!({"sessionId":"root","prompt":"next"}),
+    );
+    assert!(s.detail.background_commands.is_empty());
+
+    let mut s = state();
+    s.harness = Harness::Omp;
+    apply(
+        &mut s,
+        Harness::Omp,
+        "Stop",
+        json!({"session_id":"root","async_jobs":[{"type":"bash","label":"npm run dev"},{"type":"eval","label":""}]}),
+    );
+    assert_eq!(s.detail.background_commands, ["eval", "npm run dev"]);
+    apply(
+        &mut s,
+        Harness::Omp,
+        "Stop",
+        json!({"session_id":"root","async_jobs":[]}),
+    );
+    assert!(s.detail.background_commands.is_empty());
+}
+#[test]
 fn native_events_preserve_root_identity_waits_and_background_work() {
     let mut s = state();
     let apply = |s: &mut RuntimeState, h, event, payload: Value| {

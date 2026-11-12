@@ -41,6 +41,18 @@ impl AgentDefinition for Definition {
             .and_then(serde_json::Value::as_array)
         {
             event.background_jobs = Some(jobs.len().min(u32::MAX as usize) as u32);
+            event.background_commands = Some(
+                jobs.iter()
+                    .map(|job| {
+                        ["label", "type"]
+                            .iter()
+                            .filter_map(|key| job.get(key).and_then(serde_json::Value::as_str))
+                            .find(|s| !s.trim().is_empty())
+                            .unwrap_or("job")
+                            .to_owned()
+                    })
+                    .collect(),
+            );
         }
     }
     fn hook_session(&self, _env: &Environment) -> Box<dyn crate::hook::HookSession> {

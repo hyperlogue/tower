@@ -55,6 +55,11 @@ pub struct AgentEvent {
     pub background_active: Option<bool>,
     #[serde(default)]
     pub blocking_prompt: Option<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// `Some` names every live background job; `None` reports nothing.
+    #[serde(default)]
+    pub background_commands: Option<Vec<String>>,
     pub continuing: bool,
     pub authoritative_status: Option<String>,
 }
@@ -65,6 +70,27 @@ pub(crate) fn text(value: &Value, paths: &[&str], max: usize) -> Option<String> 
         .filter(|v| !v.is_empty())
         .map(|s| s.chars().filter(|c| !c.is_control()).take(max).collect())
         .filter(|s: &String| !s.is_empty())
+}
+const PROMPT_CHARS: usize = 500;
+const COMMAND_CHARS: usize = 200;
+const COMMANDS: usize = 16;
+/// One display line: whitespace and control runs become single spaces.
+pub(crate) fn line(text: &str, max: usize) -> Option<String> {
+    let mut words = text.split(|c: char| c.is_whitespace() || c.is_control());
+    let joined = words
+        .by_ref()
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!joined.is_empty()).then(|| joined.chars().take(max).collect())
+}
+/// The commands of live background jobs, bounded for a state file.
+pub(crate) fn commands<'a>(found: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut commands: Vec<_> = found.filter_map(|c| line(c, COMMAND_CHARS)).collect();
+    commands.sort();
+    commands.dedup();
+    commands.truncate(COMMANDS);
+    commands
 }
 pub(crate) fn count(value: &Value, paths: &[&str]) -> Option<u64> {
     paths
@@ -214,6 +240,11 @@ pub fn parse(harness: Harness, name: &str, bytes: &[u8]) -> Result<AgentEvent, &
         background_active: None,
         background_jobs: count(&value, &["/background_jobs"]).and_then(|n| n.try_into().ok()),
         blocking_prompt: None,
+        prompt: matches!(name, "UserPromptSubmit" | "prompt-submit")
+            .then(|| value.get("prompt").and_then(Value::as_str))
+            .flatten()
+            .and_then(|prompt| line(prompt, PROMPT_CHARS)),
+        background_commands: None,
         continuing: value.get("will_continue").and_then(Value::as_bool) == Some(true)
             || value.get("will_retry").and_then(Value::as_bool) == Some(true),
         authoritative_status: None,
@@ -259,6 +290,10 @@ pub fn apply(state: &mut RuntimeState, mut event: AgentEvent, now: u64) {
     clean(&mut event.effort, 64);
     clean(&mut event.tool, 128);
     clean(&mut event.tool_id, 256);
+    event.prompt = event.prompt.and_then(|p| line(&p, PROMPT_CHARS));
+    event.background_commands = event
+        .background_commands
+        .map(|found| commands(found.iter().map(String::as_str)));
     if event
         .cwd
         .as_ref()
@@ -350,6 +385,12 @@ pub fn apply(state: &mut RuntimeState, mut event: AgentEvent, now: u64) {
     if let Some(jobs) = event.background_jobs {
         state.detail.background_jobs = Some(jobs);
     }
+    if let Some(prompt) = event.prompt {
+        state.detail.last_prompt = Some(prompt);
+    }
+    if let Some(commands) = event.background_commands {
+        state.detail.background_commands = commands;
+    }
     let waiting = |state: &RuntimeState| {
         matches!(state.status.as_str(), "waiting_input" | "waiting_approval")
     };
@@ -433,6 +474,9 @@ pub fn apply(state: &mut RuntimeState, mut event: AgentEvent, now: u64) {
             }
         }
         EventKind::Metadata | EventKind::Ready | EventKind::End => {}
+    }
+    if state.detail.phase.as_deref() != Some("background") {
+        state.detail.background_commands.clear();
     }
     if let Some(status) = event.authoritative_status
         && !(event.coarse_status && state.status == "waiting_input" && status != "waiting_approval")
