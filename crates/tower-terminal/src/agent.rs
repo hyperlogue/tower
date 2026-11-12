@@ -46,10 +46,11 @@ pub(crate) fn task(context: SessionContext) -> SessionTask {
 }
 /// What hosts this launcher: Tower's own daemon and pool, or an embedding
 /// program's terminal window.
-struct Host {
-    exe: std::path::PathBuf,
-    paths: tower_pal::Paths,
-    daemon: bool,
+pub(crate) struct Host {
+    /// Answers hook, environment and Codex MCP commands for the session.
+    pub exe: std::path::PathBuf,
+    pub paths: tower_pal::Paths,
+    pub daemon: bool,
 }
 fn host(plan: &LauncherPlan) -> io::Result<Host> {
     Ok(match &plan.embedding {
@@ -75,9 +76,18 @@ async fn configure(
         project_environment(Path::new(&plan.spec.cwd), &exe, tower_pal::environment()).await?;
     let config = match plan.spec.harness.definition().execution(&plan.spec) {
         tower_agents::definition::Execution::Hooks => None,
-        tower_agents::definition::Execution::CodexAppServer => {
-            Some(tower_agents::codex_service::Config::load(&paths).map_err(io::Error::other)?)
-        }
+        tower_agents::definition::Execution::CodexAppServer => Some(
+            match &plan.embedding {
+                // An embedding program has its own settings; Tower's file is
+                // a standalone install's.
+                Some(embedding) => tower_agents::codex_service::Config::endpoint(
+                    &paths,
+                    embedding.codex_endpoint.as_deref(),
+                ),
+                None => tower_agents::codex_service::Config::load(&paths),
+            }
+            .map_err(io::Error::other)?,
+        ),
     };
     let native_home = match &config {
         Some(c) => Some(format!("codex-endpoint:{}", c.endpoint.display())),
@@ -203,15 +213,16 @@ async fn serve(
 ) -> io::Result<i32> {
     let mut invocation = configured.invocation;
     let token = configured.token;
-    let Host { paths, daemon, .. } = host(plan)?;
+    let host = host(plan)?;
     state.private.insert(
         "pty_supported".into(),
-        (daemon && super::injection::supported(&paths).await).into(),
+        (host.daemon && super::injection::supported(&host.paths).await).into(),
     );
+    let (paths, daemon) = (&host.paths, host.daemon);
     let listener = IpcListener::bind(Path::new(&plan.control_socket)).await?;
     let (observations, mut observed) = mpsc::channel(128);
     let mut server = if let Some(config) = codex {
-        match super::app_server::start(plan, &paths, &mut invocation, observations, config).await {
+        match super::app_server::start(plan, &host, &mut invocation, observations, config).await {
             Ok(server) => Some(server),
             Err(e) => {
                 // The session's terminal is where the person launching it looks.
@@ -314,7 +325,7 @@ async fn serve(
                         let _=ack.send(Err(tower_protocol::RpcError::application("delivery_failed","Target session is unavailable"))); continue;
                     }
                     if report.pty_only {
-                        if !daemon || !super::injection::allowed(&paths,plan.spec.harness){let _=ack.send(Err(tower_protocol::RpcError::application("unsupported","PTY injection is disabled")));continue;}
+                        if !daemon || !super::injection::allowed(paths,plan.spec.harness){let _=ack.send(Err(tower_protocol::RpcError::application("unsupported","PTY injection is disabled")));continue;}
                         match super::injection::proof(state) {
                             Ok(proof)=>{let paths=paths.clone();let name=plan.id.clone();tokio::spawn(async move{let _=ack.send(super::injection::send(paths,name,proof,text).await.map(Some));});}
                             Err(e)=>{let _=ack.send(Err(e));}
@@ -371,7 +382,7 @@ async fn serve(
                     let kind=event.kind;let child=event.child;let before=state.seq;let was_idle=state.status=="idle";activity.apply(state,event,now());
                     if state.seq!=before && !child {
                         super::injection::observe_idle(state,kind,was_idle);
-                        if daemon { continue_turn(&paths,plan,state); }
+                        if daemon { continue_turn(paths,plan,state); }
                         if let Some(endpoint)=report.delivery && tower_agents::delivery::validate(&endpoint).is_ok() && endpoint.messaging_socket.is_some() && endpoint.messaging_token.is_some() {
                             state.private.insert("delivery".into(),serde_json::to_value(endpoint)?);
                         }

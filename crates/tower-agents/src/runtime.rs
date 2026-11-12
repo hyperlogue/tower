@@ -37,6 +37,10 @@ pub struct Embedding {
     pub helper: String,
     /// Directory that replaces Tower's own state directory.
     pub state: String,
+    /// `unix://` URL of the Codex app-server the program is configured to
+    /// use; absent means the daemon Codex runs for its own home.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_endpoint: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

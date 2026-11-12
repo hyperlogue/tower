@@ -105,9 +105,20 @@ impl Config {
         let Some(endpoint) = codex.get("endpoint") else {
             return Ok(Self::daemon(paths));
         };
-        let endpoint = endpoint
-            .as_str()
-            .ok_or(Error::Config("Codex endpoint must be a Unix socket URL"))?;
+        Self::endpoint(
+            paths,
+            Some(
+                endpoint
+                    .as_str()
+                    .ok_or(Error::Config("Codex endpoint must be a Unix socket URL"))?,
+            ),
+        )
+    }
+    /// The app-server at `endpoint`, or Codex's own daemon when there is none.
+    pub fn endpoint(paths: &tower_pal::Paths, endpoint: Option<&str>) -> Result<Self> {
+        let Some(endpoint) = endpoint else {
+            return Ok(Self::daemon(paths));
+        };
         let path = endpoint
             .strip_prefix("unix://")
             .ok_or(Error::Config("Codex endpoint must use unix://"))?;

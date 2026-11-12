@@ -47,6 +47,8 @@ struct Shared {
     env: tower_pal::Environment,
     generation: String,
     executable: PathBuf,
+    /// The pool's clipboard is reachable; a plain terminal has its own.
+    clipboard: bool,
 }
 pub struct Server {
     pub process: Option<tower_pal::ProcessIdentity>,
@@ -141,12 +143,13 @@ fn same_process(
 }
 pub async fn start(
     plan: &LauncherPlan,
-    paths: &tower_pal::Paths,
+    host: &crate::agent::Host,
     invocation: &mut Invocation,
     events: mpsc::Sender<AgentEvent>,
     config: Config,
 ) -> io::Result<Server> {
-    let host = tower_agents::codex_host::ensure_configured(paths, config)
+    let (executable, clipboard) = (host.exe.clone(), host.daemon);
+    let host = tower_agents::codex_host::ensure_configured(&host.paths, config)
         .await
         .map_err(io::Error::other)?;
     if host.process.is_none() {
@@ -166,7 +169,8 @@ pub async fn start(
         cwd: PathBuf::from(&plan.spec.cwd),
         env: invocation.env.clone(),
         generation: plan.generation.clone(),
-        executable: tower_pal::Program::Cli.path()?,
+        executable,
+        clipboard,
     });
     let (messages, mut submissions) = mpsc::channel::<Submission>(16);
     let relay_shared = shared.clone();
@@ -405,15 +409,17 @@ async fn prepare_thread(shared: &Shared, value: &mut Value) -> io::Result<Value>
             env.insert(key.clone(), value.clone());
         }
     }
-    tower_clipboard::shim::install(
-        shared
-            .root
-            .parent()
-            .ok_or_else(|| io::Error::other("Invalid session path"))?,
-        &shared.executable,
-        &mut env,
-        &shared.generation,
-    )?;
+    if shared.clipboard {
+        tower_clipboard::shim::install(
+            shared
+                .root
+                .parent()
+                .ok_or_else(|| io::Error::other("Invalid session path"))?,
+            &shared.executable,
+            &mut env,
+            &shared.generation,
+        )?;
+    }
     let base = control
         .request("config/read", json!({"cwd":cwd,"includeLayers":false}))
         .await
@@ -1043,6 +1049,7 @@ mod tests {
             env: Default::default(),
             generation: "fixture".into(),
             executable: PathBuf::from("/unused/tower"),
+            clipboard: true,
         })
     }
     #[tokio::test]

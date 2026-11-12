@@ -71,6 +71,7 @@ async fn embedder_runs_watches_and_stops_a_session_without_daemon_or_pool() {
     let local = Local::new(Embedding {
         helper: helper.to_string_lossy().into_owned(),
         state: state.to_string_lossy().into_owned(),
+        codex_endpoint: None,
     })
     .unwrap();
     let mut watch = local.watch().unwrap();
@@ -141,4 +142,80 @@ async fn embedder_runs_watches_and_stops_a_session_without_daemon_or_pool() {
     assert!(ended.state.stop_requested);
     local.forget("one").unwrap();
     assert!(local.sessions().unwrap().is_empty());
+}
+
+// Stands in for native Codex: its hooks run the helper the session names.
+const CODEX: &str = r#"#!/bin/sh
+if [ "$1" = queue ]; then exit 0; fi
+printf '%s\n' "$@" > codex.args
+env > codex.env
+printf '{"session_id":"native-codex"}' | "$TOWER_HELPER" hook codex SessionStart
+while :; do sleep 0.03; done
+"#;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn embedded_native_codex_shares_the_profile_without_the_mcp_server() {
+    let root = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(root.path()).unwrap();
+    let (state, bin, work) = (root.join("state"), root.join("bin"), root.join("work"));
+    for dir in [&bin, &work] {
+        std::fs::create_dir(dir).unwrap();
+    }
+    let agent = bin.join("codex");
+    std::fs::write(&agent, CODEX).unwrap();
+    std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let helper = embedder();
+    let local = Local::new(local_embedding(&helper, &state)).unwrap();
+    let mut watch = local.watch().unwrap();
+    let mut launcher = Command::new(&helper)
+        .args(["launch", "one", "codex"])
+        .arg(&work)
+        .env_clear()
+        .env("HOME", &root)
+        .env("EMBEDDER_STATE", &state)
+        .env("EMBEDDER_MODE", "native")
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        )
+        .stdin(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    await_session(&local, &mut watch, "agent start", |s| {
+        s.live
+            && s.state
+                .native
+                .as_ref()
+                .is_some_and(|n| n.id == "native-codex")
+    })
+    .await;
+    let args = std::fs::read_to_string(work.join("codex.args")).unwrap();
+    assert_eq!(args, "--profile\ntower\n--enable\nhooks\n");
+    let env = std::fs::read_to_string(work.join("codex.env")).unwrap();
+    assert!(
+        env.contains(&format!("TOWER_HELPER={}\n", helper.display())),
+        "{env}"
+    );
+    let profile = std::fs::read_to_string(root.join(".codex/tower.config.toml")).unwrap();
+    assert!(profile.contains("TOWER_HELPER"), "{profile}");
+    assert!(!profile.contains("mcp_servers"), "{profile}");
+
+    let stopper = Local::new(local_embedding(&helper, &state)).unwrap();
+    tokio::task::spawn_blocking(move || stopper.stop("one"))
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::task::spawn_blocking(move || launcher.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    await_session(&local, &mut watch, "exit record", |s| !s.live).await;
+}
+fn local_embedding(helper: &Path, state: &Path) -> Embedding {
+    Embedding {
+        helper: helper.to_string_lossy().into_owned(),
+        state: state.to_string_lossy().into_owned(),
+        codex_endpoint: None,
+    }
 }

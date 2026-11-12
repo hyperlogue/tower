@@ -55,7 +55,10 @@ pub(crate) fn configure(
     if previous.is_some() {
         let _owned = tower_pal::private_file(&path, false)?;
     }
-    let profile = build(&path, exe, previous.as_deref())?;
+    // Tower's MCP server calls the daemon; a session without one leaves the
+    // entry to the installs that have it and switches it off for itself.
+    let mcp = env.contains_key("TOWER_SOCKET");
+    let profile = build(&path, exe, previous.as_deref(), mcp)?;
     if previous.as_deref() != Some(&profile) {
         tower_pal::write_owned_config(&path, profile.as_bytes())?;
     }
@@ -66,9 +69,17 @@ pub(crate) fn configure(
         "--enable".into(),
         "hooks".into(),
     ]);
+    let shared = profile.parse::<toml::Table>().ok().is_some_and(|table| {
+        table
+            .get("mcp_servers")
+            .is_some_and(|s| s.get("tower").is_some())
+    });
+    if !mcp && shared {
+        argv.extend(["-c".into(), "mcp_servers.tower.enabled=false".into()]);
+    }
     Ok(())
 }
-fn build(path: &Path, exe: &Path, previous: Option<&str>) -> io::Result<String> {
+fn build(path: &Path, exe: &Path, previous: Option<&str>, mcp: bool) -> io::Result<String> {
     let mut profile: toml::Table = previous
         .map(str::parse)
         .transpose()
@@ -120,12 +131,14 @@ fn build(path: &Path, exe: &Path, previous: Option<&str>) -> io::Result<String> 
     }
     hooks.insert("state".into(), toml::Value::Table(trust));
     profile.insert("hooks".into(), toml::Value::Table(hooks));
-    let servers = profile
-        .entry("mcp_servers")
-        .or_insert_with(|| toml::Value::Table(Default::default()))
-        .as_table_mut()
-        .ok_or_else(|| invalid("Invalid native profile MCP table"))?;
-    servers.insert("tower".into(), toml::Value::try_from(json!({"command":exe,"args":["mcp"],"env_vars":["TOWER_AGENT_ID","TOWER_AGENT_TOKEN","TOWER_SOCKET"]})).map_err(io::Error::other)?);
+    if mcp {
+        let servers = profile
+            .entry("mcp_servers")
+            .or_insert_with(|| toml::Value::Table(Default::default()))
+            .as_table_mut()
+            .ok_or_else(|| invalid("Invalid native profile MCP table"))?;
+        servers.insert("tower".into(), toml::Value::try_from(json!({"command":exe,"args":["mcp"],"env_vars":["TOWER_AGENT_ID","TOWER_AGENT_TOKEN","TOWER_SOCKET"]})).map_err(io::Error::other)?);
+    }
     Ok(format!(
         "{MARKER}\n# Other profile settings and foreign hook trust are preserved.\n{}",
         toml::to_string(&profile).map_err(io::Error::other)?
@@ -197,6 +210,36 @@ mod tests {
             Some("user-choice")
         );
         assert!(updated["hooks"]["Stop"][0].get("matcher").is_none());
+    }
+    #[test]
+    fn a_session_without_a_daemon_leaves_the_mcp_entry_to_those_with_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("codex");
+        let home = ("CODEX_HOME".to_owned(), root.to_string_lossy().into_owned());
+        let path = root.join("tower.config.toml");
+        let servers = || {
+            let table: toml::Table = std::fs::read_to_string(&path).unwrap().parse().unwrap();
+            table.get("mcp_servers").cloned()
+        };
+        let launch = |socket: bool| {
+            let mut env = Environment::from([home.clone()]);
+            if socket {
+                env.insert("TOWER_SOCKET".into(), "/run/towerd.sock".into());
+            }
+            let mut argv = vec![];
+            configure(Path::new("/opt/helper"), &mut env, &mut argv).unwrap();
+            argv
+        };
+        let plain = ["--profile", "tower", "--enable", "hooks"];
+        assert_eq!(launch(false), plain);
+        assert_eq!(servers(), None);
+        assert_eq!(launch(true), plain);
+        let entry = servers().unwrap();
+        assert_eq!(entry["tower"]["args"][0].as_str(), Some("mcp"));
+        let mut disabled = plain.to_vec();
+        disabled.extend(["-c", "mcp_servers.tower.enabled=false"]);
+        assert_eq!(launch(false), disabled);
+        assert_eq!(servers(), Some(entry));
     }
     #[test]
     fn native_profile_refuses_unowned_symlinked_and_malformed_files() {

@@ -74,7 +74,11 @@ pub fn prepare(
             "Codex project environments require a verified Bash or Zsh execution shell",
         ));
     }
-    let context = SessionMcpContext::from_environment(env)?;
+    // A session with no daemon has nothing for Tower's MCP server to reach.
+    let context = env
+        .contains_key("TOWER_SOCKET")
+        .then(|| SessionMcpContext::from_environment(env))
+        .transpose()?;
     let base = normalized(base_config, false)?;
     let mut output = normalized(request_config, true)?;
     reject_broker(&base)?;
@@ -102,8 +106,11 @@ pub fn prepare(
         return Err(invalid("Codex environment startup file exceeds its limit"));
     }
     let zsh_script = format!("unsetopt RCS\n. {}\n", shell_quote(script_path_text));
-    let context_bytes =
-        serde_json::to_vec(&context).map_err(|_| invalid("Cannot encode managed MCP context"))?;
+    let context_bytes = context
+        .as_ref()
+        .map(serde_json::to_vec)
+        .transpose()
+        .map_err(|_| invalid("Cannot encode managed MCP context"))?;
 
     output["shell_environment_policy"] = policy.bootstrap(script_path_text, path_text(root)?);
     let features = output
@@ -119,46 +126,57 @@ pub fn prepare(
         .ok_or_else(|| invalid("Invalid Codex feature settings"))?
         .insert("shell_snapshot".into(), Value::Bool(false));
     output["allow_login_shell"] = Value::Bool(false);
-    let servers = output
-        .as_object_mut()
-        .expect("normalized object")
-        .entry("mcp_servers")
-        .or_insert_with(|| json!({}));
-    if servers.is_null() {
-        *servers = json!({});
+    if context.is_some() {
+        let servers = output
+            .as_object_mut()
+            .expect("normalized object")
+            .entry("mcp_servers")
+            .or_insert_with(|| json!({}));
+        if servers.is_null() {
+            *servers = json!({});
+        }
+        let tower = servers
+            .as_object_mut()
+            .ok_or_else(|| invalid("Invalid Codex MCP settings"))?
+            .entry("tower")
+            .or_insert_with(|| json!({}));
+        if tower.is_null() {
+            *tower = json!({});
+        }
+        let tower = tower
+            .as_object_mut()
+            .ok_or_else(|| invalid("Invalid Tower MCP settings"))?;
+        for name in [
+            "env",
+            "env_vars",
+            "url",
+            "http_headers",
+            "env_http_headers",
+            "bearer_token_env_var",
+        ] {
+            tower.remove(name);
+        }
+        tower.insert("command".into(), Value::String(executable.into()));
+        tower.insert("args".into(), json!(["__session-mcp", context_path_text]));
+    } else if effective
+        .pointer("/mcp_servers/tower")
+        .is_some_and(Value::is_object)
+    {
+        // A standalone install configured the server; it cannot serve here.
+        output["mcp_servers"]["tower"] = json!({"enabled": false});
     }
-    let tower = servers
-        .as_object_mut()
-        .ok_or_else(|| invalid("Invalid Codex MCP settings"))?
-        .entry("tower")
-        .or_insert_with(|| json!({}));
-    if tower.is_null() {
-        *tower = json!({});
-    }
-    let tower = tower
-        .as_object_mut()
-        .ok_or_else(|| invalid("Invalid Tower MCP settings"))?;
-    for name in [
-        "env",
-        "env_vars",
-        "url",
-        "http_headers",
-        "env_http_headers",
-        "bearer_token_env_var",
-    ] {
-        tower.remove(name);
-    }
-    tower.insert("command".into(), Value::String(executable.into()));
-    tower.insert("args".into(), json!(["__session-mcp", context_path_text]));
     remove_managed_hooks(&effective, &mut output)?;
 
     tower_pal::private_dir(root)?;
     let _lock = tower_pal::SingletonLock::acquire(&root.join(".prepare.lock"))?;
-    let files = [
-        (script_path, script.into_bytes()),
-        (root.join(".zshenv"), zsh_script.into_bytes()),
-        (context_path, context_bytes),
-    ];
+    let files: Vec<_> = [
+        Some((script_path, script.into_bytes())),
+        Some((root.join(".zshenv"), zsh_script.into_bytes())),
+        context_bytes.map(|bytes| (context_path, bytes)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     // Validate all previous files before completing a partially published generation.
     for (path, bytes) in &files {
         if let Some(previous) = existing(path)?
@@ -814,6 +832,32 @@ mod tests {
             }
             command
         }
+    }
+
+    #[test]
+    fn a_session_without_a_daemon_gets_no_tower_mcp_server() {
+        let mut fixture = Fixture::new();
+        fixture.env.remove("TOWER_SOCKET");
+        let config = fixture
+            .prepare(
+                json!({}),
+                json!({"mcp_servers":{"other":{"command":"other-tool"}}}),
+            )
+            .unwrap();
+        assert_eq!(config["mcp_servers"]["other"]["command"], "other-tool");
+        assert!(config["mcp_servers"].get("tower").is_none());
+        assert!(config["shell_environment_policy"].is_object());
+        assert!(!fixture.root().join("mcp.json").exists());
+
+        let mut fixture = Fixture::new();
+        fixture.env.remove("TOWER_SOCKET");
+        let config = fixture
+            .prepare(
+                json!({"mcp_servers":{"tower":{"command":"/opt/tower-cli","args":["mcp"]}}}),
+                json!({}),
+            )
+            .unwrap();
+        assert_eq!(config["mcp_servers"]["tower"], json!({"enabled":false}));
     }
 
     #[test]

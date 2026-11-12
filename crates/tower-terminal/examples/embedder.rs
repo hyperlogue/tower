@@ -9,6 +9,7 @@ fn local() -> io::Result<Local> {
     Local::new(Embedding {
         helper: std::env::current_exe()?.to_string_lossy().into_owned(),
         state: std::env::var("EMBEDDER_STATE").map_err(io::Error::other)?,
+        codex_endpoint: None,
     })
 }
 fn execute(args: &[String]) -> io::Result<i32> {
@@ -24,7 +25,7 @@ fn execute(args: &[String]) -> io::Result<i32> {
                         .ok_or_else(|| io::Error::other("unknown harness"))?,
                     cwd: cwd.into(),
                     args: args.iter().map(|a| (*a).into()).collect(),
-                    mode: None,
+                    mode: std::env::var("EMBEDDER_MODE").ok(),
                     resume: None,
                     fork: false,
                     native_home: None,
