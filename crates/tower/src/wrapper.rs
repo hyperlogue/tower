@@ -37,6 +37,10 @@ pub async fn run(
     }
     env.insert("TOWER_WRAPPER".into(), "1".into());
     env.insert(
+        tower_agents::config::HELPER.into(),
+        exe.to_string_lossy().into_owned(),
+    );
+    env.insert(
         "TOWER_SOCKET".into(),
         paths.socket.to_string_lossy().into_owned(),
     );

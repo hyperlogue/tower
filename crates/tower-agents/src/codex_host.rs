@@ -96,6 +96,7 @@ async fn start_daemon(paths: &Paths) -> Result<()> {
         "TOWER_BEARER_TOKEN",
         "TOWER_LAUNCHER_SOCKET",
         "TOWER_WRAPPER",
+        crate::config::HELPER,
         "CLAUDE_CODE_SESSION_ID",
         "CODEX_THREAD_ID",
         "CODEX_SESSION_ID",

@@ -197,6 +197,39 @@ fn state() -> RuntimeState {
         private: Default::default(),
     }
 }
+#[cfg(unix)]
+#[test]
+fn hook_commands_run_the_helper_their_session_names() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = tempfile::tempdir().unwrap();
+    let dir = t.path().join("a b");
+    std::fs::create_dir(&dir).unwrap();
+    let program = |name: &str| {
+        let path = dir.join(name);
+        std::fs::write(&path, "#!/bin/sh\necho \"${0##*/}\" \"$@\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        path
+    };
+    let (writer, session) = (program("writer's"), program("session"));
+    let command = config::hook(&writer, Harness::Grok, "Stop");
+    let run = |env: &[(&str, &Path)]| {
+        let mut sh = std::process::Command::new("sh");
+        sh.args(["-c", &command]);
+        for key in ["TOWER_LAUNCHER_SOCKET", "TOWER_WRAPPER", config::HELPER] {
+            sh.env_remove(key);
+        }
+        let out = sh.envs(env.iter().copied()).output().unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let socket = ("TOWER_LAUNCHER_SOCKET", Path::new("/run/launcher.sock"));
+    assert_eq!(run(&[(config::HELPER, &session)]), "");
+    assert_eq!(
+        run(&[socket, (config::HELPER, &session)]),
+        "session hook grok Stop\n"
+    );
+    assert_eq!(run(&[socket]), "writer's hook grok Stop\n");
+}
 #[test]
 fn state_keeps_one_line_of_the_last_prompt_and_live_background_commands() {
     let mut s = state();

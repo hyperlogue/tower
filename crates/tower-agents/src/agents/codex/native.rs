@@ -1,4 +1,4 @@
-use crate::config::{home, invalid, shell_quote};
+use crate::config::{home, invalid};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
@@ -77,9 +77,10 @@ fn build(path: &Path, exe: &Path, previous: Option<&str>) -> io::Result<String> 
     let mut hooks = toml::Table::new();
     let mut trust = toml::Table::new();
     for (name, label, matcher) in EVENTS {
-        let command = format!(
-            "if [ -n \"${{TOWER_LAUNCHER_SOCKET:-}}\" ]; then {} hook codex {name}; fi; :",
-            shell_quote(&exe.to_string_lossy())
+        let command = crate::config::hook_command(
+            "${TOWER_LAUNCHER_SOCKET:-}",
+            exe,
+            &format!("codex {name}"),
         );
         let mut group =
             json!({"hooks":[{"type":"command","command":command,"timeout":600,"async":false}]});

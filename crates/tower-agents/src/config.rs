@@ -16,12 +16,23 @@ pub(crate) fn invalid(message: &str) -> io::Error {
 pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
-pub(crate) fn hook(exe: &Path, h: Harness, event: &str) -> String {
+/// Names the program a session's hooks run. Agents that read hooks from a
+/// file in the user's agent home share that file between every program that
+/// launches them, so the command takes the helper from the session.
+pub const HELPER: &str = "TOWER_HELPER";
+/// Shell that runs `helper hook <arguments>` inside a launched session.
+/// `exe` serves sessions started before their launcher exported [`HELPER`].
+pub(crate) fn hook_command(guard: &str, exe: &Path, arguments: &str) -> String {
     format!(
-        "if [ -n \"${{TOWER_LAUNCHER_SOCKET:-${{TOWER_WRAPPER:-}}}}\" ]; then {} hook {} {}; fi; :",
+        "if [ -n \"{guard}\" ]; then tower_helper=${{{HELPER}:-{}}}; \"$tower_helper\" hook {arguments}; fi; :",
         shell_quote(&exe.to_string_lossy()),
-        h.id(),
-        event
+    )
+}
+pub(crate) fn hook(exe: &Path, h: Harness, event: &str) -> String {
+    hook_command(
+        "${TOWER_LAUNCHER_SOCKET:-${TOWER_WRAPPER:-}}",
+        exe,
+        &format!("{} {event}", h.id()),
     )
 }
 pub(crate) fn home(env: &Environment, key: &str, fallback: &str) -> io::Result<PathBuf> {

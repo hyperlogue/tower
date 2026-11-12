@@ -98,6 +98,7 @@ async fn configure(
         "TOWER_AGENT_TOKEN",
         "TOWER_BEARER_TOKEN",
         "TOWER_LAUNCHER_SOCKET",
+        tower_agents::config::HELPER,
         "CLAUDE_CODE_SESSION_ID",
         "CLAUDE_CODE_CHILD_SESSION",
         "CLAUDE_CODE_MESSAGING_SOCKET",
@@ -117,6 +118,10 @@ async fn configure(
         env.remove("TOWER_SOCKET");
     }
     env.insert("TOWER_LAUNCHER_SOCKET".into(), plan.control_socket.clone());
+    env.insert(
+        tower_agents::config::HELPER.into(),
+        exe.to_string_lossy().into_owned(),
+    );
     let mut invocation = tower_agents::config::prepare(
         &plan.spec,
         &Path::new(&plan.state_dir).join("config"),
