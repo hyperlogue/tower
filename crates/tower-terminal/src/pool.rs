@@ -132,3 +132,40 @@ pub(crate) fn snapshot(paths: &Paths, id: &str) -> Result<tower_protocol::Snapsh
         limited,
     })
 }
+
+/// Calls `wake` on every pool session change, reconnecting when the pool
+/// socket is replaced. Waits for the socket rather than retrying on a timer.
+pub(crate) async fn watch(paths: Paths, wake: std::sync::Arc<dyn Fn() + Send + Sync>) {
+    let socket = paths.pool_socket();
+    loop {
+        let mut replaced = match tower_pal::FileWatch::new(std::slice::from_ref(&socket)) {
+            Ok(watch) => watch,
+            Err(e) => {
+                eprintln!("tower: terminal pool changes are unobservable: {e}");
+                return;
+            }
+        };
+        if let Ok(mut stream) = tower_pal::connect(&socket).await {
+            let subscribed = tokio::time::timeout(Duration::from_secs(5), async {
+                let capabilities = wire::hello_capabilities(&mut stream).await?;
+                if !capabilities.iter().any(|c| c == "watch.v1") {
+                    return Err(Error::other("pool cannot report changes"));
+                }
+                wire::write(&mut stream, &Request::Watch).await?;
+                wire::read(&mut stream).await?.json::<Reply>()?.checked()
+            })
+            .await;
+            if matches!(subscribed, Ok(Ok(Reply::Ok))) {
+                // Changes made while disconnected are read on the first wake.
+                wake();
+                while let Ok(frame) = wire::read(&mut stream).await {
+                    if let Frame::Json(_) = frame {
+                        wake();
+                    }
+                }
+                wake();
+            }
+        }
+        replaced.changed().await;
+    }
+}

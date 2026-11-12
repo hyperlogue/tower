@@ -97,6 +97,7 @@ struct Actor {
     next: u64,
     info: Session,
     state: watch::Sender<Session>,
+    changes: Changes,
     rx: mpsc::Receiver<Command>,
     input: VecDeque<InputUnit>,
     offset: usize,
@@ -109,7 +110,9 @@ struct Actor {
     last_input: Option<u64>,
     consumed_idle: Option<u64>,
 }
-pub fn reserve(launch: Launch, defaults: crate::preferences::Profile) -> Handle {
+/// Pool-wide revision, bumped whenever any session's state changes.
+pub type Changes = std::sync::Arc<watch::Sender<u64>>;
+pub fn reserve(launch: Launch, defaults: crate::preferences::Profile, changes: Changes) -> Handle {
     let size = launch.size.unwrap_or(defaults.size);
     let info = Session {
         name: launch.name.clone(),
@@ -132,6 +135,7 @@ pub fn reserve(launch: Launch, defaults: crate::preferences::Profile) -> Handle 
         next: 0,
         info,
         state,
+        changes,
         rx,
         input: VecDeque::new(),
         offset: 0,
@@ -231,6 +235,8 @@ impl Actor {
     }
     fn publish(&self) {
         self.state.send_replace(self.info.clone());
+        self.changes
+            .send_modify(|revision| *revision = revision.wrapping_add(1));
     }
     fn resize(&mut self) {
         let size = if self.clients.is_empty() {

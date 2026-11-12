@@ -191,6 +191,11 @@ impl Wake {
     }
 }
 impl Service {
+    pub(crate) fn watch_backends(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+        for backend in self.backends.iter() {
+            backend.watch(wake.clone());
+        }
+    }
     pub fn new(
         paths: Paths,
         store: Arc<Store>,

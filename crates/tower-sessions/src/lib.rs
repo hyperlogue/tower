@@ -77,6 +77,9 @@ pub trait ManagedBackend: Send + Sync {
     ) -> Result<tower_protocol::ConversationList> {
         Ok(Default::default())
     }
+    /// Calls `wake` whenever backend state that `observe` reads may have
+    /// changed. Must be called from within a Tokio runtime.
+    fn watch(&self, _wake: std::sync::Arc<dyn Fn() + Send + Sync>) {}
     fn cleanup(&self, _session: &ManagedSession) -> Result<()> {
         Ok(())
     }

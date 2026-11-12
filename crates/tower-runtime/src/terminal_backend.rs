@@ -39,6 +39,9 @@ impl ManagedBackend for TerminalBackend {
     fn harnesses(&self) -> Vec<tower_protocol::HarnessInfo> {
         self.native.harnesses()
     }
+    fn watch(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+        self.native.watch(wake)
+    }
     fn prepare(&self, id: &str, p: &SessionOpenParams) -> Result<PreparedSession> {
         self.native.prepare(id, p)
     }

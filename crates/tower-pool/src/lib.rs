@@ -21,6 +21,7 @@ pub async fn run(paths: Paths) -> io::Result<()> {
     tower_pal::ignore_hangup()?;
     let listener = tower_pal::IpcListener::bind(&paths.pool_socket()).await?;
     let sessions: Sessions = Arc::new(Mutex::new(BTreeMap::new()));
+    let changes: session::Changes = Arc::new(tokio::sync::watch::channel(0).0);
     let shutdown = Arc::new(Notify::new());
     let preferences = Arc::new(Mutex::new(preferences::Preferences::open(
         paths.state.join("terminal.json"),
@@ -33,7 +34,7 @@ pub async fn run(paths: Paths) -> io::Result<()> {
          _=shutdown.notified()=>break Ok(()),r=&mut signals=>break r,
          Some(_)=clients.join_next(),if !clients.is_empty()=>{},
          accepted=listener.accept(),if clients.len()<128=>match accepted {
-          Ok((stream,_))=>{let sessions=Arc::clone(&sessions);let shutdown=Arc::clone(&shutdown);let preferences=Arc::clone(&preferences);clients.spawn(async move {let _=connection(stream,sessions,shutdown,preferences).await;});},
+          Ok((stream,_))=>{let sessions=Arc::clone(&sessions);let shutdown=Arc::clone(&shutdown);let preferences=Arc::clone(&preferences);let changes=Arc::clone(&changes);clients.spawn(async move {let _=connection(stream,sessions,shutdown,preferences,changes).await;});},
           Err(e) if e.kind()==io::ErrorKind::PermissionDenied=>{},Err(e)=>break Err(e)
          }
         }
@@ -91,6 +92,7 @@ async fn connection(
     sessions: Sessions,
     shutdown: Arc<Notify>,
     preferences: Arc<Mutex<preferences::Preferences>>,
+    changes: session::Changes,
 ) -> io::Result<()> {
     let first = tokio::time::timeout(Duration::from_secs(5), wire::read(&mut stream))
         .await
@@ -115,6 +117,7 @@ async fn connection(
                 "inject_if_idle.v1".into(),
                 "terminal.kitty.v1".into(),
                 "clipboard.images.v1".into(),
+                "watch.v1".into(),
             ],
         },
     )
@@ -131,6 +134,15 @@ async fn connection(
         .await;
     }
     match request {
+        Request::Watch => {
+            let mut seen = changes.subscribe();
+            reply(&mut stream, &Reply::Ok).await?;
+            while seen.changed().await.is_ok() {
+                seen.borrow_and_update();
+                reply(&mut stream, &Reply::Changed).await?;
+            }
+            Ok(())
+        }
         Request::Inject { name, proof, text } => {
             let Some(handle) = find(&sessions, &name) else {
                 return reply(&mut stream, &Reply::error("not_found", "Session not found")).await;
@@ -196,9 +208,13 @@ async fn connection(
                     if map.len() >= 64 {
                         Err(Reply::error("limit", "session limit reached"))
                     } else {
-                        let handle =
-                            session::reserve(launch.clone(), preferences.lock().unwrap().current());
+                        let handle = session::reserve(
+                            launch.clone(),
+                            preferences.lock().unwrap().current(),
+                            Arc::clone(&changes),
+                        );
                         map.insert(launch.name.clone(), handle.clone());
+                        changes.send_modify(|revision| *revision = revision.wrapping_add(1));
                         Ok(handle)
                     }
                 }
@@ -242,6 +258,7 @@ async fn connection(
                 let (tx, rx) = oneshot::channel();
                 let _ = h.tx.send(Command::Stop(tx)).await;
                 let _ = rx.await;
+                changes.send_modify(|revision| *revision = revision.wrapping_add(1));
                 reply(&mut stream, &Reply::Ok).await
             } else {
                 reply(

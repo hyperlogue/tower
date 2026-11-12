@@ -115,6 +115,9 @@ pub enum Request {
     },
     Detach,
     Shutdown,
+    /// Streams `Reply::Changed` whenever any session's state changes
+    /// (capability `watch.v1`).
+    Watch,
     #[serde(other)]
     Unknown,
 }
@@ -172,6 +175,7 @@ pub enum Reply {
         code: i32,
     },
     Ok,
+    Changed,
     End,
     Error {
         code: String,

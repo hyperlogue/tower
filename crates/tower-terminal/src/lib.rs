@@ -593,6 +593,9 @@ impl ManagedBackend for TerminalBackend {
             truncated,
         })
     }
+    fn watch(&self, wake: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        tokio::spawn(pool::watch(self.paths.clone(), wake));
+    }
     fn cleanup(&self, session: &ManagedSession) -> Result<()> {
         if let Ok(binding) = binding(session)
             && let Ok(state) = launcher::read_state(

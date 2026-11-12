@@ -130,6 +130,8 @@ async fn maintain(service: ServiceWorker, paths: Paths) {
     use std::collections::BTreeMap;
     use std::sync::atomic::Ordering;
     let wake = service.wake();
+    let pool = wake.clone();
+    service.watch_backends(std::sync::Arc::new(move || pool.run()));
     let sessions = paths.state.join("sessions");
     let mut states = match tower_pal::private_dir(&sessions)
         .and_then(|_| tower_pal::TreeWatch::new(&sessions, "state.json"))

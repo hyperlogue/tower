@@ -32,6 +32,9 @@ impl ServiceWorker {
     pub fn wake(&self) -> Arc<crate::service::Wake> {
         self.service.wake()
     }
+    pub fn watch_backends(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+        self.service.watch_backends(wake);
+    }
     pub fn new(service: Service) -> Self {
         Self {
             service: Arc::new(service),
