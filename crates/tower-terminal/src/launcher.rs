@@ -36,6 +36,62 @@ pub(crate) fn now() -> u64 {
         .as_millis()
         .min(u64::MAX as u128) as u64
 }
+/// A fresh launch of `id` running `spec`, with its directories created below
+/// `paths`. An embedded launch has no daemon socket.
+pub(crate) fn plan(
+    paths: &tower_pal::Paths,
+    id: &str,
+    spec: tower_agents::runtime::AgentSpec,
+    embedding: Option<tower_agents::runtime::Embedding>,
+) -> io::Result<LauncherPlan> {
+    let mut bytes = [0; 8];
+    getrandom::fill(&mut bytes).map_err(|_| io::Error::other("random source unavailable"))?;
+    let generation: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let root = paths.state.join("sessions").join(id).join(&generation);
+    let run = paths.run.join("agents");
+    tower_pal::private_dir(&root)?;
+    tower_pal::private_dir(&run)?;
+    Ok(LauncherPlan {
+        id: id.into(),
+        state_dir: root.to_string_lossy().into_owned(),
+        tower_socket: if embedding.is_some() {
+            String::new()
+        } else {
+            paths.socket.to_string_lossy().into_owned()
+        },
+        control_socket: run
+            .join(format!("{generation}.sock"))
+            .to_string_lossy()
+            .into_owned(),
+        generation,
+        spec,
+        continue_turn: false,
+        embedding,
+    })
+}
+/// `spec` changed to continue the conversation its last launch recorded in
+/// `state`, or why that conversation cannot be continued.
+pub(crate) fn continued(
+    mut spec: tower_agents::runtime::AgentSpec,
+    state: RuntimeState,
+) -> Result<tower_agents::runtime::AgentSpec, &'static str> {
+    if state.private.get("native_resumable") == Some(&serde_json::Value::Bool(false)) {
+        return Err("This native conversation is ephemeral");
+    }
+    spec.resume = Some(
+        state
+            .native
+            .ok_or("The agent has not reported a native session identity")?,
+    );
+    spec.native_home = state
+        .private
+        .get("native_home")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        .or(spec.native_home);
+    spec.cwd = state.cwd;
+    Ok(spec)
+}
 fn file(plan: &LauncherPlan) -> PathBuf {
     Path::new(&plan.state_dir).join("state.json")
 }

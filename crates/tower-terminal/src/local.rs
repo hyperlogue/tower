@@ -25,7 +25,7 @@ pub struct Local {
 pub struct Session {
     pub plan: LauncherPlan,
     pub state: RuntimeState,
-    /// The launcher that wrote `state` is still running.
+    /// The launcher that wrote `state`, or its agent, is still running.
     pub live: bool,
 }
 
@@ -94,27 +94,10 @@ impl Local {
                 "session is already running",
             ));
         }
-        let generation = random(8)?;
-        let root = self.sessions_dir().join(id).join(&generation);
-        let run = self.paths.run.join("agents");
-        for dir in [&root, &run, &self.paths.tokens] {
-            tower_pal::private_dir(dir)?;
-        }
+        let plan = launcher::plan(&self.paths, id, spec, Some(self.embedding.clone()))?;
+        tower_pal::private_dir(&self.paths.tokens)?;
         tower_pal::write_private(&token_path, random(32)?.as_bytes())?;
-        let plan = LauncherPlan {
-            id: id.into(),
-            generation: generation.clone(),
-            state_dir: root.to_string_lossy().into_owned(),
-            tower_socket: String::new(),
-            control_socket: run
-                .join(format!("{generation}.sock"))
-                .to_string_lossy()
-                .into_owned(),
-            spec,
-            continue_turn: false,
-            embedding: Some(self.embedding.clone()),
-        };
-        let path = root.join("plan.json");
+        let path = Path::new(&plan.state_dir).join("plan.json");
         tower_pal::write_private(&path, &serde_json::to_vec(&plan)?)?;
         Ok(path)
     }
@@ -147,33 +130,8 @@ impl Local {
             self.embedding.codex_endpoint.as_deref(),
         )
         .map_err(io::Error::other)?;
-        let read = async {
-            let host = tower_agents::codex_host::ensure_configured(&self.paths, config).await?;
-            let mut client =
-                tower_agents::codex_service::Client::connect(&host.config.endpoint).await?;
-            let response = client
-                .request(
-                    "thread/read",
-                    serde_json::json!({"threadId":native_id,"includeTurns":false}),
-                )
-                .await?;
-            Ok::<_, tower_agents::codex_service::Error>(
-                crate::codex_candidate(&response["thread"], &host.config.endpoint)
-                    .filter(|candidate| candidate.native.id == native_id),
-            )
-        };
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?
-            .block_on(tokio::time::timeout(
-                std::time::Duration::from_secs(20),
-                read,
-            ))
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Codex did not answer"))?
-            .map_err(io::Error::other)?
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, "native conversation was not found")
-            })
+        crate::codex_block(crate::codex_thread(&self.paths, config, native_id))
+            .map_err(|error| io::Error::other(error.message))
     }
 
     /// Records a launch of `id` that continues `conversation` where the agent
@@ -209,22 +167,7 @@ impl Local {
             .filter(|s| s.plan.id == id)
             .max_by_key(|s| s.state.updated_at)
             .ok_or_else(|| unavailable("session is not recorded"))?;
-        if last.state.private.get("native_resumable") == Some(&serde_json::Value::Bool(false)) {
-            return Err(unavailable("this native conversation is ephemeral"));
-        }
-        let mut spec = last.plan.spec;
-        spec.resume =
-            Some(last.state.native.ok_or_else(|| {
-                unavailable("the agent has not reported a native session identity")
-            })?);
-        spec.native_home = last
-            .state
-            .private
-            .get("native_home")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)
-            .or(spec.native_home);
-        spec.cwd = last.state.cwd;
+        let mut spec = launcher::continued(last.plan.spec, last.state).map_err(unavailable)?;
         spec.args = tower_agents::config::resume_options(spec.harness, &spec.args)?;
         spec.fork = false;
         self.prepare(id, spec)
@@ -235,7 +178,6 @@ impl Local {
     ///
     /// [`forget`]: Self::forget
     pub fn sessions(&self) -> io::Result<Vec<Session>> {
-        let boot = tower_pal::boot_id()?;
         let mut found = Vec::new();
         for id in entries(&self.sessions_dir())? {
             for generation in entries(&id)? {
@@ -251,10 +193,8 @@ impl Local {
                 if state.id != plan.id || state.generation != plan.generation {
                     continue;
                 }
-                let live = state.exit_code.is_none()
-                    && state.boot_id == boot
-                    && tower_pal::process_identity(state.launcher_pid)
-                        .is_ok_and(|p| p.start_time == state.launcher_start_time);
+                let live =
+                    state.exit_code.is_none() && crate::launcher_alive(&state).unwrap_or(false);
                 found.push(Session { plan, state, live });
             }
         }

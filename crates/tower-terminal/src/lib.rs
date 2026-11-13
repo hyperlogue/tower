@@ -134,18 +134,8 @@ impl TerminalBackend {
             return Err(error("invalid_params", "Invalid native session identity"));
         }
         codex_block(async {
-            let host = tower_agents::codex_host::ensure(&self.paths).await?;
-            let mut client =
-                tower_agents::codex_service::Client::connect(&host.config.endpoint).await?;
-            let response = client
-                .request(
-                    "thread/read",
-                    serde_json::json!({"threadId":id,"includeTurns":false}),
-                )
-                .await?;
-            codex_candidate(&response["thread"], &host.config.endpoint)
-                .filter(|candidate| candidate.native.id == id)
-                .ok_or(tower_agents::codex_service::Error::Protocol)
+            let config = tower_agents::codex_service::Config::load(&self.paths)?;
+            codex_thread(&self.paths, config, id).await
         })
     }
     fn codex_mode(&self, request: &SessionOpenParams) -> Result<String> {
@@ -170,6 +160,24 @@ impl TerminalBackend {
         })?;
         Ok("app-server".into())
     }
+}
+/// Reads the conversation `id` from the Codex app-server at `config`.
+async fn codex_thread(
+    paths: &tower_pal::Paths,
+    config: tower_agents::codex_service::Config,
+    id: &str,
+) -> tower_agents::codex_service::Result<tower_agents::inventory::Candidate> {
+    let host = tower_agents::codex_host::ensure_configured(paths, config).await?;
+    let mut client = tower_agents::codex_service::Client::connect(&host.config.endpoint).await?;
+    let response = client
+        .request(
+            "thread/read",
+            serde_json::json!({"threadId":id,"includeTurns":false}),
+        )
+        .await?;
+    codex_candidate(&response["thread"], &host.config.endpoint)
+        .filter(|candidate| candidate.native.id == id)
+        .ok_or(tower_agents::codex_service::Error::Protocol)
 }
 fn codex_block<T>(
     operation: impl std::future::Future<Output = tower_agents::codex_service::Result<T>>,
@@ -767,28 +775,8 @@ impl ManagedBackend for TerminalBackend {
             .map_err(|e| error("invalid_params", &e.to_string()))?;
         pool::ensure(&self.paths)
             .map_err(|_| error("pool_unavailable", "Cannot connect to terminal pool"))?;
-        let mut bytes = [0; 8];
-        getrandom::fill(&mut bytes)
-            .map_err(|_| error("internal_error", "Random source unavailable"))?;
-        let generation: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        let root = self.paths.state.join("sessions").join(id).join(&generation);
-        let run = self.paths.run.join("agents");
-        tower_pal::private_dir(&root)
-            .and_then(|_| tower_pal::private_dir(&run))
+        let plan = launcher::plan(&self.paths, id, spec.clone(), None)
             .map_err(|_| error("internal_error", "Cannot create session directory"))?;
-        let plan = tower_agents::runtime::LauncherPlan {
-            id: id.into(),
-            generation: generation.clone(),
-            state_dir: root.to_string_lossy().into_owned(),
-            tower_socket: self.paths.socket.to_string_lossy().into_owned(),
-            control_socket: run
-                .join(format!("{generation}.sock"))
-                .to_string_lossy()
-                .into_owned(),
-            spec: spec.clone(),
-            continue_turn: false,
-            embedding: None,
-        };
         let binding = Binding {
             name: id.into(),
             plan,
@@ -1004,25 +992,8 @@ impl ManagedBackend for TerminalBackend {
                         "Session state belongs to another incarnation",
                     ));
                 }
-                if state.private.get("native_resumable") == Some(&serde_json::Value::Bool(false)) {
-                    return Err(error(
-                        "resume_unavailable",
-                        "This native conversation is ephemeral",
-                    ));
-                }
-                spec.resume = Some(state.native.ok_or_else(|| {
-                    error(
-                        "resume_unavailable",
-                        "The agent has not reported a native session identity",
-                    )
-                })?);
-                spec.native_home = state
-                    .private
-                    .get("native_home")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned)
-                    .or(spec.native_home);
-                spec.cwd = state.cwd;
+                spec = launcher::continued(spec, state)
+                    .map_err(|reason| error("resume_unavailable", reason))?;
             }
             Err(e)
                 if e.kind() == std::io::ErrorKind::NotFound
