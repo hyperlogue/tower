@@ -150,6 +150,9 @@ fn managed_structured_session_needs_no_process_or_terminal_and_recovers_its_bind
     let backend = Arc::new(StructuredBackend::new("acp", store.clone()));
     install(&mut s, "acp", vec![backend.clone()]);
     let id = open(&s, None);
+    // Reads return what was last observed; the backend's change report,
+    // which runs maintenance, is what observes it.
+    s.maintain().unwrap();
     let record = call(&s, "agent.get", serde_json::json!({"id":id}), human()).unwrap();
     assert_eq!(record["ownership"], "owned");
     assert_eq!(record["protocol"], "acp");

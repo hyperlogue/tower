@@ -65,7 +65,8 @@ impl TerminalBackend {
             replaced: Default::default(),
         }
     }
-    /// One pool subscription and state watch shared by every `watch` caller.
+    /// One pool subscription and one watch each on session state and the
+    /// configuration, shared by every `watch` caller.
     fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
         self.changes
             .get_or_init(|| {
@@ -88,6 +89,21 @@ impl TerminalBackend {
                         });
                     }
                     Err(e) => eprintln!("tower: managed session state is unobservable: {e}"),
+                }
+                // The configuration decides what a session can do, for
+                // example whether messages may be typed into it.
+                let config = self.paths.config_home.join("tower/config.toml");
+                match tower_pal::FileWatch::new(std::slice::from_ref(&config)) {
+                    Ok(mut config) => {
+                        let bump = bump.clone();
+                        tokio::spawn(async move {
+                            loop {
+                                config.changed().await;
+                                bump();
+                            }
+                        });
+                    }
+                    Err(e) => eprintln!("tower: configuration changes are unobservable: {e}"),
                 }
                 tokio::spawn(pool::watch(self.paths.clone(), bump));
                 changed

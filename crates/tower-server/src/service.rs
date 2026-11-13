@@ -896,7 +896,6 @@ impl Service {
                     check.params = value(IdParams { id: id.clone() })?;
                     self.approval_dispatch(&check, &actor)?;
                 }
-                self.sync_managed().map_err(storage)?;
                 self.publish()?;
                 let state = self
                     .published
@@ -1144,7 +1143,6 @@ impl Service {
             }
             "agent.list" => {
                 require(&actor, "read")?;
-                self.sync_managed().map_err(storage)?;
                 let mut p: ListParams = params(&request.params)?;
                 let prefix = p
                     .filter
@@ -1168,7 +1166,6 @@ impl Service {
             }
             "agent.get" => {
                 require(&actor, "read")?;
-                self.sync_managed().map_err(storage)?;
                 let p: IdParams = params(&request.params)?;
                 value(self.resolve(&p.id)?.record)
             }

@@ -819,8 +819,16 @@ cat
     assert!(!second.status.success());
     let error: Value = serde_json::from_slice(&second.stdout).unwrap();
     assert_eq!(error["error"]["data"]["reason"], "target_busy_pty");
+    // A configuration change reaches running sessions without a restart.
     f.config("[inject.opencode]\npty=false\n");
-    assert_eq!(f.call(&["get", id])["caps"]["message"], "none");
+    let until = Instant::now() + Duration::from_secs(5);
+    while f.call(&["get", id])["caps"]["message"] != "none" {
+        assert!(
+            Instant::now() < until,
+            "the session still accepts typed messages"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
     f.call(&["kill", id]);
 }
 
