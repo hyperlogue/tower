@@ -574,3 +574,57 @@ fn vcs_agents_are_per_phase_private_and_never_replayed_after_an_uncertain_push()
         .unwrap();
     assert!(!retained.contains("agent-c.sock"));
 }
+
+#[test]
+fn agent_activity_refreshes_a_checkout_at_most_once_per_interval() {
+    use std::time::{Duration, Instant};
+    let f = Fixture::new();
+    let repo = f.repo();
+    let id = f.call(&["checkout", "register", repo.to_str().unwrap()])["checkouts"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let agent = f.call(&[
+        "register",
+        "--harness",
+        "fixture",
+        "--cwd",
+        repo.to_str().unwrap(),
+    ]);
+    let agent = agent["id"].as_str().unwrap();
+    let wait = |dirty: bool| {
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            let row = f.call(&["checkout", "get", &id]);
+            if row["dirty"] == dirty {
+                return row;
+            }
+            assert!(Instant::now() < until, "expected dirty={dirty}: {row}");
+            std::thread::sleep(Duration::from_millis(40));
+        }
+    };
+    // Editing a file touches nothing Git watches; only the agent's activity
+    // tells Tower to look. Let the interval since registration pass first.
+    wait(false);
+    std::thread::sleep(Duration::from_millis(2200));
+    std::fs::write(repo.join("file"), "edited\n").unwrap();
+    f.call(&["tags", agent, "--add", "start"]);
+    let first = wait(true)["revision"].as_u64().unwrap();
+    // A burst of activity while the tree keeps changing: every state would
+    // be a new revision if each event refreshed the checkout.
+    for n in 0..8 {
+        let text = if n % 2 == 0 { "initial\n" } else { "edited\n" };
+        std::fs::write(repo.join("file"), text).unwrap();
+        f.call(&["tags", agent, "--add", &format!("t{n}")]);
+        std::thread::sleep(Duration::from_millis(60));
+    }
+    std::fs::write(repo.join("file"), "initial\n").unwrap();
+    f.call(&["tags", agent, "--add", "last"]);
+    // The refresh at the end of the interval sees the final state.
+    let last = wait(false)["revision"].as_u64().unwrap();
+    assert!(
+        last - first <= 2,
+        "{} refreshes changed the checkout",
+        last - first
+    );
+}

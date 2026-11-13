@@ -5,6 +5,8 @@ use std::{collections::BTreeSet, path::PathBuf, sync::Arc, time::Duration};
 use tower_protocol::*;
 use tower_store::{Store, StoredCheckout, StoredVcsOperation};
 use tower_vcs::{Binding, Prepared};
+/// The least time between two checkout refreshes that agent activity causes.
+const HINT_INTERVAL: Duration = Duration::from_secs(2);
 
 type Result<T> = std::result::Result<T, RpcError>;
 pub(crate) fn failure(_: impl std::fmt::Display) -> RpcError {
@@ -402,7 +404,8 @@ impl Vcs {
             Err(e) => Err(e),
         }
     }
-    /// Keeps checkout observations current from Git metadata changes and agent activity.
+    /// Keeps checkout observations current from Git metadata changes, which
+    /// refresh at once, and from agent activity, which is rate limited.
     pub async fn observe_changes(
         self: Arc<Self>,
         mut events: tokio::sync::broadcast::Receiver<Arc<EventNotification>>,
@@ -412,6 +415,11 @@ impl Vcs {
         let (due, mut pending) = tokio::sync::mpsc::unbounded_channel::<String>();
         let mut watched: BTreeMap<String, tokio::task::JoinHandle<()>> = BTreeMap::new();
         let mut attempted: BTreeSet<(String, String)> = BTreeSet::new();
+        // Agent activity only hints that a working tree may have changed, so
+        // it refreshes a checkout at most once per interval; the hints that
+        // arrive in between are answered by one refresh at its end.
+        let mut refreshed: BTreeMap<String, tokio::time::Instant> = BTreeMap::new();
+        let mut hinted: BTreeMap<String, tokio::time::Instant> = BTreeMap::new();
         loop {
             if let Ok(checkouts) = self.store.checkouts(&CheckoutFilter::default()) {
                 let ids: BTreeSet<_> = checkouts.iter().map(|c| c.record.id.clone()).collect();
@@ -450,6 +458,7 @@ impl Vcs {
                     }
                 }
             }
+            let next_hint = hinted.values().min().copied();
             tokio::select! {
                 _ = changes.changed() => {}
                 event = events.recv() => match event {
@@ -457,12 +466,30 @@ impl Vcs {
                         if let Ok(agent) = self.store.agent(&event.params.id)
                             && let Some(checkout) = agent.record.checkout_id
                         {
-                            let _ = due.send(checkout);
+                            match refreshed.get(&checkout) {
+                                Some(at) if at.elapsed() < HINT_INTERVAL => {
+                                    hinted.entry(checkout).or_insert(*at + HINT_INTERVAL);
+                                }
+                                _ => {
+                                    let _ = due.send(checkout);
+                                }
+                            }
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
                     _ => {}
                 },
+                _ = async { tokio::time::sleep_until(next_hint.unwrap_or_else(tokio::time::Instant::now)).await },
+                    if next_hint.is_some() =>
+                {
+                    let now = tokio::time::Instant::now();
+                    hinted.retain(|checkout, at| {
+                        if *at <= now {
+                            let _ = due.send(checkout.clone());
+                        }
+                        *at > now
+                    });
+                }
                 Some(first) = pending.recv() => {
                     // Coalesce a burst of Git writes into one observation per checkout.
                     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -471,7 +498,10 @@ impl Vcs {
                         ids.insert(id);
                     }
                     let mut groups = BTreeSet::new();
+                    refreshed.retain(|id, _| watched.contains_key(id));
                     for id in ids {
+                        hinted.remove(&id);
+                        refreshed.insert(id.clone(), tokio::time::Instant::now());
                         let Ok(_permit) = self.gate.clone().acquire_owned().await else { return };
                         if let Ok(c) = self.checkout(&id)
                             && let Ok(binding) = Self::binding(&c)
