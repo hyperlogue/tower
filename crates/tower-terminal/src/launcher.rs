@@ -169,6 +169,7 @@ pub async fn run(path: &Path) -> io::Result<i32> {
         updated_at: now(),
         stop_requested: false,
         exit_code: None,
+        attention: None,
         private: Default::default(),
     };
     if plan.spec.fork

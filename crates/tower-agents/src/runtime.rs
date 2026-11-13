@@ -104,6 +104,10 @@ pub struct RuntimeState {
     pub updated_at: u64,
     pub stop_requested: bool,
     pub exit_code: Option<i32>,
+    /// The `seq` at which the session last began to need its user: a wait,
+    /// a finished turn, an error or an unrequested end. Work clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attention: Option<u64>,
     #[serde(default)]
     pub private: BTreeMap<String, serde_json::Value>,
 }

@@ -111,6 +111,40 @@ async fn embedder_runs_watches_and_stops_a_session_without_daemon_or_pool() {
     std::fs::write(work.join("phase"), "idle").unwrap();
     await_session(&local, &mut watch, "idle", |s| s.state.status == "idle").await;
 
+    // The dashboard's view: one record per session, in the daemon's shape.
+    let record = local.records().unwrap().pop().unwrap();
+    assert_eq!(
+        (
+            record.id.as_str(),
+            record.status.as_str(),
+            record.harness.as_str()
+        ),
+        ("one", "idle", "claude-code")
+    );
+    assert_eq!(record.native_session_id.as_deref(), Some("native-claude"));
+    let detail = serde_json::to_value(&record.status_detail).unwrap();
+    assert_eq!(detail["model"], "fixture-model");
+    assert!(record.caps.kill && record.caps.resume && !record.caps.attach);
+    assert!(record.needs_attention, "a finished turn awaits its user");
+    let pinned = local
+        .patch_tags("one", &["pinned".into()], &[], true)
+        .unwrap();
+    assert!(pinned.tags.contains("pinned") && !pinned.needs_attention);
+    watch.changed().await;
+    std::fs::write(work.join("phase"), "work").unwrap();
+    await_session(&local, &mut watch, "working again", |s| {
+        s.state.status == "working"
+    })
+    .await;
+    std::fs::write(work.join("phase"), "idle").unwrap();
+    await_session(&local, &mut watch, "idle again", |s| {
+        s.state.status == "idle"
+    })
+    .await;
+    let record = local.records().unwrap().pop().unwrap();
+    assert!(record.tags.contains("pinned") && record.needs_attention);
+    assert!(local.patch_tags("absent", &[], &[], true).is_err());
+
     let args = std::fs::read_to_string(work.join("claude.args")).unwrap();
     assert!(args.contains("--settings"), "{args}");
     assert!(!args.contains("--mcp-config"), "{args}");

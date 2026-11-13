@@ -13,6 +13,7 @@ use tower_agents::{
     runtime::{AgentSpec, Embedding, LauncherPlan, RuntimeState},
 };
 use tower_pal::Paths;
+use tower_protocol::{AgentRecord, Capabilities};
 
 pub struct Local {
     embedding: Embedding,
@@ -26,6 +27,16 @@ pub struct Session {
     pub state: RuntimeState,
     /// The launcher that wrote `state` is still running.
     pub live: bool,
+}
+
+/// What a user attached to a session, kept beside its launches.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct Notes {
+    #[serde(default)]
+    tags: std::collections::BTreeSet<String>,
+    /// The launch and `seq` up to which attention was acknowledged.
+    #[serde(default)]
+    acknowledged: Option<(String, u64)>,
 }
 
 fn random(bytes: usize) -> io::Result<String> {
@@ -227,11 +238,161 @@ impl Local {
         Ok(found)
     }
 
-    /// Signals whenever a launcher records new state.
+    /// Signals whenever a launcher records new state or a session's tags or
+    /// acknowledgement change.
     pub fn watch(&self) -> io::Result<tower_pal::TreeWatch> {
         let dir = self.sessions_dir();
         tower_pal::private_dir(&dir)?;
-        tower_pal::TreeWatch::new(&dir, "state.json")
+        tower_pal::TreeWatch::new(&dir, None)
+    }
+
+    fn notes(&self, id: &str) -> io::Result<Notes> {
+        match tower_pal::read_private(&self.sessions_dir().join(id).join("notes.json")) {
+            Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Notes::default()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Each session as the daemon's registry would list it, from its latest
+    /// launch. `needs_attention` holds until [`patch_tags`] acknowledges it.
+    ///
+    /// [`patch_tags`]: Self::patch_tags
+    pub fn records(&self) -> io::Result<Vec<AgentRecord>> {
+        let mut latest = std::collections::BTreeMap::<String, Session>::new();
+        for session in self.sessions()? {
+            let newer = latest.get(&session.plan.id).is_none_or(|known| {
+                (session.live, session.state.updated_at) > (known.live, known.state.updated_at)
+            });
+            if newer {
+                latest.insert(session.plan.id.clone(), session);
+            }
+        }
+        latest
+            .into_values()
+            .map(|session| self.record(session))
+            .collect()
+    }
+    fn record(&self, session: Session) -> io::Result<AgentRecord> {
+        let Session { plan, state, live } = session;
+        let notes = self.notes(&plan.id)?;
+        let resumable = state.native.is_some()
+            && state.private.get("native_resumable") != Some(&serde_json::Value::Bool(false));
+        let acknowledged = notes
+            .acknowledged
+            .filter(|(generation, _)| *generation == state.generation)
+            .map(|(_, seq)| seq);
+        Ok(AgentRecord {
+            display_name: state.display_name,
+            node: "local".into(),
+            harness: state.harness.id().into(),
+            mode: plan.spec.mode.clone(),
+            ownership: "owned".into(),
+            protocol: Some("terminal".into()),
+            trust: "strong".into(),
+            native_session_id: state.native.map(|n| n.id),
+            pid: state.agent_pid,
+            pid_start_time: state.agent_start_time,
+            shared_process: plan.spec.uses_app_server(),
+            cwd: self.paths.display_cwd(&state.cwd).unwrap_or(state.cwd),
+            checkout_id: None,
+            status: if live {
+                state.status
+            } else if state.exit_code.is_some() {
+                "exited".into()
+            } else {
+                "lost".into()
+            },
+            status_detail: Some(
+                serde_json::from_value(serde_json::to_value(&state.detail)?)
+                    .map_err(io::Error::other)?,
+            ),
+            caps: Capabilities {
+                kill: live,
+                resume: resumable,
+                ..Capabilities::unavailable("embedded")
+            },
+            pool_session: None,
+            attach_count: 0,
+            sources: vec!["launcher".into()],
+            registered_at: std::fs::metadata(self.sessions_dir().join(&plan.id))
+                .and_then(|meta| meta.created())
+                .ok()
+                .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(state.updated_at, |at| at.as_millis() as u64),
+            updated_at: state.updated_at,
+            last_seen: state.updated_at,
+            revision: state.seq,
+            labels: Default::default(),
+            tags: notes.tags,
+            needs_attention: state
+                .attention
+                .is_some_and(|since| acknowledged.is_none_or(|seq| since > seq)),
+            task_refs: Vec::new(),
+            sync_state: "synced".into(),
+            id: plan.id,
+        })
+    }
+
+    /// Adds and removes tags on a session, and with `clear_attention`
+    /// acknowledges what its latest launch has reported so far.
+    pub fn patch_tags(
+        &self,
+        id: &str,
+        add: &[String],
+        remove: &[String],
+        clear_attention: bool,
+    ) -> io::Result<AgentRecord> {
+        let valid = |tags: &[String]| {
+            tags.len() <= 64
+                && tags.iter().all(|tag| {
+                    !tag.is_empty()
+                        && tag.chars().count() <= 64
+                        && tag.trim() == tag
+                        && !tag.chars().any(char::is_control)
+                })
+        };
+        let invalid = |reason| io::Error::new(io::ErrorKind::InvalidInput, reason);
+        if !valid(add) || !valid(remove) || add.iter().any(|tag| remove.contains(tag)) {
+            return Err(invalid(
+                "tags must be distinct, nonempty and at most 64 characters",
+            ));
+        }
+        // Validates `id` before it names a directory.
+        self.paths.token_path(id)?;
+        let session = self
+            .sessions()?
+            .into_iter()
+            .filter(|s| s.plan.id == id)
+            .max_by_key(|s| (s.live, s.state.updated_at))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "session is not recorded"))?;
+        let dir = self.sessions_dir().join(id);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let _lock = loop {
+            match tower_pal::SingletonLock::acquire(&dir.join("notes.lock")) {
+                Ok(lock) => break lock,
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < until =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5))
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        let mut notes = self.notes(id)?;
+        for tag in remove {
+            notes.tags.remove(tag);
+        }
+        notes.tags.extend(add.iter().cloned());
+        if notes.tags.len() > 64 {
+            return Err(invalid("a session may have at most 64 tags"));
+        }
+        if clear_attention {
+            notes.acknowledged = Some((session.state.generation.clone(), session.state.seq));
+        }
+        tower_pal::write_private(&dir.join("notes.json"), &serde_json::to_vec(&notes)?)?;
+        self.record(session)
     }
 
     /// Asks the running launcher of `id` to clean up and end its agent. This

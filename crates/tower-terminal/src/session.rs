@@ -67,6 +67,45 @@ impl SessionPublisher {
     }
 }
 
+/// Follows status changes to record when the session began to need its
+/// user, by the rules the daemon's registry applies to observed sessions.
+struct Attention {
+    status: String,
+    error: Option<String>,
+    since: Option<u64>,
+}
+impl Attention {
+    fn new(state: &RuntimeState) -> Self {
+        Self {
+            status: state.status.clone(),
+            error: state.detail.error.clone(),
+            since: state.attention,
+        }
+    }
+    fn note(&mut self, state: &mut RuntimeState) {
+        let status = state.status.as_str();
+        if status != "unknown" && status != self.status {
+            if matches!(status, "starting" | "working")
+                || state.stop_requested && matches!(status, "exited" | "lost")
+            {
+                self.since = None;
+            } else if matches!(
+                status,
+                "waiting_input" | "waiting_approval" | "lost" | "exited"
+            ) || status == "idle" && self.status == "working"
+            {
+                self.since = Some(state.seq);
+            }
+            self.status = status.into();
+        }
+        if state.detail.error.is_some() && state.detail.error != self.error {
+            self.since = Some(state.seq);
+        }
+        self.error = state.detail.error.clone();
+        state.attention = self.since;
+    }
+}
+
 pub(crate) async fn drive(
     mut task: SessionTask,
     mut updates: mpsc::Receiver<SessionUpdate>,
@@ -77,6 +116,7 @@ pub(crate) async fn drive(
 ) -> io::Result<i32> {
     let mut dirty = false;
     let mut exited = None;
+    let mut attention = Attention::new(&state);
     loop {
         tokio::select! {
             biased;
@@ -88,6 +128,7 @@ pub(crate) async fn drive(
             }
             Some(update) = updates.recv(), if exited.is_none() => {
                 state = update.state;
+                attention.note(&mut state);
                 let result = persist(&state);
                 dirty = result.is_err();
                 if let Some(receipt) = update.receipt { let _ = receipt.send(result); }
@@ -109,6 +150,7 @@ pub(crate) async fn drive(
                 state.exit_code = Some(code);
                 state.seq = state.seq.saturating_add(1);
                 state.updated_at = super::launcher::now();
+                attention.note(&mut state);
                 dirty = persist(&state).is_err();
                 exited = Some(code);
             }
@@ -136,6 +178,33 @@ mod tests {
             "seq":0,"updated_at":0,"stop_requested":false,"exit_code":null
         }))
         .unwrap()
+    }
+    #[test]
+    fn attention_starts_at_waits_and_finished_turns_and_ends_with_work() {
+        let mut state = state();
+        let mut attention = Attention::new(&state);
+        let mut step = |status: &str, seq| {
+            state.status = status.into();
+            state.seq = seq;
+            attention.note(&mut state);
+            state.attention
+        };
+        assert_eq!(step("idle", 1), None);
+        assert_eq!(step("working", 2), None);
+        assert_eq!(step("unknown", 3), None);
+        assert_eq!(step("idle", 4), Some(4));
+        assert_eq!(step("idle", 5), Some(4));
+        assert_eq!(step("working", 6), None);
+        assert_eq!(step("waiting_approval", 7), Some(7));
+        assert_eq!(step("working", 8), None);
+        state.detail.error = Some("agent_turn_failed".into());
+        state.seq = 9;
+        attention.note(&mut state);
+        assert_eq!(state.attention, Some(9));
+        state.stop_requested = true;
+        state.status = "exited".into();
+        attention.note(&mut state);
+        assert_eq!(state.attention, None);
     }
     #[tokio::test(start_paused = true)]
     async fn failed_writes_keep_the_task_and_stop_control_alive_and_retry_latest_facts() {
