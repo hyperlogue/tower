@@ -30,11 +30,32 @@ pub struct TerminalBackend {
         )>,
     >,
     changes: std::sync::OnceLock<tokio::sync::watch::Sender<u64>>,
-    /// Pool sessions ended by an upgrade. Only these resume on their own: a
-    /// pool that was stopped or that crashed stays down.
-    replaced: std::sync::Mutex<std::collections::BTreeSet<String>>,
+    /// Serializes changes to the record of sessions that an upgrade ended.
+    replaced: std::sync::Mutex<()>,
 }
 impl TerminalBackend {
+    /// Updates the names of pool sessions that an upgrade ended and that have
+    /// not started again. Only these resume on their own: a pool that was
+    /// stopped or that crashed stays down. The record is a file so that a
+    /// daemon restart during an upgrade does not strand them.
+    fn replaced<T>(
+        &self,
+        change: impl FnOnce(&mut std::collections::BTreeSet<String>) -> T,
+    ) -> std::io::Result<T> {
+        let _guard = self.replaced.lock().unwrap_or_else(|e| e.into_inner());
+        let path = self.paths.state.join("pool-replaced.json");
+        let old: std::collections::BTreeSet<String> = match tower_pal::read_private(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Default::default(),
+            Err(e) => return Err(e),
+        };
+        let mut new = old.clone();
+        let result = change(&mut new);
+        if new != old {
+            tower_pal::write_private(&path, &serde_json::to_vec(&new)?)?;
+        }
+        Ok(result)
+    }
     pub fn new(paths: Paths) -> Self {
         Self {
             paths,
@@ -508,6 +529,63 @@ fn pool_unavailable(e: std::io::Error) -> RpcError {
         error("pool_unavailable", "Cannot start terminal pool")
     }
 }
+impl TerminalBackend {
+    fn recover_replaced(
+        &self,
+        session: &ManagedSession,
+        old: &Binding,
+    ) -> Result<Option<PreparedSession>> {
+        if pool::list(&self.paths)
+            .map_err(|_| error("backend_unavailable", "Cannot inspect pool"))?
+            .iter()
+            .any(|r| r.name == old.name)
+        {
+            return Ok(None);
+        }
+        match launcher::read_state(&std::path::Path::new(&old.plan.state_dir).join("state.json")) {
+            Ok(state) => {
+                if state.id != session.id || state.generation != old.plan.generation {
+                    return Err(error("backend_error", "Session state identity mismatch"));
+                }
+                if launcher_alive(&state)?
+                    || state.exit_code.is_some()
+                    || state.stop_requested
+                    || state.native.is_none()
+                    || state.private.get("native_resumable")
+                        == Some(&serde_json::Value::Bool(false))
+                {
+                    return Ok(None);
+                }
+                let mut prepared = self.prepare_resume(session, None, None)?;
+                if state.status == "working" {
+                    let mut binding: Binding = decode(&prepared.binding)?;
+                    binding.plan.continue_turn = true;
+                    prepared.binding = encode(binding)?;
+                }
+                Ok(Some(prepared))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let plan: Plan = decode(session.launch.as_ref().expect("checked above"))?;
+                self.prepare(
+                    &session.id,
+                    &SessionOpenParams {
+                        checkout_id: None,
+                        resume: None,
+                        protocol: Some("terminal".into()),
+                        harness: plan.spec.harness.id().into(),
+                        cwd: plan.spec.cwd,
+                        mode: plan.spec.mode,
+                        args: plan.spec.args,
+                        headless: false,
+                        terminal: Some(plan.terminal),
+                    },
+                )
+                .map(Some)
+            }
+            Err(_) => Err(error("backend_error", "Cannot read recovery state")),
+        }
+    }
+}
 impl ManagedBackend for TerminalBackend {
     fn clipboard(
         &self,
@@ -894,6 +972,7 @@ impl ManagedBackend for TerminalBackend {
         }
         match pool::request(&self.paths, &Request::Create { launch }) {
             Ok(Reply::Created { session: created }) if created.name == binding.name => {
+                let _ = self.replaced(|names| names.remove(&binding.name));
                 self.state(session, Some(&created))
             }
             _ => Err(error(
@@ -909,7 +988,7 @@ impl ManagedBackend for TerminalBackend {
         // Sessions end with their pool, so none remain when it is not running.
         let records = match pool::list(&self.paths) {
             Ok(records) => records,
-            Err(e) if pool::absent(&e) => vec![],
+            Err(e) if pool::absent(&e) && !pool::changing(&self.paths) => vec![],
             Err(_) => return Err(error("backend_unavailable", "Terminal pool unavailable")),
         };
         sessions
@@ -1064,63 +1143,19 @@ impl ManagedBackend for TerminalBackend {
             return Ok(None);
         }
         let old = binding(session)?;
+        let unavailable = |_| error("backend_unavailable", "Cannot read replaced sessions");
         if !self
-            .replaced
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&old.name)
+            .replaced(|names| names.contains(&old.name))
+            .map_err(unavailable)?
         {
             return Ok(None);
         }
-        if pool::list(&self.paths)
-            .map_err(|_| error("backend_unavailable", "Cannot inspect pool"))?
-            .iter()
-            .any(|r| r.name == old.name)
-        {
-            return Ok(None);
+        let prepared = self.recover_replaced(session, &old)?;
+        if prepared.is_none() {
+            self.replaced(|names| names.remove(&old.name))
+                .map_err(unavailable)?;
         }
-        match launcher::read_state(&std::path::Path::new(&old.plan.state_dir).join("state.json")) {
-            Ok(state) => {
-                if state.id != session.id || state.generation != old.plan.generation {
-                    return Err(error("backend_error", "Session state identity mismatch"));
-                }
-                if launcher_alive(&state)?
-                    || state.exit_code.is_some()
-                    || state.stop_requested
-                    || state.native.is_none()
-                    || state.private.get("native_resumable")
-                        == Some(&serde_json::Value::Bool(false))
-                {
-                    return Ok(None);
-                }
-                let mut prepared = self.prepare_resume(session, None, None)?;
-                if state.status == "working" {
-                    let mut binding: Binding = decode(&prepared.binding)?;
-                    binding.plan.continue_turn = true;
-                    prepared.binding = encode(binding)?;
-                }
-                Ok(Some(prepared))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let plan: Plan = decode(session.launch.as_ref().expect("checked above"))?;
-                self.prepare(
-                    &session.id,
-                    &SessionOpenParams {
-                        checkout_id: None,
-                        resume: None,
-                        protocol: Some("terminal".into()),
-                        harness: plan.spec.harness.id().into(),
-                        cwd: plan.spec.cwd,
-                        mode: plan.spec.mode,
-                        args: plan.spec.args,
-                        headless: false,
-                        terminal: Some(plan.terminal),
-                    },
-                )
-                .map(Some)
-            }
-            Err(_) => Err(error("backend_error", "Cannot read recovery state")),
-        }
+        Ok(prepared)
     }
     fn terminal(&self) -> Option<&dyn TerminalAccess> {
         Some(self)
@@ -1148,13 +1183,10 @@ impl TerminalAccess for TerminalBackend {
         }
     }
     fn restart_pool(&self) -> Result<()> {
-        // Held across the restart so that a session seen lost meanwhile waits
-        // to learn that it was replaced.
-        let mut replaced = self.replaced.lock().unwrap_or_else(|e| e.into_inner());
-        *replaced = pool::restart(&self.paths)
-            .map_err(|_| error("pool_unavailable", "Cannot restart terminal pool"))?
-            .into_iter()
-            .collect();
+        pool::restart(&self.paths, |ended| {
+            self.replaced(|names| names.extend(ended))
+        })
+        .map_err(|_| error("pool_unavailable", "Cannot restart terminal pool"))?;
         Ok(())
     }
 }

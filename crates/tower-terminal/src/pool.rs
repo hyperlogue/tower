@@ -50,7 +50,12 @@ pub(crate) fn absent(e: &Error) -> bool {
 /// Starts a pool if none is running. One with another version is refused
 /// rather than replaced, because replacing it ends its sessions.
 pub(crate) fn ensure(paths: &Paths) -> Result<()> {
-    let outdated = || Err(Error::new(io::ErrorKind::Unsupported, "pool has another version"));
+    let outdated = || {
+        Err(Error::new(
+            io::ErrorKind::Unsupported,
+            "pool has another version",
+        ))
+    };
     match version(paths)? {
         Some(wire::VERSION) => return Ok(()),
         Some(_) => return outdated(),
@@ -67,16 +72,19 @@ pub(crate) fn ensure(paths: &Paths) -> Result<()> {
 pub(crate) fn outdated(e: &Error) -> bool {
     e.kind() == io::ErrorKind::Unsupported
 }
-/// Replaces the running pool, ending its sessions, and returns their names.
-pub(crate) fn restart(paths: &Paths) -> Result<Vec<String>> {
+/// Replaces the running pool, ending its sessions. `ending` receives their
+/// names while they still run.
+pub(crate) fn restart(paths: &Paths, ending: impl FnOnce(Vec<String>) -> Result<()>) -> Result<()> {
     let _lock = SingletonLock::acquire(&paths.run.join("pool-start.lock"))?;
-    let mut ended = vec![];
     if version(paths)?.is_some() {
-        ended = list(paths)?.into_iter().map(|s| s.name).collect();
+        ending(list(paths)?.into_iter().map(|s| s.name).collect())?;
         shutdown(paths)?;
     }
-    start(paths)?;
-    Ok(ended)
+    start(paths)
+}
+/// Whether a pool is being started or replaced right now.
+pub(crate) fn changing(paths: &Paths) -> bool {
+    SingletonLock::acquire(&paths.run.join("pool-start.lock")).is_err()
 }
 fn shutdown(paths: &Paths) -> Result<()> {
     core(paths, &Request::Shutdown)?;

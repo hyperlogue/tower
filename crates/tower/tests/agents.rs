@@ -365,6 +365,39 @@ fn launch_refuses_a_pool_of_another_version_instead_of_replacing_it() {
 }
 
 #[test]
+fn a_daemon_restart_finishes_an_interrupted_pool_upgrade() {
+    let f = Fixture::new();
+    let opened = f.call(&["launch", "claude", "--headless"]);
+    let id = opened["id"].as_str().unwrap();
+    let before = f.wait(id, "idle");
+    let launcher = tower_pal::process_identity(before["pid"].as_u64().unwrap() as u32)
+        .unwrap()
+        .parent;
+    let pool = tower_pal::process_identity(launcher).unwrap().parent;
+    f.call(&["daemon", "stop"]);
+    // What an upgrade records before it ends the pool's sessions.
+    let replaced = f.root.path().join("s/tower/pool-replaced.json");
+    std::fs::write(&replaced, json!([before["pool_session"]]).to_string()).unwrap();
+    assert!(
+        Command::new("kill")
+            .args(["-KILL", &pool.to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let until = Instant::now() + Duration::from_secs(5);
+    while tower_pal::process_identity(launcher).is_ok() {
+        assert!(Instant::now() < until);
+        thread::sleep(Duration::from_millis(20));
+    }
+    f.call(&["pool", "upgrade"]);
+    let recovered = f.wait(id, "idle");
+    assert_ne!(recovered["pid"], before["pid"]);
+    assert_eq!(recovered["native_session_id"], before["native_session_id"]);
+    assert_eq!(std::fs::read_to_string(&replaced).unwrap(), "[]");
+}
+
+#[test]
 fn pool_upgrade_replaces_the_pool_and_resumes_its_sessions() {
     let f = Fixture::new();
     let opened = f.call(&["launch", "claude", "--headless"]);
