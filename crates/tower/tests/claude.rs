@@ -41,8 +41,8 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         for (binary, args) in [
-            (env!("CARGO_BIN_EXE_tower-terminal-pool"), &["stop"][..]),
             (env!("CARGO_BIN_EXE_tower-cli"), &["daemon", "stop"][..]),
+            (env!("CARGO_BIN_EXE_tower-terminal-pool"), &["stop"][..]),
         ] {
             let _ = self
                 .program(binary, args)
