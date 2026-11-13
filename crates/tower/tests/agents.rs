@@ -1477,3 +1477,54 @@ done
     assert!(row["status_detail"]["program"].is_null(), "{row}");
     f.call(&["kill", id]);
 }
+
+#[test]
+fn a_session_reports_its_launcher_version_and_a_mismatch_is_warned_about() {
+    let f = Fixture::new();
+    let opened = f.call(&["launch", "pi", "--headless"]);
+    let id = opened["id"].as_str().unwrap();
+    let row = f.wait(id, "idle");
+    assert_eq!(
+        row["status_detail"]["launcher_version"],
+        env!("CARGO_PKG_VERSION"),
+        "{row}"
+    );
+    assert!(row["status_detail"]["launcher_mismatch"].is_null(), "{row}");
+    let listed = f.command(&["ls"]).output().unwrap();
+    assert!(!String::from_utf8_lossy(&listed.stderr).contains("launcher version"));
+
+    // The launcher of a session started before an upgrade keeps running.
+    fn find(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        std::fs::read_dir(dir).ok()?.flatten().find_map(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                find(&path)
+            } else {
+                (path.file_name()? == "state.json").then_some(path)
+            }
+        })
+    }
+    let path = find(f.root.path()).expect("the launcher's state file");
+    let mut state: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    state["version"] = "0.0.1".into();
+    let next = path.with_extension("next");
+    std::fs::write(&next, serde_json::to_vec(&state).unwrap()).unwrap();
+    std::fs::rename(&next, &path).unwrap();
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let row = f.call(&["get", id]);
+        if row["status_detail"]["launcher_mismatch"] == true {
+            assert_eq!(row["status_detail"]["launcher_version"], "0.0.1");
+            break;
+        }
+        assert!(Instant::now() < until, "{row}");
+        thread::sleep(Duration::from_millis(40));
+    }
+    let listed = f.command(&["ls"]).output().unwrap();
+    let warning = String::from_utf8_lossy(&listed.stderr);
+    assert!(
+        warning.contains(id) && warning.contains("launcher version 0.0.1"),
+        "{warning}"
+    );
+    f.call(&["kill", id]);
+}

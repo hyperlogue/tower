@@ -226,6 +226,7 @@ pub async fn run(path: &Path) -> io::Result<i32> {
         stop_requested: false,
         exit_code: None,
         attention: None,
+        version: Some(env!("CARGO_PKG_VERSION").into()),
         private: Default::default(),
     };
     if plan.spec.fork

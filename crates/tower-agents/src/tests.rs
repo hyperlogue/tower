@@ -195,6 +195,7 @@ fn state() -> RuntimeState {
         stop_requested: false,
         exit_code: None,
         attention: None,
+        version: None,
         private: Default::default(),
     }
 }

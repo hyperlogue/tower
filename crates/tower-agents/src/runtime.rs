@@ -110,6 +110,11 @@ pub struct RuntimeState {
     /// decides this for the sessions it observes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention: Option<u64>,
+    /// The Tower version of the launcher that runs the session. A launcher
+    /// keeps running across upgrades of the daemon; absent for one that
+    /// predates this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     #[serde(default)]
     pub private: BTreeMap<String, serde_json::Value>,
 }

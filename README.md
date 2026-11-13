@@ -95,6 +95,12 @@ work end when the program exits. Everything the protocol does not cover, such as
 launch, exit, loss and the native conversation, still comes from the launcher and
 the harness.
 
+A session's launcher keeps running when the daemon is upgraded. Each running
+terminal session reports its launcher's version as
+`status_detail.launcher_version`, with `launcher_mismatch` set when it differs
+from the daemon's. `tower-cli ls` prints a warning for such sessions; restart
+the session to move it to the current version.
+
 `host.metrics {}` takes no parameters. It returns a sample timestamp, CPU
 utilization, used/total memory, and available space on the filesystem containing
 the Tower user's home. Unavailable measurements are null; the first CPU sample

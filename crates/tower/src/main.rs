@@ -965,6 +965,18 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
                     "ID\tNAME\tHARNESS\tPROTOCOL\tMODE\tSTATUS\tATTENTION\tTAGS\tMESSAGE\tTRUST\tCWD\tATTACH"
                 );
                 for r in records {
+                    if let Some(tower_protocol::Value::Object(detail)) = &r.status_detail
+                        && detail.get("launcher_mismatch")
+                            == Some(&tower_protocol::Value::Bool(true))
+                        && let Some(tower_protocol::Value::String(version)) =
+                            detail.get("launcher_version")
+                    {
+                        eprintln!(
+                            "warning: session {} runs launcher version {}, which differs from the daemon's. Restart the session to update it.",
+                            visible(&r.id),
+                            visible(version)
+                        );
+                    }
                     let message = if r.caps.message == "none" {
                         format!("none: {}", r.caps.message_reason.unwrap_or_default())
                     } else {

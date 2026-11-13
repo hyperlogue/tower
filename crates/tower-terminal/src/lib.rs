@@ -509,11 +509,22 @@ impl TerminalBackend {
                         .and_then(|v| v.as_u64());
                 }
                 let mut detail = serde_json::to_value(&state.detail).unwrap_or_default();
-                if let (Some(program), Some(detail)) = (program, detail.as_object_mut()) {
-                    detail.insert(
-                        "program".into(),
-                        serde_json::to_value(program).unwrap_or_default(),
-                    );
+                if let Some(detail) = detail.as_object_mut() {
+                    if let Some(program) = program {
+                        detail.insert(
+                            "program".into(),
+                            serde_json::to_value(program).unwrap_or_default(),
+                        );
+                    }
+                    // A launcher outlives daemon upgrades, so a running
+                    // session may be served by an older or newer one.
+                    if live {
+                        let version = state.version.as_deref().unwrap_or("unknown");
+                        detail.insert("launcher_version".into(), version.into());
+                        if version != env!("CARGO_PKG_VERSION") {
+                            detail.insert("launcher_mismatch".into(), true.into());
+                        }
+                    }
                 }
                 result.metadata = tower_sessions::SessionMetadata {
                     shared_process: Some(binding.plan.spec.uses_app_server()),
