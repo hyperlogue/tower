@@ -93,7 +93,10 @@ impl Fixture {
             assert!(
                 Instant::now() < until,
                 "expected {status}: {row}; snapshot {}",
-                self.call(&["snapshot", id])
+                self.command(&["--json", "snapshot", id])
+                    .output()
+                    .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+                    .unwrap_or_default()
             );
             thread::sleep(Duration::from_millis(40));
         }
@@ -274,21 +277,35 @@ fn an_unapproved_project_environment_cannot_run_the_agent() {
 }
 
 #[test]
-fn pool_crash_recovers_native_conversations_but_never_reopens_killed_sessions() {
+fn a_lost_pool_leaves_its_sessions_lost_until_the_pool_is_upgraded() {
     let f = Fixture::new();
+    let starts = |harness: &str| {
+        std::fs::read_to_string(f.root.path().join(format!("{harness}.starts")))
+            .unwrap()
+            .lines()
+            .count()
+    };
     let opened = f.call(&["launch", "claude", "--headless"]);
     let id = opened["id"].as_str().unwrap();
-    let before = f.wait(id, "idle");
-    let root = f.root.path().join("s/tower/sessions").join(id);
-    let generation = std::fs::read_dir(root)
+    f.wait(id, "idle");
+    // Stopped while the daemon runs: it must not bring the pool back.
+    assert!(
+        f.program(env!("CARGO_BIN_EXE_tower-terminal-pool"), &["stop"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    f.wait(id, "lost");
+    thread::sleep(Duration::from_millis(500));
+    assert!(tower_pal::connect_blocking(&f.root.path().join("s/tower/run/pool.sock")).is_err());
+    assert_eq!(starts("claude"), 1);
+
+    let opened = f.call(&["launch", "pi", "--headless"]);
+    let crashed = opened["id"].as_str().unwrap();
+    let before = f.wait(crashed, "idle");
+    let launcher = tower_pal::process_identity(before["pid"].as_u64().unwrap() as u32)
         .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    let state: Value =
-        serde_json::from_slice(&std::fs::read(generation.join("state.json")).unwrap()).unwrap();
-    let launcher = state["launcher_pid"].as_u64().unwrap() as u32;
+        .parent;
     let pool = tower_pal::process_identity(launcher).unwrap().parent;
     f.call(&["daemon", "stop"]);
     assert!(
@@ -303,37 +320,48 @@ fn pool_crash_recovers_native_conversations_but_never_reopens_killed_sessions() 
         assert!(Instant::now() < until);
         thread::sleep(Duration::from_millis(20));
     }
-    let recovered = f.wait(id, "idle");
-    assert_ne!(recovered["pid"], before["pid"]);
-    assert_eq!(recovered["native_session_id"], before["native_session_id"]);
-    assert_eq!(
-        std::fs::read_to_string(f.root.path().join("claude.starts"))
-            .unwrap()
-            .lines()
-            .count(),
-        2
-    );
+    // Neither a daemon restart nor a new pool resumes what a crash ended.
+    f.wait(crashed, "lost");
+    let opened = f.call(&["launch", "opencode", "--headless"]);
+    f.wait(opened["id"].as_str().unwrap(), "idle");
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(f.call(&["get", crashed])["status"], "lost");
+    assert_eq!(f.call(&["get", id])["status"], "lost");
+    assert_eq!((starts("claude"), starts("pi")), (1, 1));
+}
+
+#[test]
+fn launch_refuses_a_pool_of_another_version_instead_of_replacing_it() {
+    use tower_pool_proto::{self as wire, Reply, Request};
+    let f = Fixture::new();
+    f.call(&["ls"]);
+    let listener =
+        std::os::unix::net::UnixListener::bind(f.root.path().join("s/tower/run/pool.sock"))
+            .unwrap();
+    thread::spawn(move || {
+        for mut stream in listener.incoming().flatten() {
+            while let Ok(frame) = wire::read_sync(&mut stream) {
+                let reply = match frame.json::<Request>() {
+                    Ok(Request::Hello { .. }) => Reply::Hello {
+                        version: wire::VERSION + 1,
+                        capabilities: vec![],
+                    },
+                    _ => Reply::Sessions { sessions: vec![] },
+                };
+                if wire::write_sync(&mut stream, &reply).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    let out = f.command(&["launch", "pi", "--headless"]).output().unwrap();
+    assert!(!out.status.success());
     assert!(
-        std::fs::read_to_string(f.root.path().join("claude.args"))
-            .unwrap()
-            .contains("--resume\nnative-claude-code")
+        String::from_utf8_lossy(&out.stderr).contains("tower-cli pool upgrade"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
     );
-    f.call(&["kill", id]);
-    assert!(
-        f.program(env!("CARGO_BIN_EXE_tower-terminal-pool"), &["stop"])
-            .status()
-            .unwrap()
-            .success()
-    );
-    f.call(&["daemon", "stop"]);
-    assert_eq!(f.call(&["get", id])["status"], "exited");
-    assert_eq!(
-        std::fs::read_to_string(f.root.path().join("claude.starts"))
-            .unwrap()
-            .lines()
-            .count(),
-        2
-    );
+    assert!(!f.root.path().join("pi.starts").exists());
 }
 
 #[test]
@@ -361,7 +389,19 @@ fn pool_upgrade_replaces_the_pool_and_resumes_its_sessions() {
             .unwrap()
             .contains("--resume\nnative-claude-code")
     );
+    // A killed session is not reopened by a later upgrade.
     f.call(&["kill", id]);
+    f.wait(id, "exited");
+    f.call(&["pool", "upgrade"]);
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(f.call(&["get", id])["status"], "exited");
+    assert_eq!(
+        std::fs::read_to_string(f.root.path().join("claude.starts"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
 }
 
 #[test]
@@ -388,22 +428,7 @@ fn missing_native_identity_fails_recovery_without_creating_a_new_conversation() 
         assert!(Instant::now() < until);
         thread::sleep(Duration::from_millis(20));
     }
-    let state: Value =
-        serde_json::from_slice(&std::fs::read(generation.join("state.json")).unwrap()).unwrap();
-    let launcher = state["launcher_pid"].as_u64().unwrap() as u32;
-    let pool = tower_pal::process_identity(launcher).unwrap().parent;
-    f.call(&["daemon", "stop"]);
-    assert!(
-        Command::new("kill")
-            .args(["-KILL", &pool.to_string()])
-            .status()
-            .unwrap()
-            .success()
-    );
-    while tower_pal::process_identity(launcher).is_ok() {
-        assert!(Instant::now() < until);
-        thread::sleep(Duration::from_millis(20));
-    }
+    f.call(&["pool", "upgrade"]);
     let ended = f.wait(id, "exited");
     assert_eq!(ended["status_detail"]["error"], "session_resume_failed");
     assert_eq!(

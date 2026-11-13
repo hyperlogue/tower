@@ -30,6 +30,9 @@ pub struct TerminalBackend {
         )>,
     >,
     changes: std::sync::OnceLock<tokio::sync::watch::Sender<u64>>,
+    /// Pool sessions ended by an upgrade. Only these resume on their own: a
+    /// pool that was stopped or that crashed stays down.
+    replaced: std::sync::Mutex<std::collections::BTreeSet<String>>,
 }
 impl TerminalBackend {
     pub fn new(paths: Paths) -> Self {
@@ -38,6 +41,7 @@ impl TerminalBackend {
             inventory: Default::default(),
             codex_inventory: Default::default(),
             changes: Default::default(),
+            replaced: Default::default(),
         }
     }
     /// One pool subscription and state watch shared by every `watch` caller.
@@ -494,6 +498,16 @@ fn clipboard_mode(harness: tower_agents::Harness) -> Option<tower_pool_proto::Cl
         _ => None,
     }
 }
+fn pool_unavailable(e: std::io::Error) -> RpcError {
+    if pool::outdated(&e) {
+        error(
+            "pool_outdated",
+            "The terminal pool runs another version; run `tower-cli pool upgrade`",
+        )
+    } else {
+        error("pool_unavailable", "Cannot start terminal pool")
+    }
+}
 impl ManagedBackend for TerminalBackend {
     fn clipboard(
         &self,
@@ -773,8 +787,7 @@ impl ManagedBackend for TerminalBackend {
         }
         tower_agents::config::validate(&spec)
             .map_err(|e| error("invalid_params", &e.to_string()))?;
-        pool::ensure(&self.paths)
-            .map_err(|_| error("pool_unavailable", "Cannot connect to terminal pool"))?;
+        pool::ensure(&self.paths).map_err(pool_unavailable)?;
         let plan = launcher::plan(&self.paths, id, spec.clone(), None)
             .map_err(|_| error("internal_error", "Cannot create session directory"))?;
         let binding = Binding {
@@ -858,8 +871,7 @@ impl ManagedBackend for TerminalBackend {
                 cols: s.cols,
             }),
         };
-        pool::ensure(&self.paths)
-            .map_err(|_| error("pool_unavailable", "Cannot start terminal pool"))?;
+        pool::ensure(&self.paths).map_err(pool_unavailable)?;
         if pool::list(&self.paths).is_ok_and(|records| {
             records
                 .iter()
@@ -894,10 +906,12 @@ impl ManagedBackend for TerminalBackend {
         if sessions.is_empty() {
             return Ok(vec![]);
         }
-        pool::ensure(&self.paths)
-            .map_err(|_| error("backend_unavailable", "Cannot start terminal pool"))?;
-        let records = pool::list(&self.paths)
-            .map_err(|_| error("backend_unavailable", "Terminal pool unavailable"))?;
+        // Sessions end with their pool, so none remain when it is not running.
+        let records = match pool::list(&self.paths) {
+            Ok(records) => records,
+            Err(e) if pool::absent(&e) => vec![],
+            Err(_) => return Err(error("backend_unavailable", "Terminal pool unavailable")),
+        };
         sessions
             .iter()
             .map(|s| {
@@ -1049,9 +1063,15 @@ impl ManagedBackend for TerminalBackend {
         if !session.auto_resume || session.launch.is_none() {
             return Ok(None);
         }
-        pool::ensure(&self.paths)
-            .map_err(|_| error("backend_unavailable", "Cannot start terminal pool"))?;
         let old = binding(session)?;
+        if !self
+            .replaced
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&old.name)
+        {
+            return Ok(None);
+        }
         if pool::list(&self.paths)
             .map_err(|_| error("backend_unavailable", "Cannot inspect pool"))?
             .iter()
@@ -1128,7 +1148,13 @@ impl TerminalAccess for TerminalBackend {
         }
     }
     fn restart_pool(&self) -> Result<()> {
-        pool::restart(&self.paths)
-            .map_err(|_| error("pool_unavailable", "Cannot restart terminal pool"))
+        // Held across the restart so that a session seen lost meanwhile waits
+        // to learn that it was replaced.
+        let mut replaced = self.replaced.lock().unwrap_or_else(|e| e.into_inner());
+        *replaced = pool::restart(&self.paths)
+            .map_err(|_| error("pool_unavailable", "Cannot restart terminal pool"))?
+            .into_iter()
+            .collect();
+        Ok(())
     }
 }

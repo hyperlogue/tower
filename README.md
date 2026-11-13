@@ -275,7 +275,10 @@ from Allgather, restart under the same IDs and resume their conversations. An
 agent that was mid-turn is told to continue when PTY input is enabled for it
 (`[inject.HARNESS] pty`, on by default for Claude Code). `--wait-idle` first waits until no terminal session is
 mid-turn.
-The server replaces a pool with a different protocol version automatically.
+A launch fails while the running pool has a different protocol version, until
+the pool is upgraded. The server starts a pool only for a launch or an upgrade:
+sessions of a pool that was stopped or that crashed are reported `lost` and are
+not restarted.
 
 Snapshots contain reconstructed ANSI text, with a `truncated` flag for discarded
 history and a `limited` flag for unsupported terminal behavior. The current bounds
@@ -630,7 +633,7 @@ Terminal launch requires both local configuration and invitation consent; `admin
 `send`, and `acp:control` do not grant it. `[allgather] managed = false` disables
 both remote launch modes. Terminal lifecycle events contain no PTY output or
 transcript. A surviving pool session retains its identity across daemon restart;
-after pool loss or upgrade, resumable terminal sessions recover their native
+after a pool upgrade, resumable terminal sessions recover their native
 conversations under the same runtime identity. Recovery requires confirmed
 termination and resumable history. Uncertain executions remain fenced.
 

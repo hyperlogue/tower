@@ -40,32 +40,43 @@ pub(crate) fn version(paths: &Paths) -> Result<Option<u16>> {
         Err(e) => Err(e),
     }
 }
-fn absent(e: &Error) -> bool {
+/// Whether a pool request failed because no pool is running.
+pub(crate) fn absent(e: &Error) -> bool {
     matches!(
         e.kind(),
         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
     )
 }
-/// Starts a pool if none is running and replaces one with another version.
+/// Starts a pool if none is running. One with another version is refused
+/// rather than replaced, because replacing it ends its sessions.
 pub(crate) fn ensure(paths: &Paths) -> Result<()> {
-    if version(paths)? == Some(wire::VERSION) {
-        return Ok(());
+    let outdated = || Err(Error::new(io::ErrorKind::Unsupported, "pool has another version"));
+    match version(paths)? {
+        Some(wire::VERSION) => return Ok(()),
+        Some(_) => return outdated(),
+        None => {}
     }
     let _lock = SingletonLock::acquire(&paths.run.join("pool-start.lock"))?;
     match version(paths)? {
-        Some(wire::VERSION) => return Ok(()),
-        Some(_) => shutdown(paths)?,
-        None => {}
+        Some(wire::VERSION) => Ok(()),
+        Some(_) => outdated(),
+        None => start(paths),
     }
-    start(paths)
 }
-/// Replaces the running pool, ending its sessions.
-pub(crate) fn restart(paths: &Paths) -> Result<()> {
+/// Whether [`ensure`] refused a pool that only an upgrade may replace.
+pub(crate) fn outdated(e: &Error) -> bool {
+    e.kind() == io::ErrorKind::Unsupported
+}
+/// Replaces the running pool, ending its sessions, and returns their names.
+pub(crate) fn restart(paths: &Paths) -> Result<Vec<String>> {
     let _lock = SingletonLock::acquire(&paths.run.join("pool-start.lock"))?;
+    let mut ended = vec![];
     if version(paths)?.is_some() {
+        ended = list(paths)?.into_iter().map(|s| s.name).collect();
         shutdown(paths)?;
     }
-    start(paths)
+    start(paths)?;
+    Ok(ended)
 }
 fn shutdown(paths: &Paths) -> Result<()> {
     core(paths, &Request::Shutdown)?;
