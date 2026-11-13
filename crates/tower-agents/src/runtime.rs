@@ -106,6 +106,8 @@ pub struct RuntimeState {
     pub exit_code: Option<i32>,
     /// The `seq` at which the session last began to need its user: a wait,
     /// a finished turn, an error or an unrequested end. Work clears it.
+    /// Recorded only by a launcher with no daemon; the daemon's registry
+    /// decides this for the sessions it observes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attention: Option<u64>,
     #[serde(default)]

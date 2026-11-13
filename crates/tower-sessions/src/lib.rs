@@ -4,6 +4,7 @@ use tower_protocol::{Capabilities, RpcError, Secret, SessionOpenParams, Value};
 pub mod attention;
 pub mod execution;
 pub mod messaging;
+pub mod tags;
 pub mod terminal;
 
 pub type Result<T> = std::result::Result<T, RpcError>;

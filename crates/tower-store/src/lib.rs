@@ -887,31 +887,11 @@ impl Store {
         clear_attention: bool,
         now: u64,
     ) -> Result<AgentRecord> {
-        fn valid(tags: &[String]) -> bool {
-            tags.len() <= 64
-                && tags.iter().all(|tag| {
-                    !tag.is_empty()
-                        && tag.chars().count() <= 64
-                        && tag.trim() == tag
-                        && !tag.chars().any(char::is_control)
-                })
-        }
-        if !valid(add) || !valid(remove) || add.iter().any(|tag| remove.contains(tag)) {
-            return Err(Error::Conflict(
-                "Tags must be distinct additions/removals, at most 64 nonempty values of 64 characters without control characters or surrounding whitespace",
-            ));
-        }
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         let mut record = stored_agent(&tx, id)?.record;
         let before = record.clone();
-        for tag in remove {
-            record.tags.remove(tag);
-        }
-        record.tags.extend(add.iter().cloned());
-        if record.tags.len() > 64 {
-            return Err(Error::Conflict("A session may have at most 64 tags"));
-        }
+        tower_sessions::tags::patch(&mut record.tags, add, remove).map_err(Error::Conflict)?;
         if clear_attention {
             record.needs_attention = false;
         }

@@ -39,6 +39,29 @@ struct Notes {
     acknowledged: Option<(String, u64)>,
 }
 
+impl Session {
+    /// Its launcher ended without recording an exit.
+    fn lost(&self) -> bool {
+        !self.live && self.state.exit_code.is_none()
+    }
+    /// The `seq` at which the session began to need its user. A launcher
+    /// cannot record its own loss, so that one is decided here.
+    fn attention(&self) -> Option<u64> {
+        if !self.lost() {
+            return self.state.attention;
+        }
+        match tower_sessions::attention::on_status(
+            &self.state.status,
+            "lost",
+            self.state.stop_requested,
+        ) {
+            Some(true) => Some(self.state.seq.saturating_add(1)),
+            Some(false) => None,
+            None => self.state.attention,
+        }
+    }
+}
+
 fn random(bytes: usize) -> io::Result<String> {
     let mut buffer = vec![0; bytes];
     getrandom::fill(&mut buffer).map_err(|_| io::Error::other("random source unavailable"))?;
@@ -274,6 +297,7 @@ impl Local {
             .collect()
     }
     fn record(&self, session: Session) -> io::Result<AgentRecord> {
+        let (lost, attention) = (session.lost(), session.attention());
         let Session { plan, state, live } = session;
         let notes = self.notes(&plan.id)?;
         let resumable = state.native.is_some()
@@ -298,10 +322,10 @@ impl Local {
             checkout_id: None,
             status: if live {
                 state.status
-            } else if state.exit_code.is_some() {
-                "exited".into()
-            } else {
+            } else if lost {
                 "lost".into()
+            } else {
+                "exited".into()
             },
             status_detail: Some(
                 serde_json::from_value(serde_json::to_value(&state.detail)?)
@@ -325,8 +349,7 @@ impl Local {
             revision: state.seq,
             labels: Default::default(),
             tags: notes.tags,
-            needs_attention: state
-                .attention
+            needs_attention: attention
                 .is_some_and(|since| acknowledged.is_none_or(|seq| since > seq)),
             task_refs: Vec::new(),
             sync_state: "synced".into(),
@@ -343,21 +366,7 @@ impl Local {
         remove: &[String],
         clear_attention: bool,
     ) -> io::Result<AgentRecord> {
-        let valid = |tags: &[String]| {
-            tags.len() <= 64
-                && tags.iter().all(|tag| {
-                    !tag.is_empty()
-                        && tag.chars().count() <= 64
-                        && tag.trim() == tag
-                        && !tag.chars().any(char::is_control)
-                })
-        };
         let invalid = |reason| io::Error::new(io::ErrorKind::InvalidInput, reason);
-        if !valid(add) || !valid(remove) || add.iter().any(|tag| remove.contains(tag)) {
-            return Err(invalid(
-                "tags must be distinct, nonempty and at most 64 characters",
-            ));
-        }
         // Validates `id` before it names a directory.
         self.paths.token_path(id)?;
         let session = self
@@ -381,15 +390,12 @@ impl Local {
             }
         };
         let mut notes = self.notes(id)?;
-        for tag in remove {
-            notes.tags.remove(tag);
-        }
-        notes.tags.extend(add.iter().cloned());
-        if notes.tags.len() > 64 {
-            return Err(invalid("a session may have at most 64 tags"));
-        }
+        tower_sessions::tags::patch(&mut notes.tags, add, remove).map_err(invalid)?;
         if clear_attention {
-            notes.acknowledged = Some((session.state.generation.clone(), session.state.seq));
+            notes.acknowledged = Some((
+                session.state.generation.clone(),
+                session.attention().unwrap_or(0).max(session.state.seq),
+            ));
         }
         tower_pal::write_private(&dir.join("notes.json"), &serde_json::to_vec(&notes)?)?;
         self.record(session)

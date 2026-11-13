@@ -199,13 +199,24 @@ pub async fn run(path: &Path) -> io::Result<i32> {
         publisher,
         commands: super::session::SessionCommands(receiver),
     };
+    let mut attention = plan
+        .embedding
+        .is_some()
+        .then(|| super::session::Attention::new(&state));
     super::session::drive(
         super::agent::task(context),
         updates,
         commands,
         state,
         terminated,
-        |state| save(&plan, state),
+        |state| match &mut attention {
+            Some(attention) => {
+                let mut state = state.clone();
+                attention.note(&mut state);
+                save(&plan, &state)
+            }
+            None => save(&plan, state),
+        },
     )
     .await
 }

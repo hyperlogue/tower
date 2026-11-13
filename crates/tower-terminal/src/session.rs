@@ -67,22 +67,23 @@ impl SessionPublisher {
     }
 }
 
-/// Follows status changes to record when the session began to need its
-/// user; the daemon's registry applies the same rules to what it observes.
-struct Attention {
+/// Follows a session's recorded states to mark when it began to need its
+/// user. Only a launcher with no daemon does this: the daemon's registry
+/// applies the same rules to every session it observes.
+pub(crate) struct Attention {
     status: String,
     error: Option<String>,
     since: Option<u64>,
 }
 impl Attention {
-    fn new(state: &RuntimeState) -> Self {
+    pub fn new(state: &RuntimeState) -> Self {
         Self {
             status: state.status.clone(),
             error: state.detail.error.clone(),
             since: state.attention,
         }
     }
-    fn note(&mut self, state: &mut RuntimeState) {
+    pub fn note(&mut self, state: &mut RuntimeState) {
         use tower_sessions::attention;
         let status = state.status.as_str();
         match attention::on_status(&self.status, status, state.stop_requested) {
@@ -111,7 +112,6 @@ pub(crate) async fn drive(
 ) -> io::Result<i32> {
     let mut dirty = false;
     let mut exited = None;
-    let mut attention = Attention::new(&state);
     loop {
         tokio::select! {
             biased;
@@ -123,7 +123,6 @@ pub(crate) async fn drive(
             }
             Some(update) = updates.recv(), if exited.is_none() => {
                 state = update.state;
-                attention.note(&mut state);
                 let result = persist(&state);
                 dirty = result.is_err();
                 if let Some(receipt) = update.receipt { let _ = receipt.send(result); }
@@ -145,7 +144,6 @@ pub(crate) async fn drive(
                 state.exit_code = Some(code);
                 state.seq = state.seq.saturating_add(1);
                 state.updated_at = super::launcher::now();
-                attention.note(&mut state);
                 dirty = persist(&state).is_err();
                 exited = Some(code);
             }
