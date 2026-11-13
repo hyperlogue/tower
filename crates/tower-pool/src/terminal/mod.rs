@@ -1,14 +1,37 @@
 mod lexer;
 mod screen;
 use lexer::{Lexer, Token};
-use screen::{Color, Line, Screen, Style};
-use std::{
-    collections::{BTreeMap, VecDeque},
-    fmt::Write,
-};
-use tower_pool_proto::Size;
-const MAX_HISTORY: usize = 10_000;
-const MAX_BYTES: usize = 16 * 1024 * 1024;
+use screen::{Clusters, Color, Screen, Style};
+use std::{collections::VecDeque, fmt::Write};
+use tower_pool_proto::{Scrollback, Size};
+
+/// The private modes the terminal tracks, one bit each in this order.
+const MODES: [u16; 15] = [
+    1, 6, 7, 25, 1000, 1002, 1003, 1004, 1005, 1006, 1007, 1015, 1016, 2004, 2026,
+];
+const ORIGIN: u16 = 1 << 1;
+const AUTOWRAP: u16 = 1 << 2;
+const CURSOR: u16 = 1 << 3;
+fn mode_bit(n: u16) -> Option<u16> {
+    MODES.iter().position(|m| *m == n).map(|i| 1 << i)
+}
+/// Semicolon-separated decimal parameters; an empty one is zero.
+fn params(raw: &[u8]) -> Option<([u16; 32], usize)> {
+    let mut values = [0u16; 32];
+    let mut count = 0;
+    for &b in raw {
+        match b {
+            b'0'..=b'9' => {
+                values[count] = values[count]
+                    .checked_mul(10)?
+                    .checked_add(u16::from(b - b'0'))?
+            }
+            b';' if count + 1 < values.len() => count += 1,
+            _ => return None,
+        }
+    }
+    Some((values, count + 1))
+}
 #[derive(Default)]
 struct Keyboard {
     flags: u16,
@@ -63,41 +86,43 @@ pub struct Output {
 }
 pub struct Terminal {
     lexer: Lexer,
-    utf8: Vec<u8>,
     screens: [Screen; 2],
     active: usize,
     keys: [Keyboard; 2],
-    modes: BTreeMap<u16, bool>,
+    modes: u16,
     style: Style,
     keypad: bool,
     insert: bool,
     modify: u16,
     cursor_style: u16,
-    history: VecDeque<Line>,
-    history_bytes: usize,
-    pub truncated: bool,
+    clusters: Clusters,
+    scrollback: Scrollback,
     pub limited: bool,
 }
 impl Terminal {
-    pub fn new(size: Size) -> Self {
+    pub fn new(size: Size, scrollback: Scrollback) -> Self {
+        let (rows, cols) = (size.rows as usize, size.cols as usize);
         Self {
             lexer: Lexer::default(),
-            utf8: Vec::new(),
             screens: [
-                Screen::new(size.rows as usize, size.cols as usize),
-                Screen::new(size.rows as usize, size.cols as usize),
+                Screen::new(
+                    rows,
+                    cols,
+                    scrollback.lines as usize,
+                    usize::try_from(scrollback.bytes).unwrap_or(usize::MAX),
+                ),
+                Screen::new(rows, cols, 0, 0),
             ],
             active: 0,
             keys: Default::default(),
-            modes: [(7, true), (25, true)].into(),
+            modes: AUTOWRAP | CURSOR,
             style: Style::default(),
             keypad: false,
             insert: false,
             modify: 0,
             cursor_style: 0,
-            history: VecDeque::new(),
-            history_bytes: 0,
-            truncated: false,
+            clusters: Clusters::default(),
+            scrollback,
             limited: false,
         }
     }
@@ -111,117 +136,85 @@ impl Terminal {
         for screen in &mut self.screens {
             screen.resize(size.rows as usize, size.cols as usize)
         }
-        self.bound_history();
+    }
+    /// Scrollback was dropped to stay within the limits.
+    pub fn truncated(&self) -> bool {
+        self.screens[0].truncated
     }
     pub(crate) fn mode(&self, n: u16) -> bool {
-        *self.modes.get(&n).unwrap_or(&false)
+        mode_bit(n).is_some_and(|bit| self.modes & bit != 0)
     }
-    fn remember(&mut self, lines: Vec<Line>) {
-        if self.active != 0
-            || self.screens[0].top != 0
-            || self.screens[0].bottom + 1 != self.screens[0].rows
-        {
-            return;
-        }
-        for line in lines {
-            self.history_bytes += screen::line_bytes(&line);
-            self.history.push_back(line);
-        }
-        self.bound_history();
-    }
-    fn bound_history(&mut self) {
-        let screen_bytes: usize = self
-            .screens
-            .iter()
-            .flat_map(|screen| &screen.lines)
-            .map(screen::line_bytes)
-            .sum();
-        while self.history.len() > MAX_HISTORY || self.history_bytes + screen_bytes > MAX_BYTES {
-            let Some(line) = self.history.pop_front() else {
-                break;
-            };
-            self.history_bytes -= screen::line_bytes(&line);
-            self.truncated = true;
-        }
-    }
-    pub fn process(&mut self, bytes: &[u8]) -> Output {
-        let mut output = Output {
-            bytes: Vec::new(),
-            replies: Vec::new(),
-        };
-        for token in self.lexer.push(bytes) {
-            match token {
-                Token::Text(bytes) => {
-                    self.utf8.extend(bytes);
-                    let mut used = 0;
-                    while used < self.utf8.len() {
-                        match std::str::from_utf8(&self.utf8[used..]) {
-                            Ok(s) => {
-                                let text = s.to_owned();
-                                used = self.utf8.len();
-                                for ch in text.chars() {
-                                    self.character(ch)
-                                }
-                            }
-                            Err(e) => {
-                                let valid = e.valid_up_to();
-                                if valid > 0 {
-                                    let text =
-                                        String::from_utf8_lossy(&self.utf8[used..used + valid])
-                                            .into_owned();
-                                    for ch in text.chars() {
-                                        self.character(ch)
-                                    }
-                                    used += valid;
-                                }
-                                if let Some(n) = e.error_len() {
-                                    self.character('\u{fffd}');
-                                    used += n;
-                                } else {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    output.bytes.extend(self.utf8.drain(..used));
-                }
-                Token::Control(bytes) => {
-                    self.flush_utf8(&mut output.bytes);
-                    let reply = self.control(&bytes);
-                    if let Some(reply) = reply {
-                        output.replies.extend(reply)
-                    } else {
-                        output.bytes.extend(bytes)
-                    }
-                }
-                Token::String(bytes) => {
-                    self.flush_utf8(&mut output.bytes);
-                    if let Some(reply) = self.string(&bytes) {
-                        output.replies.extend(reply)
-                    } else {
-                        output.bytes.extend(bytes)
-                    }
-                }
-                Token::Opaque(bytes) => {
-                    self.flush_utf8(&mut output.bytes);
-                    self.limited = true;
-                    output.bytes.extend(bytes);
-                }
+    fn set_mode(&mut self, n: u16, on: bool) {
+        if let Some(bit) = mode_bit(n) {
+            self.modes = if on {
+                self.modes | bit
+            } else {
+                self.modes & !bit
             }
         }
+    }
+    /// Updates the screen from program output. `bytes` is what attached
+    /// clients receive: the same output without the queries answered here in
+    /// `replies`, clipboard reads, and bytes no terminal would print.
+    pub fn process(&mut self, bytes: &[u8]) -> Output {
+        let mut output = Output {
+            bytes: Vec::with_capacity(bytes.len()),
+            replies: Vec::new(),
+        };
+        // A full reset replaces the terminal but not the position in its input.
+        let mut lexer = std::mem::take(&mut self.lexer);
+        lexer.push(bytes, &mut |token| match token {
+            Token::Text(text) => {
+                output.bytes.extend_from_slice(text);
+                self.print(text);
+            }
+            Token::Control(seq) => match self.control(seq) {
+                Some(reply) => output.replies.extend(reply),
+                None => output.bytes.extend_from_slice(seq),
+            },
+            Token::String(seq) => match self.string(seq) {
+                Some(reply) => output.replies.extend(reply),
+                None => output.bytes.extend_from_slice(seq),
+            },
+            Token::Opaque(seq) => {
+                self.limited = true;
+                output.bytes.extend_from_slice(seq);
+            }
+        });
+        self.lexer = lexer;
         output
     }
-    fn flush_utf8(&mut self, out: &mut Vec<u8>) {
-        if !self.utf8.is_empty() {
-            self.character('\u{fffd}');
-            out.append(&mut self.utf8);
+    fn print(&mut self, text: &[u8]) {
+        let wrap = self.modes & AUTOWRAP != 0;
+        let screen = &mut self.screens[self.active];
+        // Text is whole characters, except that an ESC may have consumed
+        // the first byte of one; what is left of it is not printable.
+        for chunk in text.utf8_chunks() {
+            let mut text = chunk.valid();
+            while let Some(ch) = text.chars().next() {
+                let ascii = text
+                    .bytes()
+                    .position(|b| !b.is_ascii())
+                    .unwrap_or(text.len());
+                if ascii > 0 && !self.insert && !screen.after_cluster() {
+                    screen.write_ascii(&text.as_bytes()[..ascii], self.style, wrap);
+                    text = &text[ascii..];
+                } else {
+                    screen.put(ch, self.style, wrap, self.insert, &mut self.clusters);
+                    text = &text[ch.len_utf8()..];
+                }
+            }
+            if !chunk.invalid().is_empty() {
+                screen.put(
+                    '\u{fffd}',
+                    self.style,
+                    wrap,
+                    self.insert,
+                    &mut self.clusters,
+                );
+            }
         }
-    }
-    fn character(&mut self, ch: char) {
-        let wrap = self.mode(7);
-        let lines = self.screens[self.active].put(ch, self.style, wrap, self.insert);
-        self.limited |= self.screens[self.active].limited;
-        self.remember(lines);
+        self.limited |= screen.limited;
     }
     fn control(&mut self, b: &[u8]) -> Option<Vec<u8>> {
         if b.len() == 1 {
@@ -231,10 +224,7 @@ impl Terminal {
                     s.col = 0;
                     s.wrap = false;
                 }
-                b'\n' | 11 | 12 => {
-                    let lines = s.newline(self.style);
-                    self.remember(lines);
-                }
+                b'\n' | 11 | 12 => s.newline(self.style),
                 8 => {
                     s.col = s.col.saturating_sub(1);
                     s.wrap = false;
@@ -260,14 +250,10 @@ impl Terminal {
                     self.style = s.saved.2;
                     s.wrap = false;
                 }
-                b'D' => {
-                    let lines = s.newline(self.style);
-                    self.remember(lines);
-                }
+                b'D' => s.newline(self.style),
                 b'E' => {
                     s.col = 0;
-                    let lines = s.newline(self.style);
-                    self.remember(lines);
+                    s.newline(self.style);
                 }
                 b'M' => {
                     if s.row == s.top {
@@ -279,10 +265,7 @@ impl Terminal {
                 }
                 b'=' => self.keypad = true,
                 b'>' => self.keypad = false,
-                b'c' => {
-                    let size = self.size();
-                    *self = Self::new(size);
-                }
+                b'c' => *self = Self::new(self.size(), self.scrollback),
                 _ => {}
             }
         } else {
@@ -316,24 +299,11 @@ impl Terminal {
             let state = if self.mode(n) { 1 } else { 2 };
             return Some(format!("\x1b[?{n};{state}$y").into_bytes());
         }
-        let Ok(text) = std::str::from_utf8(raw) else {
+        let Some((params, count)) = params(raw) else {
             self.limited = true;
             return None;
         };
-        let Some(p) = text
-            .split(';')
-            .map(|v| {
-                if v.is_empty() {
-                    Some(0)
-                } else {
-                    v.parse::<u16>().ok()
-                }
-            })
-            .collect::<Option<Vec<_>>>()
-        else {
-            self.limited = true;
-            return None;
-        };
+        let p = &params[..count];
         let n = p[0].max(1) as usize;
         if action == b'u' && prefix == Some(b'?') {
             return Some(format!("\x1b[?{}u", self.keys[self.active].flags).into_bytes());
@@ -371,19 +341,19 @@ impl Terminal {
             });
         }
         if action == b'u' && prefix.is_some_and(|v| b"<=>".contains(&v)) {
-            self.keys[self.active].apply(prefix.unwrap(), &p);
+            self.keys[self.active].apply(prefix.unwrap(), p);
             return None;
         }
         if action == b'm' {
             if prefix == Some(b'>') && p[0] == 4 {
                 self.modify = p.get(1).copied().unwrap_or(0).min(2)
             } else if prefix.is_none() {
-                self.sgr(&p)
+                self.sgr(p)
             }
             return None;
         }
         if matches!(action, b'h' | b'l') {
-            for &mode in &p {
+            for &mode in p {
                 let set = action == b'h';
                 if prefix == Some(b'?') {
                     match mode {
@@ -397,7 +367,7 @@ impl Terminal {
                                 if mode != 47 {
                                     let size = self.size();
                                     self.screens[1] =
-                                        Screen::new(size.rows as usize, size.cols as usize);
+                                        Screen::new(size.rows as usize, size.cols as usize, 0, 0);
                                 }
                             } else if !set && self.active == 1 {
                                 self.active = 0;
@@ -413,10 +383,10 @@ impl Terminal {
                         | 1016 | 2004 | 2026 => {
                             if set && matches!(mode, 1000 | 1002 | 1003) {
                                 for m in [1000, 1002, 1003] {
-                                    self.modes.insert(m, false);
+                                    self.set_mode(m, false);
                                 }
                             }
-                            self.modes.insert(mode, set);
+                            self.set_mode(mode, set);
                             if mode == 6 {
                                 let s = &mut self.screens[self.active];
                                 s.row = if set { s.top } else { 0 };
@@ -438,7 +408,7 @@ impl Terminal {
             self.limited = true;
             return None;
         }
-        let origin = self.mode(6);
+        let origin = self.modes & ORIGIN != 0;
         let s = &mut self.screens[self.active];
         match action {
             b'A' => s.row = s.row.saturating_sub(n).max(if origin { s.top } else { 0 }),
@@ -472,16 +442,12 @@ impl Terminal {
             b'J' => {
                 s.erase_display(p[0], self.style);
                 if p[0] == 3 {
-                    self.history.clear();
-                    self.history_bytes = 0;
+                    self.screens[0].erase_history();
                 }
             }
             b'K' => s.erase_line(p[0], self.style),
             b'@' | b'P' | b'X' => s.edit_chars(action, n, self.style),
-            b'S' => {
-                let lines = s.scroll_up(n, self.style);
-                self.remember(lines);
-            }
+            b'S' => s.scroll_up(n, self.style, true),
             b'T' => s.scroll_down(n, self.style),
             b'L' | b'M' => {
                 if s.row >= s.top && s.row <= s.bottom {
@@ -490,7 +456,7 @@ impl Terminal {
                     if action == b'L' {
                         s.scroll_down(n, self.style)
                     } else {
-                        s.scroll_up(n, self.style);
+                        s.scroll_up(n, self.style, false)
                     }
                     s.top = top;
                 }
@@ -604,13 +570,14 @@ impl Terminal {
     }
     pub fn snapshot(&self) -> Vec<u8> {
         let mut out = String::new();
-        for line in &self.history {
-            screen::paint_line(line, &mut out);
+        for line in self.screens[0].scrollback() {
+            screen::paint_line(line, &self.clusters, &mut out);
             out.push_str("\x1b[0m\r\n");
         }
-        for (n, line) in self.screens[self.active].lines.iter().enumerate() {
-            screen::paint_line(line, &mut out);
-            if n + 1 < self.screens[self.active].rows {
+        let rows = self.screens[self.active].rows;
+        for (n, line) in self.screens[self.active].visible().enumerate() {
+            screen::paint_line(line, &self.clusters, &mut out);
+            if n + 1 < rows {
                 out.push_str("\x1b[0m\r\n");
             }
         }
@@ -622,12 +589,12 @@ impl Terminal {
             "\x18\x1b[?2026l\x1b[?1049h\x1b[<65535u\x1b[=0u\x1b[?1049l\x1b[<65535u\x1b[=0u\x1b[?6l\x1b[?7l\x1b[4l\x1b[0m\x1b[r\x1b[H\x1b[2J\x1b[3J",
         );
         // History is regenerated from cells, never from retained terminal commands.
-        for line in &self.history {
-            screen::paint_line(line, &mut out);
+        for line in self.screens[0].scrollback() {
+            screen::paint_line(line, &self.clusters, &mut out);
             out.push_str("\x1b[0m\r\n");
         }
-        for (row, line) in self.screens[0].lines.iter().enumerate() {
-            screen::paint_line(line, &mut out);
+        for (row, line) in self.screens[0].visible().enumerate() {
+            screen::paint_line(line, &self.clusters, &mut out);
             if row + 1 < self.screens[0].rows {
                 out.push_str("\x1b[0m\r\n");
             }
@@ -635,7 +602,7 @@ impl Terminal {
         self.restore_cursor(0, &mut out);
         self.keys[0].restore(&mut out);
         out.push_str("\x1b[?47h");
-        self.screens[1].paint(&mut out);
+        self.screens[1].paint(&self.clusters, &mut out);
         self.restore_cursor(1, &mut out);
         self.keys[1].restore(&mut out);
         if self.active == 0 {
@@ -661,25 +628,21 @@ impl Terminal {
         );
         self.style.ansi(&mut out);
         let _ = write!(out, "\x1b[{} q", self.cursor_style);
-        let row = if self.mode(6) {
+        let row = if self.modes & ORIGIN != 0 {
             s.row.saturating_sub(s.top)
         } else {
             s.row
         };
         let _ = write!(out, "\x1b[{};{}H", row + 1, s.col + 1);
-        if s.wrap && self.mode(7) {
+        if s.wrap {
             let mut col = s.col;
-            if s.lines[s.row][col].width == 0 && col > 0 {
+            if s.line(s.row)[col].width() == 0 && col > 0 {
                 col -= 1;
             }
             let _ = write!(out, "\x1b[{};{}H", row + 1, col + 1);
-            let cell = &s.lines[s.row][col];
-            cell.style.ansi(&mut out);
-            if cell.text.is_empty() {
-                out.push(' ')
-            } else {
-                out.push_str(&cell.text)
-            }
+            let cell = s.line(s.row)[col];
+            cell.style().ansi(&mut out);
+            screen::paint_cell(cell, &self.clusters, &mut out);
             self.style.ansi(&mut out);
         }
         out.push_str(std::str::from_utf8(self.lexer.continuation()).unwrap());

@@ -66,6 +66,24 @@ pub struct Launch {
     pub size: Option<Size>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clipboard: Option<ClipboardConfig>,
+    /// Absent keeps the pool's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scrollback: Option<Scrollback>,
+}
+/// How much output that scrolled off the main screen a session keeps in
+/// memory for later attaches and snapshots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Scrollback {
+    pub lines: u32,
+    pub bytes: u64,
+}
+impl Default for Scrollback {
+    fn default() -> Self {
+        Self {
+            lines: 3000,
+            bytes: 8 * 1024 * 1024,
+        }
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClipboardConfig {

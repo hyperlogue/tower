@@ -281,8 +281,19 @@ sessions of a pool that was stopped or that crashed are reported `lost` and are
 not restarted.
 
 Snapshots contain reconstructed ANSI text, with a `truncated` flag for discarded
-history and a `limited` flag for unsupported terminal behavior. The current bounds
-are 10,000 history lines and 16 MiB of retained cells per session. The pool accepts
+history and a `limited` flag for unsupported terminal behavior. Each session keeps
+the output that scrolled off its main screen, up to 3,000 lines and 8 MiB of cells
+by default, so a later attach or snapshot can show it. This scrollback is held in
+the pool's memory only and is never written to disk. Change the bounds for new
+sessions in `~/.config/tower/config.toml`:
+
+```toml
+[terminal]
+scrollback_lines = 3000
+scrollback_megabytes = 8
+```
+
+The pool accepts
 up to 64 sessions, 16 clients per session, and terminal sizes up to 512 columns by
 256 rows. Stopped terminal buffers can be evicted when the pool fills; SQLite
 retains ended-session metadata for 30 days by default. Clipboard writes (OSC 52

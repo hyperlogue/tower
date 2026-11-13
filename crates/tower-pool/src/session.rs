@@ -130,7 +130,7 @@ pub fn reserve(launch: Launch, defaults: crate::preferences::Profile, changes: C
         clipboard: crate::clipboard::Clipboard::new(launch.name.clone(), launch.clipboard.clone()),
         launch: launch.clone(),
         pty: None,
-        terminal: Terminal::new(size),
+        terminal: Terminal::new(size, launch.scrollback.unwrap_or_default()),
         clients: BTreeMap::new(),
         next: 0,
         info,
@@ -665,7 +665,7 @@ impl Actor {
             Command::Snapshot(reply) => {
                 let _ = reply.send(Snapshot {
                     size: self.info.size,
-                    truncated: self.terminal.truncated,
+                    truncated: self.terminal.truncated(),
                     limited: self.terminal.limited,
                     buffer: self.terminal.snapshot(),
                 });

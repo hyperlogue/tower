@@ -510,6 +510,7 @@ trust_level="trusted"
             cwd: f.root.path().to_string_lossy().into_owned(),
             size: Some(Size::default()),
             clipboard: None,
+            scrollback: None,
         },
     });
     let Reply::Created { session } = created else {

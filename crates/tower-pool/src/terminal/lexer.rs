@@ -1,11 +1,18 @@
+/// The longest escape sequence held back whole. Longer ones are forwarded
+/// in pieces without being interpreted.
+const SEQUENCE: usize = 512;
+/// The longest string sequence held back whole once it is known not to be a
+/// clipboard read: a program status report may take 4096 bytes.
+const STRING: usize = 4096;
 #[derive(Default)]
 pub struct Lexer {
     state: State,
     pending: Vec<u8>,
     /// An incomplete UTF-8 sequence at the end of the previous chunk.
     carry: Vec<u8>,
+    scratch: Vec<u8>,
 }
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 enum State {
     #[default]
     Text,
@@ -27,11 +34,14 @@ enum State {
         escape: bool,
     },
 }
-pub enum Token {
-    Text(Vec<u8>),
-    Control(Vec<u8>),
-    String(Vec<u8>),
-    Opaque(Vec<u8>),
+/// Tokens borrow the input or the lexer's buffer for the duration of the
+/// callback. Text has no control characters and is whole UTF-8 characters,
+/// except after an ESC that consumed the first byte of one.
+pub enum Token<'a> {
+    Text(&'a [u8]),
+    Control(&'a [u8]),
+    String(&'a [u8]),
+    Opaque(&'a [u8]),
 }
 /// A clipboard read returns the human's local clipboard to the session as
 /// input, so it never reaches attached clients. Everything else, including
@@ -79,235 +89,294 @@ fn allowed_string(pending: &[u8], complete: bool) -> Option<bool> {
             .any(|kv| matches!(kv, b"type=write" | b"type=wdata" | b"type=walias")),
     )
 }
+enum Kind {
+    Control,
+    String,
+    Opaque,
+}
+/// The first C1 control (U+0080..U+009F) in valid UTF-8: exactly C2 80..C2 9F.
+fn c1(valid: &[u8]) -> Option<usize> {
+    let mut from = 0;
+    while let Some(i) = valid[from..].iter().position(|&b| b == 0xc2) {
+        if valid[from + i + 1] <= 0x9f {
+            return Some(from + i);
+        }
+        from += i + 2;
+    }
+    None
+}
+fn run(bytes: &[u8], stop: impl Fn(u8) -> bool) -> usize {
+    bytes.iter().position(|&b| stop(b)).unwrap_or(bytes.len())
+}
 impl Lexer {
     /// Forward only valid UTF-8 without C1 controls (U+0080..U+009F).
     /// Terminals treat C1 controls, and raw 0x80..0x9F bytes in 8-bit mode,
     /// like their ESC equivalents, for example U+009D as OSC. They are never
     /// printable, so every client then parses what tower parses. Invalid
     /// bytes become U+FFFD.
-    fn sanitize(&mut self, bytes: &[u8]) -> Vec<u8> {
+    fn sanitize(&mut self, bytes: &[u8], out: &mut Vec<u8>) {
         let mut input = std::mem::take(&mut self.carry);
         input.extend_from_slice(bytes);
-        let mut out = Vec::with_capacity(input.len());
         let mut rest = &input[..];
         loop {
-            let (valid, error) = match std::str::from_utf8(rest) {
+            let (mut valid, error) = match std::str::from_utf8(rest) {
                 Ok(_) => (rest, None),
                 Err(e) => (&rest[..e.valid_up_to()], Some(e)),
             };
-            let mut i = 0;
-            while i < valid.len() {
-                // In valid UTF-8, C1 controls are exactly C2 80..C2 9F.
-                if valid[i] == 0xc2 && valid[i + 1] <= 0x9f {
-                    i += 2;
-                } else {
-                    out.push(valid[i]);
-                    i += 1;
-                }
+            let consumed = valid.len();
+            while let Some(at) = c1(valid) {
+                out.extend_from_slice(&valid[..at]);
+                valid = &valid[at + 2..];
             }
+            out.extend_from_slice(valid);
             let Some(error) = error else { break };
             let Some(len) = error.error_len() else {
-                self.carry = rest[valid.len()..].to_vec();
+                self.carry.extend_from_slice(&rest[consumed..]);
                 break;
             };
             out.extend_from_slice("\u{fffd}".as_bytes());
-            rest = &rest[valid.len() + len..];
+            rest = &rest[consumed + len..];
         }
-        out
     }
-    pub fn push(&mut self, bytes: &[u8]) -> Vec<Token> {
-        let bytes = self.sanitize(bytes);
-        let mut out = Vec::new();
-        let mut text = Vec::new();
-        for &b in &bytes {
-            // An ESC inside a string or control sequence ends it and starts a
-            // new sequence, as in the standard terminal parser.
-            match &mut self.state {
-                State::DiscardString { escape } => {
-                    if *escape && b != b'\\' {
-                        self.state = State::Escape;
-                        self.pending = vec![27];
-                    } else {
-                        let done = (*escape && b == b'\\') || matches!(b, 7 | 24 | 26);
-                        *escape = b == 27;
-                        if done {
-                            self.state = State::Text;
-                        }
-                        continue;
-                    }
-                }
+    /// The length of the prefix that needs no sanitizing, when the rest is
+    /// only an incomplete character, which is kept for the next chunk.
+    fn clean(&mut self, bytes: &[u8]) -> Option<usize> {
+        if !self.carry.is_empty() {
+            return None;
+        }
+        let valid = match std::str::from_utf8(bytes) {
+            Ok(_) => bytes.len(),
+            Err(e) if e.error_len().is_none() => e.valid_up_to(),
+            Err(_) => return None,
+        };
+        if c1(&bytes[..valid]).is_some() {
+            return None;
+        }
+        self.carry.extend_from_slice(&bytes[valid..]);
+        Some(valid)
+    }
+    pub fn push(&mut self, bytes: &[u8], f: &mut impl FnMut(Token<'_>)) {
+        if let Some(n) = self.clean(bytes) {
+            return self.lex(&bytes[..n], f);
+        }
+        let mut scratch = std::mem::take(&mut self.scratch);
+        self.sanitize(bytes, &mut scratch);
+        self.lex(&scratch, f);
+        scratch.clear();
+        self.scratch = scratch;
+    }
+    fn lex(&mut self, bytes: &[u8], f: &mut impl FnMut(Token<'_>)) {
+        let mut i = 0;
+        while i < bytes.len() {
+            let rest = &bytes[i..];
+            // Runs that need no per-byte decision are passed on as slices.
+            let n = match self.state {
                 State::Text => {
-                    if b == 27 {
-                        if !text.is_empty() {
-                            out.push(Token::Text(std::mem::take(&mut text)))
-                        }
-                        self.pending.push(b);
-                        self.state = State::Escape;
-                    } else if b < 32 || b == 127 {
-                        if !text.is_empty() {
-                            out.push(Token::Text(std::mem::take(&mut text)))
-                        }
-                        out.push(Token::Control(vec![b]));
-                    } else {
-                        text.push(b)
+                    let n = run(rest, |b| b < 32 || b == 127);
+                    if n > 0 {
+                        f(Token::Text(&rest[..n]));
                     }
-                    continue;
+                    n
+                }
+                State::LongString { osc, escape: false } => {
+                    let n = run(rest, |b| matches!(b, 24 | 26 | 27) || osc && b == 7);
+                    if n > 0 {
+                        f(Token::Opaque(&rest[..n]));
+                    }
+                    n
                 }
                 State::LongCsi => {
-                    if b == 27 {
-                        if !text.is_empty() {
-                            out.push(Token::Opaque(std::mem::take(&mut text)));
-                        }
-                        self.state = State::Escape;
-                        self.pending = vec![27];
-                        continue;
+                    let n = run(rest, |b| matches!(b, 24 | 26 | 27 | 0x40..=0x7e));
+                    if n > 0 {
+                        f(Token::Opaque(&rest[..n]));
                     }
-                    text.push(b);
-                    if (0x40..=0x7e).contains(&b) || matches!(b, 24 | 26) {
-                        out.push(Token::Opaque(std::mem::take(&mut text)));
-                        self.state = State::Text;
-                    }
-                    continue;
+                    n
                 }
-                State::LongString { osc, escape } => {
-                    if *escape {
-                        *escape = false;
-                        if b == b'\\' {
-                            text.extend([27, b'\\']);
-                            out.push(Token::Opaque(std::mem::take(&mut text)));
-                            self.state = State::Text;
-                            continue;
-                        }
-                        if !text.is_empty() {
-                            out.push(Token::Opaque(std::mem::take(&mut text)));
-                        }
-                        self.state = State::Escape;
-                        self.pending = vec![27];
-                    } else if b == 27 {
-                        *escape = true;
-                        continue;
+                State::DiscardString { escape: false } => {
+                    run(rest, |b| matches!(b, 7 | 24 | 26 | 27))
+                }
+                _ => 0,
+            };
+            if n > 0 {
+                i += n;
+            } else {
+                self.byte(bytes[i], f);
+                i += 1;
+            }
+        }
+    }
+    fn restart(&mut self) {
+        self.state = State::Escape;
+        self.pending.clear();
+        self.pending.push(27);
+    }
+    fn flush(&mut self, f: &mut impl FnMut(Token<'_>), kind: Kind) {
+        let pending = std::mem::take(&mut self.pending);
+        f(match kind {
+            Kind::Control => Token::Control(&pending),
+            Kind::String => Token::String(&pending),
+            Kind::Opaque => Token::Opaque(&pending),
+        });
+        self.pending = pending;
+        self.pending.clear();
+    }
+    fn byte(&mut self, b: u8, f: &mut impl FnMut(Token<'_>)) {
+        // An ESC inside a string or control sequence ends it and starts a
+        // new sequence, as in the standard terminal parser.
+        match self.state {
+            State::DiscardString { escape } => {
+                if escape && b != b'\\' {
+                    self.restart();
+                } else {
+                    self.state = if (escape && b == b'\\') || matches!(b, 7 | 24 | 26) {
+                        State::Text
                     } else {
-                        text.push(b);
-                        if (*osc && b == 7) || matches!(b, 24 | 26) {
-                            out.push(Token::Opaque(std::mem::take(&mut text)));
-                            self.state = State::Text;
-                        }
-                        continue;
-                    }
+                        State::DiscardString { escape: b == 27 }
+                    };
+                    return;
                 }
-                State::String { escape: true, .. } if b != b'\\' => {
-                    // Drop the aborted string; it was never forwarded.
+            }
+            State::Text => {
+                if b == 27 {
+                    self.pending.push(b);
                     self.state = State::Escape;
-                    self.pending = vec![27];
+                } else {
+                    f(Token::Control(&[b]));
                 }
-                _ => {}
+                return;
             }
-            if !text.is_empty() {
-                out.push(Token::Opaque(std::mem::take(&mut text)))
-            }
-            if matches!(self.state, State::Escape) && b == 27 {
-                // ESC restarts an escape sequence; the abandoned prefix has no effect.
-                self.pending = vec![27];
-                continue;
-            }
-            self.pending.push(b);
-            if matches!(b, 24 | 26) {
-                if matches!(self.state, State::String { allowed: false, .. }) {
-                    self.pending = vec![b];
+            State::LongCsi => {
+                if b == 27 {
+                    self.restart();
+                } else {
+                    f(Token::Opaque(&[b]));
+                    self.state = State::Text;
                 }
-                out.push(Token::Opaque(std::mem::take(&mut self.pending)));
-                self.state = State::Text;
-                continue;
+                return;
             }
-            match &mut self.state {
-                State::Escape => match b {
-                    b'[' if self.pending.len() == 2 => self.state = State::Csi,
-                    b']' | b'P' | b'X' | b'^' | b'_' if self.pending.len() == 2 => {
-                        self.state = State::String {
-                            osc: b == b']',
-                            escape: false,
-                            allowed: false,
-                        }
-                    }
-                    0x20..=0x2f => {}
-                    _ => {
-                        out.push(Token::Control(std::mem::take(&mut self.pending)));
+            State::LongString { osc, escape } => {
+                if escape {
+                    if b == b'\\' {
+                        f(Token::Opaque(b"\x1b\\"));
                         self.state = State::Text;
+                        return;
                     }
-                },
-                State::Csi => {
-                    if (0x40..=0x7e).contains(&b) {
-                        out.push(Token::Control(std::mem::take(&mut self.pending)));
-                        self.state = State::Text;
-                    } else if b == 27 {
-                        self.pending.pop();
-                        out.push(Token::Opaque(std::mem::take(&mut self.pending)));
-                        self.pending.push(27);
-                        self.state = State::Escape;
+                    self.restart();
+                } else if b == 27 {
+                    self.state = State::LongString { osc, escape: true };
+                    return;
+                } else {
+                    f(Token::Opaque(&[b]));
+                    self.state = State::Text;
+                    return;
+                }
+            }
+            // Drop the aborted string; it was never forwarded.
+            State::String { escape: true, .. } if b != b'\\' => self.restart(),
+            _ => {}
+        }
+        if matches!(self.state, State::Escape) && b == 27 {
+            // ESC restarts an escape sequence; the abandoned prefix has no effect.
+            return self.restart();
+        }
+        self.pending.push(b);
+        if matches!(b, 24 | 26) {
+            if matches!(self.state, State::String { allowed: false, .. }) {
+                self.pending.clear();
+                self.pending.push(b);
+            }
+            self.flush(f, Kind::Opaque);
+            self.state = State::Text;
+            return;
+        }
+        match self.state {
+            State::Escape => match b {
+                b'[' if self.pending.len() == 2 => self.state = State::Csi,
+                b']' | b'P' | b'X' | b'^' | b'_' if self.pending.len() == 2 => {
+                    self.state = State::String {
+                        osc: b == b']',
+                        escape: false,
+                        allowed: false,
                     }
                 }
+                0x20..=0x2f => {}
+                _ => {
+                    self.flush(f, Kind::Control);
+                    self.state = State::Text;
+                }
+            },
+            State::Csi => {
+                if (0x40..=0x7e).contains(&b) {
+                    self.flush(f, Kind::Control);
+                    self.state = State::Text;
+                } else if b == 27 {
+                    self.pending.pop();
+                    self.flush(f, Kind::Opaque);
+                    self.restart();
+                }
+            }
+            State::String {
+                osc,
+                escape,
+                allowed,
+            } => {
+                if (escape && b == b'\\') || (osc && b == 7) {
+                    let body = self.pending.len() - if b == 7 { 1 } else { 2 };
+                    if allowed || allowed_string(&self.pending[..body], true) == Some(true) {
+                        self.flush(f, Kind::String);
+                    } else {
+                        self.pending.clear();
+                    }
+                    self.state = State::Text;
+                } else {
+                    let allowed = allowed
+                        || b != 27
+                            && match allowed_string(&self.pending, false) {
+                                Some(true) => true,
+                                Some(false) => {
+                                    self.pending.clear();
+                                    self.state = State::DiscardString { escape: false };
+                                    return;
+                                }
+                                None => false,
+                            };
+                    self.state = State::String {
+                        osc,
+                        escape: b == 27,
+                        allowed,
+                    };
+                }
+            }
+            _ => {}
+        }
+        let limit = match self.state {
+            State::String { allowed: true, .. } => STRING,
+            _ => SEQUENCE,
+        };
+        if self.pending.len() > limit {
+            let held = match self.state {
                 State::String {
-                    osc,
-                    escape,
-                    allowed,
-                } => {
-                    let done = (*escape && b == b'\\') || (*osc && b == 7);
-                    *escape = b == 27;
-                    if done {
-                        let pending = std::mem::take(&mut self.pending);
-                        let body = pending.len() - if b == 7 { 1 } else { 2 };
-                        if *allowed || allowed_string(&pending[..body], true) == Some(true) {
-                            out.push(Token::String(pending));
-                        }
-                        self.state = State::Text;
-                    } else if !*allowed && b != 27 {
-                        match allowed_string(&self.pending, false) {
-                            Some(true) => *allowed = true,
-                            Some(false) => {
-                                self.pending.clear();
-                                self.state = State::DiscardString { escape: false };
-                                continue;
-                            }
-                            None => {}
-                        }
-                    }
-                }
-                _ => {}
-            }
-            if self.pending.len() > 512 {
-                if let State::String {
                     allowed: false,
                     escape,
                     ..
-                } = self.state
-                {
+                } => {
                     // Too long to classify safely.
                     self.pending.clear();
                     self.state = State::DiscardString { escape };
-                    continue;
+                    return;
                 }
-                let held = match self.state {
-                    State::String { escape, .. } => escape,
-                    _ => false,
-                };
-                if held {
-                    self.pending.pop();
-                }
-                out.push(Token::Opaque(std::mem::take(&mut self.pending)));
-                self.state = match self.state {
-                    State::String { osc, escape, .. } => State::LongString { osc, escape },
-                    _ => State::LongCsi,
-                };
+                State::String { escape, .. } => escape,
+                _ => false,
+            };
+            if held {
+                self.pending.pop();
             }
+            self.flush(f, Kind::Opaque);
+            self.state = match self.state {
+                State::String { osc, escape, .. } => State::LongString { osc, escape },
+                _ => State::LongCsi,
+            };
         }
-        if !text.is_empty() {
-            out.push(if matches!(self.state, State::Text) {
-                Token::Text(text)
-            } else {
-                Token::Opaque(text)
-            });
-        }
-        out
     }
     pub fn continuation(&self) -> &'static [u8] {
         match self.state {

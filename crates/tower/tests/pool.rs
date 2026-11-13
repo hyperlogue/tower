@@ -66,6 +66,7 @@ impl Pool {
                     cwd: self.dir.path().to_string_lossy().into_owned(),
                     size: headless.then(Size::default),
                     clipboard: None,
+                    scrollback: None,
                 }
             }),
             Reply::Created { .. }
@@ -523,7 +524,36 @@ fn terminal_launch(p: &Pool, name: &str) -> Launch {
         term: None,
         defer: false,
         clipboard: None,
+        scrollback: None,
     }
+}
+#[test]
+fn a_session_keeps_only_the_scrollback_its_launch_allows() {
+    let p = Pool::new();
+    let mut launch = terminal_launch(&p, "short");
+    launch.argv[2] = "for n in 01 02 03 04 05 06 07 08 09 10 11 12; do echo line-$n; done; printf DONE; exec cat".into();
+    launch.size = Some(Size { rows: 2, cols: 20 });
+    launch.scrollback = Some(tower_pool_proto::Scrollback {
+        lines: 3,
+        bytes: 1024 * 1024,
+    });
+    p.call(Request::Create { launch });
+    wait(|| String::from_utf8_lossy(&p.snapshot("short").1).contains("DONE"));
+    let (header, snapshot) = p.snapshot("short");
+    let text = String::from_utf8(snapshot).unwrap();
+    // Three lines of scrollback above a two-line screen.
+    assert!(
+        text.contains("line-09") && text.contains("line-12"),
+        "{text:?}"
+    );
+    assert!(!text.contains("line-08"), "{text:?}");
+    assert!(matches!(
+        header,
+        Reply::Snapshot {
+            truncated: true,
+            ..
+        }
+    ));
 }
 #[test]
 fn immediate_launch_uses_last_attach_preferences_and_explicit_overrides() {

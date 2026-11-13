@@ -510,6 +510,24 @@ impl TerminalBackend {
         Ok(result)
     }
 }
+/// `[terminal] scrollback_lines` and `scrollback_megabytes`; a missing or
+/// unusable setting keeps the pool's default.
+fn scrollback(paths: &tower_pal::Paths) -> Option<tower_pool_proto::Scrollback> {
+    let config = tower_pal::read_config(&paths.config_home.join("tower/config.toml")).ok()??;
+    let config: toml::Table = config.parse().ok()?;
+    let terminal = config.get("terminal")?;
+    let value = |key| {
+        terminal
+            .get(key)
+            .and_then(|v| v.as_integer())
+            .and_then(|v| u64::try_from(v).ok())
+    };
+    let default = tower_pool_proto::Scrollback::default();
+    Some(tower_pool_proto::Scrollback {
+        lines: value("scrollback_lines").map_or(default.lines, |v| v.min(1_000_000) as u32),
+        bytes: value("scrollback_megabytes").map_or(default.bytes, |v| v.min(1024) * 1024 * 1024),
+    })
+}
 fn clipboard_mode(harness: tower_agents::Harness) -> Option<tower_pool_proto::ClipboardMode> {
     match harness {
         tower_agents::Harness::Codex => Some(tower_pool_proto::ClipboardMode::FileUrl),
@@ -932,6 +950,7 @@ impl ManagedBackend for TerminalBackend {
                     mode,
                 }
             }),
+            scrollback: scrollback(&self.paths),
             cwd: plan.spec.cwd,
             env: [
                 ("TOWER_AGENT_ID".into(), session.id.clone()),
