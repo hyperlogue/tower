@@ -160,6 +160,42 @@ pub struct Session {
     pub size: Size,
     #[serde(default)]
     pub exit_code: Option<i32>,
+    /// What the session's program last reported about itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program: Option<Program>,
+}
+/// A program status report (OSC 7501).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Program {
+    pub state: ProgramState,
+    /// Why the program is blocked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ProgramKind>,
+    /// Percent complete; absent while the amount of work is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramState {
+    Idle,
+    Working,
+    Done,
+    Blocked,
+    Error,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgramKind {
+    Permission,
+    Question,
+    Auth,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

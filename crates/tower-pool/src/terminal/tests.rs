@@ -440,3 +440,52 @@ fn edits_never_leave_half_a_wide_character() {
         }
     }
 }
+
+#[test]
+fn program_status_reports_are_recorded_forwarded_and_the_query_answered() {
+    use tower_pool_proto::{ProgramKind, ProgramState};
+    let mut t = terminal();
+    // The feature query is answered here and never reaches a client, which
+    // would answer it a second time.
+    let out = t.process(b"\x1b]7501;?\x1b\\");
+    assert!(out.bytes.is_empty());
+    assert_eq!(out.replies, b"\x1b]7501;?\x1b\\");
+    assert!(t.program().is_none());
+
+    let report = b"\x1b]7501;state=blocked:kind=permission:app=agent:msg=UnVuIHRlc3RzPw==\x07";
+    let mut forwarded = Vec::new();
+    for byte in report {
+        forwarded.extend(t.process(&[*byte]).bytes);
+    }
+    assert_eq!(forwarded, report);
+    let program = t.program().unwrap();
+    assert_eq!(
+        (program.state, program.kind, program.message.as_deref()),
+        (
+            ProgramState::Blocked,
+            Some(ProgramKind::Permission),
+            Some("Run tests?")
+        )
+    );
+    // The largest report the protocol allows is still read whole.
+    let long = base64_of(&"x".repeat(2048));
+    t.process(format!("\x1b]7501;state=working:msg={long}\x1b\\").as_bytes());
+    assert_eq!(t.program().unwrap().message.as_ref().unwrap().len(), 2048);
+    assert_eq!(text(&t).trim(), "");
+
+    // A new shell prompt ends unfinished work; results stay.
+    t.process(b"\x1b]7501;state=error:id=build\x07\x1b]133;A\x07");
+    assert_eq!(t.program().unwrap().state, ProgramState::Error);
+    // Leaving the screen does not touch the records; a full reset does.
+    t.process(b"\x1b[?1049h\x1b[?1049l\x1b[!p");
+    assert!(t.program().is_some());
+    t.process(b"\x1bc");
+    assert!(t.program().is_none());
+    t.process(b"\x1b]7501;state=working\x07");
+    t.finish();
+    assert!(t.program().is_none());
+}
+fn base64_of(text: &str) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(text)
+}

@@ -122,6 +122,7 @@ pub fn reserve(launch: Launch, defaults: crate::preferences::Profile, changes: C
         attach_count: 0,
         size,
         exit_code: None,
+        program: None,
     };
     let (state, receiver) = watch::channel(info.clone());
     let (tx, rx) = mpsc::channel(64);
@@ -233,6 +234,26 @@ impl Actor {
         self.publish();
         Ok(())
     }
+    /// Publishes the program's reported status when it changed. A change
+    /// of progress alone is recorded without waking the watchers.
+    fn reported(&mut self) {
+        let program = self.terminal.program();
+        if program == self.info.program.as_ref() {
+            return;
+        }
+        let progress = |p: Option<&tower_pool_proto::Program>| p.and_then(|p| p.progress);
+        let only_progress = progress(program) != progress(self.info.program.as_ref())
+            && program.cloned().map(|mut p| {
+                p.progress = progress(self.info.program.as_ref());
+                p
+            }) == self.info.program;
+        self.info.program = program.cloned();
+        if only_progress {
+            self.state.send_replace(self.info.clone());
+        } else {
+            self.publish();
+        }
+    }
     fn publish(&self) {
         self.state.send_replace(self.info.clone());
         self.changes
@@ -320,6 +341,8 @@ impl Actor {
         self.input.insert(at, unit);
     }
     fn exited(&mut self, code: i32) {
+        self.terminal.finish();
+        self.info.program = self.terminal.program().cloned();
         self.info.state = "exited".into();
         self.info.exit_code = Some(code);
         self.info.attach_count = 0;
@@ -427,6 +450,7 @@ impl Actor {
                         }
                         Ok(n) => {
                             let out = self.terminal.process(&bytes[..n]);
+                            self.reported();
                             if !out.replies.is_empty() && self.killing.is_none() && self.pending_exit.is_none() {
                                 self.enqueue_reply(out.replies);
                             }

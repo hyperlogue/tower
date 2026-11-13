@@ -1429,3 +1429,51 @@ fn unmanaged_sessions_of_other_harnesses_are_discovered_from_their_files() {
         child.wait().unwrap();
     }
 }
+
+#[test]
+fn a_program_status_report_outranks_hooks_until_it_is_cleared() {
+    let f = Fixture::new();
+    std::fs::write(
+        f.root.path().join("bin/pi"),
+        r#"#!/bin/sh
+report() { printf '{"session_id":"native-pi","root_confirmed":true}' | "$TOWER_TEST_BIN" hook pi "$1"; }
+report SessionStart
+last=
+while :; do
+  phase=$(cat phase 2>/dev/null || :)
+  if [ "$phase" != "$last" ]; then
+    case $phase in
+      blocked) printf '\033]7501;state=blocked:kind=permission:app=pi:msg=UnVuIHRlc3RzPw==\033\\';;
+      working) printf '\033]7501;state=working:progress=40\007';;
+      hook-idle) report UserPromptSubmit; report Stop;;
+      clear) printf '\033]7501;state=clear\007';;
+    esac
+    last=$phase
+  fi
+  sleep 0.03
+done
+"#,
+    )
+    .unwrap();
+    let opened = f.call(&["launch", "pi", "--headless"]);
+    let id = opened["id"].as_str().unwrap();
+    f.wait(id, "idle");
+    f.phase("blocked");
+    let row = f.wait(id, "waiting_approval");
+    let program = &row["status_detail"]["program"];
+    assert_eq!(program["message"], "Run tests?", "{row}");
+    assert_eq!(program["app"], "pi", "{row}");
+    assert_eq!(row["needs_attention"], true, "{row}");
+    f.phase("working");
+    let row = f.wait(id, "working");
+    assert_eq!(row["status_detail"]["program"]["progress"], 40, "{row}");
+    // The hooks now say the turn ended; the program still says it works.
+    f.phase("hook-idle");
+    thread::sleep(Duration::from_millis(400));
+    assert_eq!(f.call(&["get", id])["status"], "working");
+    // Without a report the other sources decide again.
+    f.phase("clear");
+    let row = f.wait(id, "idle");
+    assert!(row["status_detail"]["program"].is_null(), "{row}");
+    f.call(&["kill", id]);
+}

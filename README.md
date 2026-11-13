@@ -83,6 +83,18 @@ events, and `tower-cli ls`. Metadata edits require local administrative authorit
 These fields are not included in the existing Allgather status projection until
 an extension is negotiated.
 
+A program in a terminal session can report its own status with the Program
+Status Protocol (OSC 7501). The pool answers the feature query, keeps the
+reports, and still passes them to attached terminals. While a report is in
+effect it decides the session's status ahead of hooks and transcripts:
+`working` stays `working`, `blocked` becomes `waiting_approval` for a permission
+request and `waiting_input` otherwise, and `idle`, `done` and `error` become
+`idle`, with `error` recorded as `program_error`. The report's `app`, `title`,
+message and progress appear under `status_detail.program`. Reports of unfinished
+work end when the program exits. Everything the protocol does not cover, such as
+launch, exit, loss and the native conversation, still comes from the launcher and
+the harness.
+
 `host.metrics {}` takes no parameters. It returns a sample timestamp, CPU
 utilization, used/total memory, and available space on the filesystem containing
 the Tower user's home. Unavailable measurements are null; the first CPU sample

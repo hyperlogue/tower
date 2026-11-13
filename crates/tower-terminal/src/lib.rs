@@ -409,6 +409,18 @@ impl TerminalBackend {
                 if live {
                     result.status = state.status.clone();
                 }
+                // What the program reports about itself through the terminal
+                // outranks what hooks and transcripts suggest.
+                let program = record.filter(|_| live).and_then(|r| r.program.as_ref());
+                if let Some(program) = program {
+                    result.status = program_status(program).into();
+                    if program.state == tower_pool_proto::ProgramState::Error {
+                        state
+                            .detail
+                            .error
+                            .get_or_insert_with(|| "program_error".into());
+                    }
+                }
                 if record.is_none() {
                     if launcher_alive(&state)? {
                         result.status = "unknown".into();
@@ -496,6 +508,13 @@ impl TerminalBackend {
                         .get("server_start_time")
                         .and_then(|v| v.as_u64());
                 }
+                let mut detail = serde_json::to_value(&state.detail).unwrap_or_default();
+                if let (Some(program), Some(detail)) = (program, detail.as_object_mut()) {
+                    detail.insert(
+                        "program".into(),
+                        serde_json::to_value(program).unwrap_or_default(),
+                    );
+                }
                 result.metadata = tower_sessions::SessionMetadata {
                     shared_process: Some(binding.plan.spec.uses_app_server()),
                     native_session_id: state.native.map(|n| n.id),
@@ -503,11 +522,21 @@ impl TerminalBackend {
                         .display_name
                         .map_or(tower_protocol::Patch::Clear, tower_protocol::Patch::Set),
                     cwd: self.paths.display_cwd(&state.cwd).ok(),
-                    detail: Some(encode(&state.detail)?),
+                    detail: Some(encode(detail)?),
                 };
             }
         }
         Ok(result)
+    }
+}
+/// The session status a program status report (OSC 7501) stands for.
+fn program_status(program: &tower_pool_proto::Program) -> &'static str {
+    use tower_pool_proto::{ProgramKind, ProgramState};
+    match (program.state, program.kind) {
+        (ProgramState::Working, _) => "working",
+        (ProgramState::Blocked, Some(ProgramKind::Permission)) => "waiting_approval",
+        (ProgramState::Blocked, _) => "waiting_input",
+        (ProgramState::Idle | ProgramState::Done | ProgramState::Error, _) => "idle",
     }
 }
 /// `[terminal] scrollback_lines` and `scrollback_megabytes`; a missing or

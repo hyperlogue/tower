@@ -1,9 +1,10 @@
 mod lexer;
+mod program;
 mod screen;
 use lexer::{Lexer, Token};
 use screen::{Clusters, Color, Screen, Style};
 use std::{collections::VecDeque, fmt::Write};
-use tower_pool_proto::{Scrollback, Size};
+use tower_pool_proto::{Program, Scrollback, Size};
 
 /// The private modes the terminal tracks, one bit each in this order.
 const MODES: [u16; 15] = [
@@ -97,6 +98,7 @@ pub struct Terminal {
     cursor_style: u16,
     clusters: Clusters,
     scrollback: Scrollback,
+    programs: program::Programs,
     pub limited: bool,
 }
 impl Terminal {
@@ -123,6 +125,7 @@ impl Terminal {
             cursor_style: 0,
             clusters: Clusters::default(),
             scrollback,
+            programs: program::Programs::default(),
             limited: false,
         }
     }
@@ -136,6 +139,14 @@ impl Terminal {
         for screen in &mut self.screens {
             screen.resize(size.rows as usize, size.cols as usize)
         }
+    }
+    /// What the program last reported about itself (OSC 7501).
+    pub fn program(&self) -> Option<&Program> {
+        self.programs.summary()
+    }
+    /// The program exited: its unfinished work is over.
+    pub fn finish(&mut self) {
+        self.programs.finish();
     }
     /// Scrollback was dropped to stay within the limits.
     pub fn truncated(&self) -> bool {
@@ -562,6 +573,16 @@ impl Terminal {
                 if body == query {
                     return Some(answer.to_vec());
                 }
+            }
+            if let Some(report) = body.strip_prefix(b"7501;") {
+                // Reports still reach attached terminals, which may show
+                // them; only the feature query is answered here.
+                if let program::Report::Query = self.programs.report(report) {
+                    return Some(b"\x1b]7501;?\x1b\\".to_vec());
+                }
+            } else if body.starts_with(b"133;A") {
+                // A new shell prompt: the previous command is over.
+                self.programs.finish();
             }
         } else {
             self.limited = true;
