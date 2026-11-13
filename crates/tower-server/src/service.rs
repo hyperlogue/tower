@@ -163,7 +163,7 @@ pub(super) struct Service {
     message_limits: messaging::Limits,
     traffic: Mutex<messaging::Traffic>,
     scan: scan::Config,
-    last_scan: Mutex<std::time::Instant>,
+    scanned: std::sync::atomic::AtomicBool,
     /// Serialize identity resolution and writes, including filesystem credential publication.
     mutation: Mutex<()>,
     events: tokio::sync::broadcast::Sender<Arc<EventNotification>>,
@@ -262,7 +262,7 @@ impl Service {
             message_limits: config.messaging,
             traffic: Mutex::new(messaging::Traffic::default()),
             scan: config.scan,
-            last_scan: Mutex::new(std::time::Instant::now()),
+            scanned: Default::default(),
             mutation: Mutex::new(()),
             events: tokio::sync::broadcast::channel(256).0,
             published: Mutex::new(events::Published::default()),
@@ -337,10 +337,7 @@ impl Service {
     }
     /// When maintenance next has timed work, and which live processes to watch for exit.
     pub fn maintenance_plan(&self) -> Result<MaintenancePlan> {
-        let mut next = self.store.next_deadline(self.retention_ms)?;
-        if let Some(scan) = self.scan_deadline()? {
-            next = Some(next.map_or(scan, |n| n.min(scan)));
-        }
+        let next = self.store.next_deadline(self.retention_ms)?;
         let processes = self
             .all()
             .map_err(Error::Rpc)?

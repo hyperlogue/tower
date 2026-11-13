@@ -5,41 +5,21 @@ use std::time::{Duration, Instant};
 #[serde(default)]
 pub(super) struct Config {
     enabled: bool,
-    interval_s: u64,
 }
 impl Default for Config {
     fn default() -> Self {
-        Self {
-            enabled: true,
-            interval_s: 10,
-        }
+        Self { enabled: true }
     }
 }
 impl Service {
-    pub(super) fn scan_deadline(&self) -> Result<Option<u64>> {
-        if !self.scan.enabled {
-            return Ok(None);
-        }
-        let last = self
-            .last_scan
-            .lock()
-            .map_err(|_| Error::Other("Scanner state unavailable".into()))?;
-        let remaining =
-            Duration::from_secs(self.scan.interval_s.max(1)).saturating_sub(last.elapsed());
-        Ok(Some(now_ms().saturating_add(remaining.as_millis() as u64)))
-    }
+    /// Registers harness processes that were running before this server
+    /// started. Later sessions are found from the files their harness writes,
+    /// or from hooks, so this runs once.
     pub(super) fn scan_processes(&self) -> Result<()> {
-        if !self.scan.enabled {
+        if !self.scan.enabled || self.scanned.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return Ok(());
         }
-        let mut last = self
-            .last_scan
-            .lock()
-            .map_err(|_| Error::Other("Scanner state unavailable".into()))?;
-        if last.elapsed() < Duration::from_secs(self.scan.interval_s.max(1)) {
-            return Ok(());
-        }
-        *last = Instant::now();
+        let started = Instant::now();
         let known = self.all().map_err(Error::Rpc)?;
         let harnesses = self
             .backends
@@ -47,7 +27,7 @@ impl Service {
             .flat_map(|b| b.harnesses())
             .collect::<Vec<_>>();
         for pid in tower_pal::processes()?.into_iter().take(50000) {
-            if last.elapsed() > Duration::from_secs(2) {
+            if started.elapsed() > Duration::from_secs(2) {
                 break;
             }
             if known.iter().any(|r| {

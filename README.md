@@ -520,10 +520,12 @@ incoming_per_minute = 30
 
 [scan]
 enabled = true
-interval_s = 10
 ```
 
-The scanner skips managed-process ownership markers. Scan-only records cannot
+When the daemon starts, it scans once for harness processes that are already
+running. After that, Tower finds unmanaged Claude, Codex, Pi, omp, Grok,
+Reasonix, Kimi, and OpenCode sessions from the files each harness writes.
+Antigravity sessions need hooks. The scanner skips managed-process ownership markers. Scan-only records cannot
 receive messages until registration establishes a delivery channel. Installed
 hooks report external Claude/Codex state. Codex requires native hook trust review.
 `tower-cli run` uses the current terminal and registers the process without starting a

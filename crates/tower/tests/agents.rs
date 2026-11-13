@@ -665,20 +665,40 @@ fn foreground_wrapper_registers_and_unregisters_without_a_pool() {
 }
 
 #[test]
-fn scanner_does_not_allocate_an_id_for_a_managed_process() {
+fn startup_scan_registers_running_harnesses_but_not_managed_ones() {
     let f = Fixture::new();
     let config = f.root.path().join("c/tower");
     std::fs::create_dir_all(&config).unwrap();
-    std::fs::write(
-        config.join("config.toml"),
-        "[scan]\nenabled=true\ninterval_s=1\n",
-    )
-    .unwrap();
+    std::fs::write(config.join("config.toml"), "[scan]\nenabled=true\n").unwrap();
     let opened = f.call(&["launch", "claude", "--headless"]);
     let id = opened["id"].as_str().unwrap();
     f.wait(id, "idle");
-    thread::sleep(Duration::from_millis(2200));
-    let rows = f.call(&["ls"]);
+    let standalone = f.root.path().join("standalone");
+    std::fs::create_dir(&standalone).unwrap();
+    let bin = standalone.join("opencode");
+    std::fs::write(&bin, "#!/bin/sh\nread _\n").unwrap();
+    tower_pal::make_executable(&bin).unwrap();
+    let mut running = Command::new(&bin)
+        .current_dir(f.root.path())
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The managed session outlives the server, which scans on its next start.
+    f.call(&["daemon", "stop"]);
+    let until = Instant::now() + Duration::from_secs(10);
+    let rows = loop {
+        let rows = f.call(&["ls"]);
+        let scanned = rows.as_array().unwrap().iter().any(|r| {
+            r["sources"]
+                .as_array()
+                .is_some_and(|s| s.contains(&json!("scan")))
+        });
+        if scanned {
+            break rows;
+        }
+        assert!(Instant::now() < until, "nothing was scanned: {rows}");
+        thread::sleep(Duration::from_millis(50));
+    };
     let records = rows.as_array().unwrap();
     let owned = records
         .iter()
@@ -686,12 +706,18 @@ fn scanner_does_not_allocate_an_id_for_a_managed_process() {
         .collect::<Vec<_>>();
     assert_eq!(owned.len(), 1);
     assert_eq!(owned[0]["id"], id);
-    assert!(!records.iter().any(|r| {
-        r["sources"]
-            .as_array()
-            .is_some_and(|s| s.contains(&json!("scan")))
-            && r["pid"] == owned[0]["pid"]
-    }));
+    let scanned = |pid: &Value| {
+        records.iter().any(|r| {
+            r["sources"]
+                .as_array()
+                .is_some_and(|s| s.contains(&json!("scan")))
+                && &r["pid"] == pid
+        })
+    };
+    assert!(!scanned(&owned[0]["pid"]));
+    assert!(scanned(&json!(running.id())), "{rows}");
+    running.kill().unwrap();
+    running.wait().unwrap();
     f.call(&["kill", id]);
 }
 
