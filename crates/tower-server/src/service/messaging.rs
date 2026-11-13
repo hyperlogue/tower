@@ -683,6 +683,9 @@ struct HookReport {
     detail: serde_json::Value,
     token: Option<Secret>,
 }
+/// How stale `last_seen` may get while hooks only repeat what is known. It
+/// stays well inside the time after which an unseen session counts as lost.
+const HOOK_HEARTBEAT_MS: u64 = 30_000;
 impl Service {
     pub(super) fn hook_report(
         &self,
@@ -877,7 +880,7 @@ impl Service {
             detail.insert("context_tokens".into(), n.into());
         }
         self.store
-            .update(
+            .update_repeating(
                 &UpdateParams {
                     delivery: Patch::Missing,
                     id,
@@ -888,6 +891,7 @@ impl Service {
                     detail: Patch::Set(value(detail)?),
                 },
                 now_ms(),
+                HOOK_HEARTBEAT_MS,
             )
             .map_err(storage)
             .and_then(value)

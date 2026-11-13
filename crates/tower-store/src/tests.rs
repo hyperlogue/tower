@@ -448,3 +448,44 @@ fn managed_metadata_distinguishes_no_title_observation_from_cleared_title() {
     store.observe_managed("terminal", observation, 201).unwrap();
     assert_eq!(store.agent("managed").unwrap().record.display_name, None);
 }
+
+#[test]
+fn a_repeated_report_writes_nothing_until_the_record_goes_unseen() {
+    let (_dir, s) = setup();
+    s.register_test(record("a", Some("n"), None), b"hash")
+        .unwrap();
+    let first = s
+        .update_repeating(&update("a", 1, "working"), 1_000, 30_000)
+        .unwrap();
+    assert!(first.applied);
+    let seq = s.agent("a").unwrap().seq;
+
+    // The same status again: no revision, no write, and the sequence
+    // number is still free for the next report.
+    let again = s
+        .update_repeating(&update("a", seq + 1, "working"), 20_000, 30_000)
+        .unwrap();
+    assert!(!again.applied);
+    let stored = s.agent("a").unwrap();
+    assert_eq!(
+        (stored.record.revision, stored.record.last_seen, stored.seq),
+        (first.revision, 1_000, seq)
+    );
+
+    // Unseen for the whole interval: only `last_seen` moves.
+    s.update_repeating(&update("a", seq + 1, "working"), 31_000, 30_000)
+        .unwrap();
+    let stored = s.agent("a").unwrap();
+    assert_eq!(
+        (stored.record.revision, stored.record.last_seen),
+        (first.revision, 31_000)
+    );
+    assert_eq!(stored.record.updated_at, 1_000);
+
+    // A change is applied as usual.
+    let changed = s
+        .update_repeating(&update("a", seq + 1, "idle"), 32_000, 30_000)
+        .unwrap();
+    assert!(changed.applied && changed.revision > first.revision);
+    assert!(s.agent("a").unwrap().record.needs_attention);
+}

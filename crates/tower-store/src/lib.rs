@@ -67,14 +67,16 @@ pub struct Store {
     database: Arc<Database>,
 }
 
-fn observe_status(tx: &Transaction<'_>, record: &mut AgentRecord, status: &str) -> Result<()> {
+/// Returns whether the stored observation changed.
+fn observe_status(tx: &Transaction<'_>, record: &mut AgentRecord, status: &str) -> Result<bool> {
     let (previous, stopping): (Option<String>, bool) = tx.query_row(
         "SELECT observed_status,stop_requested FROM agents WHERE id=?1",
         [&record.id],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     let previous = previous.as_deref().unwrap_or(&record.status);
-    if status != "unknown" && previous != status {
+    let observed = status != "unknown" && previous != status;
+    if observed {
         if let Some(needed) = tower_sessions::attention::on_status(previous, status, stopping) {
             record.needs_attention = needed;
         }
@@ -84,7 +86,7 @@ fn observe_status(tx: &Transaction<'_>, record: &mut AgentRecord, status: &str) 
         )?;
     }
     record.status = status.into();
-    Ok(())
+    Ok(observed)
 }
 fn new_error(before: &AgentRecord, after: &AgentRecord) -> bool {
     fn error(record: &AgentRecord) -> Option<&str> {
@@ -381,7 +383,28 @@ fn host_info(conn: &Connection) -> Result<Host> {
 }
 impl Store {
     pub fn update(&self, update: &UpdateParams, now: u64) -> Result<UpdateResult> {
-        self.update_with_delivery(update, now, None)
+        self.apply_update(update, now, None, None)
+    }
+    /// As `update`, for a source that repeats what it said before, such as a
+    /// hook on every tool call. A report that changes nothing is not written.
+    /// Once the record has not been seen for `heartbeat` milliseconds only
+    /// its `last_seen` is, without a new revision. Such a report is not
+    /// applied and its sequence number stays unused.
+    pub fn update_repeating(
+        &self,
+        update: &UpdateParams,
+        now: u64,
+        heartbeat: u64,
+    ) -> Result<UpdateResult> {
+        self.apply_update(update, now, None, Some(heartbeat))
+    }
+    pub fn update_with_delivery(
+        &self,
+        update: &UpdateParams,
+        now: u64,
+        delivery: Option<DeliveryState>,
+    ) -> Result<UpdateResult> {
+        self.apply_update(update, now, delivery, None)
     }
     pub fn clear_policy(&self) -> Result<()> {
         let mut conn = self.lock()?;
@@ -797,11 +820,12 @@ impl Store {
             })
             .collect())
     }
-    pub fn update_with_delivery(
+    fn apply_update(
         &self,
         update: &UpdateParams,
         now: u64,
         delivery: Option<DeliveryState>,
+        heartbeat: Option<u64>,
     ) -> Result<UpdateResult> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
@@ -811,6 +835,7 @@ impl Store {
                 "ended session requires re-registration or resume",
             ));
         }
+        let seen = agent.record.last_seen;
         agent.record.last_seen = now;
         if update.seq <= agent.seq {
             save_record(&tx, &agent.record)?;
@@ -829,8 +854,9 @@ impl Store {
             messaging::apply_delivery(&tx, &mut agent.record, &delivery.endpoint, delivery.caps)?;
         }
         let before = agent.record.clone();
+        let mut observed = false;
         if let Some(status) = &update.status {
-            observe_status(&tx, &mut agent.record, status)?;
+            observed = observe_status(&tx, &mut agent.record, status)?;
             if matches!(status.as_str(), "exited" | "lost") {
                 disable_delivery(&mut agent.record.caps, "session_ended");
             }
@@ -858,6 +884,20 @@ impl Store {
         }
         if new_error(&before, &agent.record) {
             agent.record.needs_attention = true;
+        }
+        if let Some(heartbeat) = heartbeat
+            && !observed
+            && agent.record == before
+        {
+            // Dropping the transaction leaves the record as it was.
+            if now.saturating_sub(seen) >= heartbeat {
+                save_record(&tx, &agent.record)?;
+                tx.commit()?;
+            }
+            return Ok(UpdateResult {
+                applied: false,
+                revision: agent.record.revision,
+            });
         }
         agent.record.updated_at = now;
         agent.record.revision = next_revision(&tx)?;
