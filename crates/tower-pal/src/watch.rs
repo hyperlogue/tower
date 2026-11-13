@@ -215,11 +215,13 @@ mod vnode {
                 queue: Kqueue::new()?,
                 files: Mutex::default(),
             });
-            let stop = |flags, trigger| {
-                KEvent::new(0, EventFilter::EVFILT_USER, flags, trigger, 0, 0)
-            };
+            let stop =
+                |flags, trigger| KEvent::new(0, EventFilter::EVFILT_USER, flags, trigger, 0, 0);
             shared.queue.kevent(
-                &[stop(EvFlags::EV_ADD | EvFlags::EV_CLEAR, FilterFlag::empty())],
+                &[stop(
+                    EvFlags::EV_ADD | EvFlags::EV_CLEAR,
+                    FilterFlag::empty(),
+                )],
                 &mut [],
                 NOW,
             )?;
