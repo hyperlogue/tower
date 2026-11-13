@@ -1201,7 +1201,7 @@ fn unmanaged_codex_rollouts_are_discovered_from_their_writer() {
 }
 
 #[test]
-fn unmanaged_pi_grok_reasonix_and_opencode_sessions_are_discovered_from_their_files() {
+fn unmanaged_sessions_of_other_harnesses_are_discovered_from_their_files() {
     let f = Fixture::new();
     let home = f.root.path();
     let work = home.join("work");
@@ -1296,6 +1296,29 @@ fn unmanaged_pi_grok_reasonix_and_opencode_sessions_are_discovered_from_their_fi
     append(&dir.join("events.jsonl"), json!({"type":"turn_ended"}));
     find("grok", "01ab", "idle", grok.id());
 
+    // Kimi names its session directory after a digest of the working directory.
+    let mut kimi = spawn("kimi", None);
+    let hash = {
+        use md5::Digest;
+        let cwd = std::fs::canonicalize(&work).unwrap();
+        md5::Md5::digest(cwd.to_str().unwrap().as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    let wire = home.join(".kimi/sessions").join(hash).join("k1/wire.jsonl");
+    append(
+        &wire,
+        json!({"type": "metadata", "protocol_version": "1.9"}),
+    );
+    let record = |kind: &str| json!({"timestamp": 1.0, "message": {"type": kind, "payload": {}}});
+    append(&wire, record("TurnBegin"));
+    find("kimi", "k1", "working", kimi.id());
+    append(&wire, record("ApprovalRequest"));
+    find("kimi", "k1", "waiting_approval", kimi.id());
+    append(&wire, record("TurnEnd"));
+    find("kimi", "k1", "idle", kimi.id());
+
     // OpenCode records busy and idle times in its session database.
     let mut opencode = spawn("opencode", None);
     let data = home.join(".local/share/opencode");
@@ -1317,7 +1340,7 @@ fn unmanaged_pi_grok_reasonix_and_opencode_sessions_are_discovered_from_their_fi
         .unwrap();
     find("opencode", "ses_1", "idle", opencode.id());
 
-    for child in [&mut reasonix, &mut pi, &mut grok, &mut opencode] {
+    for child in [&mut reasonix, &mut pi, &mut grok, &mut kimi, &mut opencode] {
         child.kill().unwrap();
         child.wait().unwrap();
     }

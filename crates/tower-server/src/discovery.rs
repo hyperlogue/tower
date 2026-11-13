@@ -45,6 +45,12 @@ pub(crate) fn start(service: ServiceWorker, home: &Path) -> Vec<tokio::task::Joi
             format: Format::Grok,
         },
         Spec {
+            harness: "kimi",
+            executable: "kimi",
+            root: dir("KIMI_SHARE_DIR", ".kimi").join("sessions"),
+            format: Format::Kimi,
+        },
+        Spec {
             harness: "reasonix",
             executable: "reasonix",
             root: dir("REASONIX_HOME", ".reasonix").join("projects"),
@@ -139,6 +145,8 @@ enum Format {
     Grok,
     /// `$REASONIX_HOME/projects/<cwd>/sessions/<id>.jsonl.lease.lock`, held from launch.
     Reasonix,
+    /// `$KIMI_SHARE_DIR/sessions/<md5 of cwd>/<id>/wire.jsonl`.
+    Kimi,
 }
 struct Spec {
     harness: &'static str,
@@ -166,6 +174,7 @@ impl Format {
                 (parts.len() == 3 && parts[1] == "sessions" && name.ends_with(".jsonl.lease.lock"))
                     .then(|| path.to_path_buf())
             }
+            Format::Kimi => (parts.len() == 3 && name == "wire.jsonl").then(|| path.to_path_buf()),
         }
     }
     /// Whether a file is only ever written by a process that holds it open.
@@ -187,6 +196,7 @@ impl Format {
                     .to_owned(),
                 None,
             )),
+            Format::Kimi => Some((path.parent()?.file_name()?.to_str()?.to_owned(), None)),
             Format::Codex | Format::Pi => None,
         }
     }
@@ -204,7 +214,7 @@ impl Format {
                 (value["type"] == "session").then_some(())?;
                 (&value["id"], &value["cwd"])
             }
-            Format::Grok | Format::Reasonix => return None,
+            Format::Grok | Format::Reasonix | Format::Kimi => return None,
         };
         Some((id.as_str()?.to_owned(), Some(cwd.as_str()?.to_owned())))
     }
@@ -264,6 +274,25 @@ impl Format {
                 (value["type"] == kind).then_some(match kind {
                     "turn_ended" => "idle",
                     "permission_requested" => "waiting_approval",
+                    _ => "working",
+                })
+            }
+            Format::Kimi => {
+                let kind = [
+                    "TurnBegin",
+                    "TurnEnd",
+                    "ApprovalRequest",
+                    "ApprovalResponse",
+                    "QuestionRequest",
+                    "QuestionResponse",
+                ]
+                .into_iter()
+                .find(|k| text.contains(k))?;
+                let value: serde_json::Value = serde_json::from_str(text).ok()?;
+                (value["message"]["type"] == kind).then_some(match kind {
+                    "TurnEnd" => "idle",
+                    "ApprovalRequest" => "waiting_approval",
+                    "QuestionRequest" => "waiting_input",
                     _ => "working",
                 })
             }
@@ -404,7 +433,8 @@ fn newest_per_directory(spec: &Spec, root: &Path) -> Vec<PathBuf> {
                     let tracked = spec
                         .format
                         .tracked(root, &path)
-                        .or_else(|| spec.format.tracked(root, &path.join("events.jsonl")))?;
+                        .or_else(|| spec.format.tracked(root, &path.join("events.jsonl")))
+                        .or_else(|| spec.format.tracked(root, &path.join("wire.jsonl")))?;
                     Some((modified(&tracked)?, tracked))
                 })
                 .max()
@@ -421,6 +451,26 @@ fn writer_by_directory(
     path: &Path,
     sessions: &BTreeMap<PathBuf, Transcript>,
 ) -> Option<(u32, u64)> {
+    let taken = |c| sessions.values().any(|s| (s.pid, s.start) == c);
+    if spec.format == Format::Kimi {
+        // Kimi names the directory after the MD5 digest of its working directory.
+        use md5::Digest;
+        let hash = path.parent()?.parent()?.file_name()?.to_str()?;
+        return process_where(
+            spec.executable,
+            |cwd| {
+                cwd.to_str().is_some_and(|cwd| {
+                    let digest = md5::Md5::digest(cwd.as_bytes());
+                    digest
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>()
+                        == hash
+                })
+            },
+            taken,
+        );
+    }
     let cwd = match spec.format.named(path) {
         Some((_, cwd)) => cwd,
         None => {
@@ -433,9 +483,7 @@ fn writer_by_directory(
         }
     }?;
     let cwd = std::fs::canonicalize(&cwd).unwrap_or_else(|_| PathBuf::from(cwd));
-    process_in(spec.executable, &cwd, |c| {
-        sessions.values().any(|s| (s.pid, s.start) == c)
-    })
+    process_in(spec.executable, &cwd, taken)
 }
 
 /// The `executable` process running in `cwd`. A process `taken` by another
@@ -445,8 +493,16 @@ fn process_in(
     cwd: &Path,
     taken: impl Fn((u32, u64)) -> bool,
 ) -> Option<(u32, u64)> {
+    process_where(executable, |dir| dir == cwd, taken)
+}
+
+fn process_where(
+    executable: &str,
+    cwd: impl Fn(&Path) -> bool,
+    taken: impl Fn((u32, u64)) -> bool,
+) -> Option<(u32, u64)> {
     let candidates = harness_processes(executable)
-        .filter(|(_, _, dir)| dir == cwd)
+        .filter(|(_, _, dir)| cwd(dir))
         .map(|(pid, start, _)| (pid, start))
         .collect::<Vec<_>>();
     let free = candidates
