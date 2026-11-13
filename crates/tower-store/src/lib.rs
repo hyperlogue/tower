@@ -75,16 +75,8 @@ fn observe_status(tx: &Transaction<'_>, record: &mut AgentRecord, status: &str) 
     )?;
     let previous = previous.as_deref().unwrap_or(&record.status);
     if status != "unknown" && previous != status {
-        if matches!(status, "starting" | "working")
-            || stopping && matches!(status, "exited" | "lost")
-        {
-            record.needs_attention = false;
-        } else if matches!(
-            status,
-            "waiting_input" | "waiting_approval" | "lost" | "exited"
-        ) || status == "idle" && previous == "working"
-        {
-            record.needs_attention = true;
+        if let Some(needed) = tower_sessions::attention::on_status(previous, status, stopping) {
+            record.needs_attention = needed;
         }
         tx.execute(
             "UPDATE agents SET observed_status=?2 WHERE id=?1",
@@ -99,11 +91,11 @@ fn new_error(before: &AgentRecord, after: &AgentRecord) -> bool {
         if let Some(Value::Object(fields)) = &record.status_detail
             && let Some(Value::String(error)) = fields.get("error")
         {
-            return (!error.is_empty()).then_some(error);
+            return Some(error);
         }
         None
     }
-    error(after).is_some() && error(after) != error(before)
+    tower_sessions::attention::on_error(error(before), error(after))
 }
 
 impl Store {

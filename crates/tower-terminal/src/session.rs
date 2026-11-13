@@ -68,7 +68,7 @@ impl SessionPublisher {
 }
 
 /// Follows status changes to record when the session began to need its
-/// user, by the rules the daemon's registry applies to observed sessions.
+/// user; the daemon's registry applies the same rules to what it observes.
 struct Attention {
     status: String,
     error: Option<String>,
@@ -83,22 +83,17 @@ impl Attention {
         }
     }
     fn note(&mut self, state: &mut RuntimeState) {
+        use tower_sessions::attention;
         let status = state.status.as_str();
-        if status != "unknown" && status != self.status {
-            if matches!(status, "starting" | "working")
-                || state.stop_requested && matches!(status, "exited" | "lost")
-            {
-                self.since = None;
-            } else if matches!(
-                status,
-                "waiting_input" | "waiting_approval" | "lost" | "exited"
-            ) || status == "idle" && self.status == "working"
-            {
-                self.since = Some(state.seq);
-            }
+        match attention::on_status(&self.status, status, state.stop_requested) {
+            Some(true) => self.since = Some(state.seq),
+            Some(false) => self.since = None,
+            None => {}
+        }
+        if status != "unknown" {
             self.status = status.into();
         }
-        if state.detail.error.is_some() && state.detail.error != self.error {
+        if attention::on_error(self.error.as_deref(), state.detail.error.as_deref()) {
             self.since = Some(state.seq);
         }
         self.error = state.detail.error.clone();

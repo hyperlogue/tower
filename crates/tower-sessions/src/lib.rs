@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, sync::Arc};
 use terminal::TerminalState;
 use tower_protocol::{Capabilities, RpcError, Secret, SessionOpenParams, Value};
+pub mod attention;
 pub mod execution;
 pub mod messaging;
 pub mod terminal;
