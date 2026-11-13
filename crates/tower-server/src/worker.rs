@@ -247,7 +247,11 @@ impl ServiceWorker {
         }
         Ok(Ok(result))
     }
-    pub(crate) async fn recover_enrollment(&self) -> Result<()> {
+    pub(crate) fn enrollment_pending(&self) -> Arc<tokio::sync::Notify> {
+        self.service.enrollment_pending()
+    }
+    /// Confirms one enrollment that is waiting for it; false when none is.
+    pub(crate) async fn recover_enrollment(&self) -> Result<bool> {
         let _permit = self
             .enrollment_gate
             .clone()
@@ -260,8 +264,9 @@ impl ServiceWorker {
             crate::allgather::enrollment::confirm(&confirmation).await?;
             self.execute(move |s| s.confirm_enrollment(&confirmation))
                 .await??;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
     pub async fn remote(
         &self,
@@ -340,11 +345,14 @@ impl ServiceWorker {
         }
         request.method = "approval.status".into();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(p.timeout_s);
+        // A decision is a write to the approvals table. An approval that
+        // nobody decides ends at its own expiry, which is only a time.
+        let mut decided = tower_store::table_changes("approvals");
         loop {
             let r = request.clone();
             let result = self.execute(move |s| s.dispatch(&r, peer)).await?;
             let now = tokio::time::Instant::now();
-            match result {
+            let expiry = match result {
                 Ok(tower_protocol::Value::Object(mut fields))
                     if fields.get("state")
                         == Some(&tower_protocol::Value::String("pending".into())) =>
@@ -353,11 +361,22 @@ impl ServiceWorker {
                         fields.insert("timed_out".into(), tower_protocol::Value::Bool(true));
                         return Ok(Ok(tower_protocol::Value::Object(fields)));
                     }
+                    serde_json::to_value(fields.get("expires_at"))
+                        .ok()
+                        .and_then(|at| at.as_u64())
+                        .map(|at| {
+                            let wait = at
+                                .saturating_add(1)
+                                .saturating_sub(crate::service::now_ms());
+                            now + std::time::Duration::from_millis(wait)
+                        })
                 }
                 other => return Ok(other),
+            };
+            tokio::select! {
+                _ = decided.changed() => {}
+                _ = tokio::time::sleep_until(expiry.map_or(deadline, |at| at.min(deadline))) => {}
             }
-            tokio::time::sleep_until(deadline.min(now + std::time::Duration::from_millis(250)))
-                .await;
         }
     }
     pub async fn conversations(

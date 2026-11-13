@@ -176,15 +176,31 @@ pub(super) fn start(
     let config = Config::load(&paths)?;
     Ok(tokio::spawn(async move {
         let confirmation_worker = worker.clone();
+        // An enrollment is confirmed when it is made. This finishes the
+        // ones whose confirmation failed, retrying only while one waits.
         let confirmations = async move {
+            let pending = confirmation_worker.enrollment_pending();
             loop {
-                let _ = confirmation_worker.recover_enrollment().await;
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                match confirmation_worker.recover_enrollment().await {
+                    Ok(true) => {}
+                    Ok(false) => pending.notified().await,
+                    Err(_) => tokio::time::sleep(Duration::from_secs(5)).await,
+                }
             }
         };
         let connections = async move {
             let mut delay = Duration::from_millis(500);
             let mut blocked_key = None;
+            // What decides whether to connect: the enrollment files and the
+            // host's sync mode.
+            let mut host = tower_store::table_changes("host");
+            let mut files = tower_pal::FileWatch::new(&[
+                paths.state.join("allgather-server"),
+                paths.state.join("allgather.key"),
+            ]);
+            if let Err(e) = &files {
+                eprintln!("tower: Allgather enrollment is unobservable: {e}");
+            }
             loop {
                 let mut config = config.clone();
                 if let Ok(binding) = tower_pal::read_private(&paths.state.join("allgather-server"))
@@ -243,7 +259,15 @@ pub(super) fn start(
                     tokio::time::sleep(delay).await;
                     continue;
                 }
-                tokio::time::sleep(Duration::from_secs(1)).await;
+                tokio::select! {
+                    _ = host.changed() => {}
+                    _ = async {
+                        match &mut files {
+                            Ok(files) => files.changed().await,
+                            Err(_) => std::future::pending().await,
+                        }
+                    } => {}
+                }
             }
         };
         tokio::select! { _=confirmations=>{}, _=connections=>{} }

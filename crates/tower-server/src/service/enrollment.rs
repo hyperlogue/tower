@@ -281,6 +281,7 @@ impl Service {
         .map_err(enrollment_storage)?;
         self.save_enrollment(&key, &url)?;
         self.save_attempts(&mut all, next)?;
+        self.enrollment_pending.notify_one();
         Ok((value(result)?, Some(confirmation)))
     }
     fn saved_credential_matches(&self, c: &Confirmation) -> bool {

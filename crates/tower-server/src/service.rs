@@ -169,6 +169,8 @@ pub(super) struct Service {
     events: tokio::sync::broadcast::Sender<Arc<EventNotification>>,
     published: Mutex<events::Published>,
     wake: Arc<Wake>,
+    /// Signalled when an enrollment starts waiting to be confirmed.
+    enrollment_pending: Arc<tokio::sync::Notify>,
     /// Advances after any state change that can alter a caller's authority.
     authority: tokio::sync::watch::Sender<u64>,
 }
@@ -267,6 +269,7 @@ impl Service {
             events: tokio::sync::broadcast::channel(256).0,
             published: Mutex::new(events::Published::default()),
             wake: Arc::default(),
+            enrollment_pending: Arc::default(),
             authority: tokio::sync::watch::channel(0).0,
         })
     }
@@ -354,6 +357,9 @@ impl Service {
     pub(crate) fn credential_expiry(&self, context: &CallerContext) -> Option<u64> {
         let token = context.bearer_token.as_ref()?;
         self.store.token_by_hash(&hash(token)).ok()?.info.expires_at
+    }
+    pub(crate) fn enrollment_pending(&self) -> Arc<tokio::sync::Notify> {
+        self.enrollment_pending.clone()
     }
     pub(crate) fn wake(&self) -> Arc<Wake> {
         self.wake.clone()

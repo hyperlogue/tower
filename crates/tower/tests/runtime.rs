@@ -1421,3 +1421,63 @@ async fn startup_retries_only_the_handshake_not_an_uncertain_mutation() {
     );
     peer.await.unwrap();
 }
+
+#[test]
+fn an_approval_watch_returns_when_the_approval_is_decided() {
+    let f = Fixture::new();
+    let a = f.run(&["register", "--harness", "codex", "--session-id", "asker"]);
+    let b = f.run(&[
+        "register",
+        "--harness",
+        "claude-code",
+        "--session-id",
+        "target",
+    ]);
+    // The target needs a message channel before a send asks for approval.
+    let inbox_dir = PathBuf::from(format!("/tmp/cc-socks-{}", tower_pal::uid()));
+    std::fs::create_dir_all(&inbox_dir).unwrap();
+    let socket = inbox_dir.join(format!(
+        "tower-watch-{}.sock",
+        f.dir.path().file_name().unwrap().to_string_lossy()
+    ));
+    let _ = std::fs::remove_file(&socket);
+    let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let params = json!({"id":b["id"],"token":b["token"],"delivery":{"messaging_socket":socket,"messaging_token":"fixture-inbox-token"}}).to_string();
+    f.run(&["rpc", "agent.delivery", &params]);
+    let denied = f
+        .command(&["--json", "send", b["id"].as_str().unwrap(), "hello"])
+        .env("TOWER_AGENT_ID", a["id"].as_str().unwrap())
+        .env("TOWER_AGENT_TOKEN", a["token"].as_str().unwrap())
+        .output()
+        .unwrap();
+    let denied: Value = serde_json::from_slice(&denied.stdout).unwrap();
+    let approval = denied["error"]["data"]["approval_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no approval: {denied}"))
+        .to_owned();
+    // A watch that expires first reports the approval as still pending.
+    let pending = f.run(&["approval", "watch", &approval, "--timeout-s", "0"]);
+    assert_eq!(pending["state"], "pending");
+    assert_eq!(pending["timed_out"], true);
+
+    let watch = f
+        .command(&[
+            "--json",
+            "approval",
+            "watch",
+            &approval,
+            "--timeout-s",
+            "60",
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_millis(300));
+    let decided = Instant::now();
+    f.run(&["approve", &approval]);
+    let out = watch.wait_with_output().unwrap();
+    let result: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(result["state"], "approved", "{result}");
+    assert!(decided.elapsed() < Duration::from_secs(5));
+    let _ = std::fs::remove_file(&socket);
+}
