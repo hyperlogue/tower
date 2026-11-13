@@ -393,7 +393,13 @@ async fn transcripts(service: ServiceWorker, spec: Spec) {
             sessions.insert(path, session);
         }
         sessions.retain(|_, s| s.alive());
-        changed = watch.changed().await;
+        // A file may have grown between its last read and the start of its watch.
+        let followed = watch.follow(sessions.keys().cloned());
+        changed = if followed.is_empty() {
+            watch.changed().await
+        } else {
+            Some(followed)
+        };
     }
 }
 
