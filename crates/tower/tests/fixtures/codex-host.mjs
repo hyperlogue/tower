@@ -428,8 +428,25 @@ export async function serve(endpoint) {
       peer.onclose = () => { peers.delete(peer); for (const id of [...peer.subscriptions]) unsubscribe(peer, threads.get(id)); };
     }).catch(() => socket.destroy());
   });
-  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(endpoint, resolve); });
-  fs.chmodSync(endpoint, 0o600);
+  // macOS can report the listening event before the socket inode exists, and
+  // chmod on an AF_UNIX socket can return ENOTSUP. Either one used to kill
+  // this process after bind, so Tower never saw a daemon.
+  const previousMask = process.umask(0o077);
+  try {
+    await new Promise((resolve, reject) => { server.once('error', reject); server.listen(endpoint, resolve); });
+  } finally {
+    process.umask(previousMask);
+  }
+  for (let attempt = 0; attempt < 50; attempt++) {
+    try {
+      fs.chmodSync(endpoint, 0o600);
+      break;
+    } catch (error) {
+      if (!['ENOENT', 'ENOTSUP', 'EINVAL', 'EPERM'].includes(error.code)) throw error;
+      if (error.code !== 'ENOENT' || attempt === 49) break;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+  }
   const inode = fs.statSync(endpoint);
   let phase;
   const timer = setInterval(() => {
@@ -571,8 +588,10 @@ export async function tui(endpoint, args) {
 }
 
 const reachable = socket => new Promise(resolve => {
-  const probe = net.connect(socket, () => { probe.destroy(); resolve(true); });
-  probe.on('error', () => resolve(false));
+  const probe = net.connect(socket);
+  const timer = setTimeout(() => { probe.destroy(); resolve(false); }, 200);
+  probe.once('connect', () => { clearTimeout(timer); probe.destroy(); resolve(true); });
+  probe.once('error', () => { clearTimeout(timer); resolve(false); });
 });
 
 // Mirrors `codex app-server daemon start|stop` with its default socket.
@@ -586,7 +605,12 @@ async function daemon(command) {
       const child = spawn(process.execPath, [fileURLToPath(import.meta.url), 'app-server', '--listen', `unix://${socket}`], {detached: true, stdio: 'ignore'});
       fs.writeFileSync(pidFile, String(child.pid));
       child.unref();
-      for (let tries = 0; tries < 400 && !await reachable(socket); tries++) await new Promise(resolve => setTimeout(resolve, 25));
+      let up = false;
+      for (let tries = 0; tries < 400 && !up; tries++) {
+        up = await reachable(socket);
+        if (!up) await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      if (!up) throw new Error('fixture app-server socket did not accept connections');
     }
     process.stdout.write(`${JSON.stringify({status: 'started', socketPath: socket})}\n`);
   } else if (command === 'stop') {

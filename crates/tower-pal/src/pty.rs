@@ -74,10 +74,14 @@ impl PtyProcess {
                     return Err(io::Error::last_os_error());
                 }
                 // macOS does not make the new session the foreground group, so
-                // bytes written to the master never reach /dev/tty.
-                let group = libc::getpgrp();
-                if libc::ioctl(0, libc::TIOCSPGRP as _, &group) == -1 {
-                    return Err(io::Error::last_os_error());
+                // bytes written to the master never reach /dev/tty. Linux
+                // already does this inside TIOCSCTTY.
+                #[cfg(target_os = "macos")]
+                {
+                    let group = libc::getpgrp();
+                    if libc::ioctl(0, libc::TIOCSPGRP as _, &group) == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
                 }
                 Ok(())
             });
@@ -101,6 +105,7 @@ impl PtyProcess {
     pub fn pid(&self) -> u32 {
         self.child.id()
     }
+    #[cfg(target_os = "macos")]
     fn child_has_exited(&self) -> bool {
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         if unsafe {
@@ -125,13 +130,14 @@ impl PtyProcess {
                 file.read(bytes)
             }) {
                 Ok(Err(e)) if e.raw_os_error() == Some(libc::EIO) => {
-                    // macOS also returns EIO while the slave is momentarily
-                    // unowned. That is not EOF unless this child has exited.
-                    if self.child_has_exited() {
-                        return Ok(0);
+                    // Linux EIO means the slave is gone. macOS also returns it
+                    // while the slave is momentarily unowned and the child lives.
+                    #[cfg(target_os = "macos")]
+                    if !self.child_has_exited() {
+                        tokio::task::yield_now().await;
+                        continue;
                     }
-                    tokio::task::yield_now().await;
-                    continue;
+                    return Ok(0);
                 }
                 Ok(result) => return result,
                 Err(_) => continue,
@@ -317,8 +323,8 @@ pub fn terminal_resize_signal() -> io::Result<tokio::signal::unix::Signal> {
 }
 
 pub fn prompt_secret(prompt: &str, limit: usize) -> io::Result<String> {
-    use nix::poll::{PollFd, PollFlags, poll};
     use nix::sys::signal::SigSet;
+    use nix::sys::time::TimeValLike;
     use std::os::fd::AsFd;
 
     struct Restore {
@@ -381,8 +387,12 @@ pub fn prompt_secret(prompt: &str, limit: usize) -> io::Result<String> {
                 "Input cancelled",
             ));
         }
-        let mut fds = [PollFd::new(restore.tty.as_fd(), PollFlags::POLLIN)];
-        match poll(&mut fds, 100u16) {
+        // poll() does not report input on a macOS pty slave. select() does.
+        let tty = restore.tty.as_fd();
+        let mut ready = nix::sys::select::FdSet::new();
+        ready.insert(tty);
+        let mut timeout = nix::sys::time::TimeVal::milliseconds(100);
+        match nix::sys::select::select(None, Some(&mut ready), None, None, Some(&mut timeout)) {
             Ok(0) | Err(nix::errno::Errno::EINTR) => continue,
             Ok(_) => {}
             Err(error) => return Err(error.into()),
