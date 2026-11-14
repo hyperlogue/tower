@@ -531,10 +531,11 @@ fn harness_processes(executable: &str) -> impl Iterator<Item = (u32, u64, PathBu
         .filter(move |pid| {
             tower_pal::process_name(*pid).is_ok_and(|n| {
                 n == executable
-                    || matches!(
-                        n.as_str(),
-                        "node" | "bun" | "sh" | "bash" | "python" | "python3"
-                    )
+                    || matches!(n.as_str(), "node" | "bun")
+                    // Linux names a shebang script after the script. macOS names
+                    // it after the interpreter, so those processes need argv.
+                    || (cfg!(target_os = "macos")
+                        && matches!(n.as_str(), "sh" | "bash" | "python" | "python3"))
             })
         })
         .filter_map(move |pid| {

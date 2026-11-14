@@ -918,7 +918,6 @@ async fn a_cancelled_partial_response_requires_a_fresh_client_connection() {
 
 #[test]
 fn native_messaging_approval_retry_and_persistent_privacy() {
-    use std::io::{BufRead, BufReader as SyncReader};
     use std::os::unix::net::UnixListener;
     let f = Fixture::new();
     let inbox_dir = PathBuf::from(format!("/tmp/cc-socks-{}", tower_pal::uid()));
@@ -934,15 +933,28 @@ fn native_messaging_approval_retry_and_persistent_privacy() {
         let until = Instant::now() + Duration::from_secs(15);
         while Instant::now() < until {
             if let Ok((stream, _)) = listener.accept() {
-                // macOS copies O_NONBLOCK from the listener and rejects
-                // SO_RCVTIMEO on a unix socket. The sender shuts the write
-                // side down, so a blocking read still ends.
-                stream.set_nonblocking(false).unwrap();
-                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                let lines = SyncReader::new(stream)
+                // macOS copies O_NONBLOCK onto the accepted socket and rejects
+                // SO_RCVTIMEO on unix sockets. Poll instead of blocking forever.
+                stream.set_nonblocking(true).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(2);
+                let mut pending = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while Instant::now() < deadline {
+                    let remain = deadline.saturating_duration_since(Instant::now());
+                    if !tower_pal::wait_readable(&stream, remain).unwrap() {
+                        break;
+                    }
+                    match std::io::Read::read(&mut &stream, &mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => pending.extend_from_slice(&chunk[..n]),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                        Err(e) => panic!("{e}"),
+                    }
+                }
+                let lines = String::from_utf8_lossy(&pending)
                     .lines()
-                    .collect::<std::io::Result<Vec<_>>>()
-                    .unwrap();
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
                 received.send(lines).unwrap();
                 return;
             }

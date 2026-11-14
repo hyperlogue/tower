@@ -199,11 +199,58 @@ pub struct Peer {
     pub pid: Option<u32>,
 }
 pub fn peer(stream: &IpcStream) -> io::Result<Peer> {
-    let c = stream.peer_cred()?;
-    Ok(Peer {
-        uid: c.uid(),
-        pid: c.pid().and_then(|p| u32::try_from(p).ok()),
-    })
+    #[cfg(target_os = "macos")]
+    {
+        // tokio's peer_cred fails the whole lookup when LOCAL_PEEREPID returns
+        // ENOTCONN, even if getpeereid still knows the uid. A missing pid must
+        // not drop a connection that belongs to this user.
+        return macos_peer(stream);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let c = stream.peer_cred()?;
+        Ok(Peer {
+            uid: c.uid(),
+            pid: c.pid().and_then(|p| u32::try_from(p).ok()),
+        })
+    }
+}
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn macos_peer(stream: &IpcStream) -> io::Result<Peer> {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let mut uid = 0u32;
+    let mut gid = 0u32;
+    if unsafe { libc::getpeereid(fd, &mut uid, &mut gid) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut epid: libc::pid_t = 0;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    let pid = if unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEEREPID,
+            &mut epid as *mut libc::pid_t as *mut libc::c_void,
+            &mut len,
+        )
+    } == 0
+        && epid > 0
+    {
+        Some(epid as u32)
+    } else {
+        None
+    };
+    Ok(Peer { uid, pid })
+}
+/// Whether `fd` becomes readable within `timeout`.
+/// Unix sockets on macOS reject `SO_RCVTIMEO`, so callers use this instead.
+pub fn wait_readable(fd: impl std::os::fd::AsFd, timeout: Duration) -> io::Result<bool> {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    let mut fds = [PollFd::new(fd.as_fd(), PollFlags::POLLIN)];
+    let timeout = PollTimeout::try_from(timeout).unwrap_or(PollTimeout::MAX);
+    Ok(poll(&mut fds, timeout).map_err(io::Error::from)? > 0)
 }
 pub async fn connect(path: &Path) -> io::Result<IpcStream> {
     let stream = UnixStream::connect(path).await?;

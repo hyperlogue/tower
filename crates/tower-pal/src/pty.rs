@@ -73,6 +73,12 @@ impl PtyProcess {
                 if libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
                     return Err(io::Error::last_os_error());
                 }
+                // macOS does not make the new session the foreground group, so
+                // bytes written to the master never reach /dev/tty.
+                let group = libc::getpgrp();
+                if libc::ioctl(0, libc::TIOCSPGRP as _, &group) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
                 Ok(())
             });
         }
@@ -95,6 +101,22 @@ impl PtyProcess {
     pub fn pid(&self) -> u32 {
         self.child.id()
     }
+    fn child_has_exited(&self) -> bool {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        if unsafe {
+            libc::waitid(
+                libc::P_PID,
+                self.child.id(),
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        } == -1
+        {
+            return true;
+        }
+        let pid = unsafe { info.si_pid() };
+        pid != 0
+    }
     pub async fn read(&self, bytes: &mut [u8]) -> io::Result<usize> {
         loop {
             let mut guard = self.io.readable().await?;
@@ -102,7 +124,15 @@ impl PtyProcess {
                 let mut file = fd.get_ref();
                 file.read(bytes)
             }) {
-                Ok(Err(e)) if e.raw_os_error() == Some(libc::EIO) => return Ok(0),
+                Ok(Err(e)) if e.raw_os_error() == Some(libc::EIO) => {
+                    // macOS also returns EIO while the slave is momentarily
+                    // unowned. That is not EOF unless this child has exited.
+                    if self.child_has_exited() {
+                        return Ok(0);
+                    }
+                    tokio::task::yield_now().await;
+                    continue;
+                }
                 Ok(result) => return result,
                 Err(_) => continue,
             }
@@ -312,12 +342,9 @@ pub fn prompt_secret(prompt: &str, limit: usize) -> io::Result<String> {
         })?;
     let original = termios::tcgetattr(&tty)?;
     let mut hidden = original.clone();
-    hidden.local_flags.remove(
-        termios::LocalFlags::ECHO | termios::LocalFlags::ECHONL | termios::LocalFlags::ICANON,
-    );
-    // A macOS pty line discipline can hold NL until CR. Read each byte instead.
-    hidden.control_chars[termios::SpecialCharacterIndices::VMIN as usize] = 1;
-    hidden.control_chars[termios::SpecialCharacterIndices::VTIME as usize] = 0;
+    hidden
+        .local_flags
+        .remove(termios::LocalFlags::ECHO | termios::LocalFlags::ECHONL);
     let mut restore = Restore {
         tty,
         original,
@@ -367,15 +394,9 @@ pub fn prompt_secret(prompt: &str, limit: usize) -> io::Result<String> {
                 "Input cancelled",
             ));
         }
-        if byte[0] == b'\n' || byte[0] == b'\r' {
+        if byte[0] == b'\n' {
             return String::from_utf8(bytes)
                 .map_err(|_| io::Error::other("Invalid input encoding"));
-        }
-        if byte[0] == b'\x04' && bytes.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "Input cancelled",
-            ));
         }
         if bytes.len() == limit {
             return Err(io::Error::other("Input exceeds limit"));
