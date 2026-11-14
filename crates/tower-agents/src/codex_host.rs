@@ -14,25 +14,6 @@ pub async fn ensure(paths: &Paths) -> Result<Host> {
     ensure_configured(paths, Config::load(paths)?).await
 }
 
-fn trace(message: &str) {
-    let Ok(home) = std::env::var("HOME") else {
-        return;
-    };
-    let path = std::path::PathBuf::from(home).join("codex-trace.log");
-    let line = format!(
-        "{} pid={} {message}\n",
-        tower_pal::monotonic_ms(),
-        std::process::id()
-    );
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        use std::io::Write;
-        let _ = file.write_all(line.as_bytes());
-    }
-}
 pub async fn ensure_configured(paths: &Paths, config: Config) -> Result<Host> {
     let mut client = match Client::connect(&config.endpoint).await {
         Ok(client) => client,
@@ -55,17 +36,7 @@ pub async fn ensure_configured(paths: &Paths, config: Config) -> Result<Host> {
             match Client::connect(&config.endpoint).await {
                 Ok(client) => client,
                 Err(Error::Unavailable) => {
-                    trace(&format!(
-                        "start_daemon.begin socket={} exists={}",
-                        config.endpoint.display(),
-                        config.endpoint.exists()
-                    ));
                     start_daemon(paths).await?;
-                    trace(&format!(
-                        "start_daemon.done socket={} exists={}",
-                        config.endpoint.display(),
-                        config.endpoint.exists()
-                    ));
                     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
                     loop {
                         match Client::connect(&config.endpoint).await {

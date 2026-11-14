@@ -92,13 +92,11 @@ impl Fixture {
             }
             assert!(
                 Instant::now() < until,
-                "expected {status}: {row}; snapshot {}; trace {}",
+                "expected {status}: {row}; snapshot {}",
                 self.command(&["--json", "snapshot", id])
                     .output()
                     .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
-                    .unwrap_or_default(),
-                std::fs::read_to_string(self.root.path().join("codex-trace.log"))
-                    .unwrap_or_else(|error| format!("unread trace: {error}"))
+                    .unwrap_or_default()
             );
             thread::sleep(Duration::from_millis(40));
         }

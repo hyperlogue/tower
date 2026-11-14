@@ -446,9 +446,6 @@ export async function serve(endpoint) {
   process.on('SIGHUP', () => {});
   process.on('SIGPIPE', () => {});
   fs.writeFileSync(path.join(path.dirname(endpoint), 'fixture-daemon.pid'), String(process.pid));
-  try {
-    fs.appendFileSync(path.join(home, 'codex-trace.log'), `${Date.now()} pid=${process.pid} ppid=${process.ppid} listening socket=${endpoint} exists=${fs.existsSync(endpoint)}\n`);
-  } catch {}
   let phase;
   const timer = setInterval(() => {
     let next;
@@ -592,9 +589,12 @@ export async function tui(endpoint, args) {
 }
 
 const reachable = socket => new Promise(resolve => {
+  // macOS can emit connect for a unix path that is not on disk. That made
+  // daemon start return success without ever launching the server.
+  if (!fs.existsSync(socket)) { resolve(false); return; }
   const probe = net.connect(socket);
   const timer = setTimeout(() => { probe.destroy(); resolve(false); }, 200);
-  probe.once('connect', () => { clearTimeout(timer); probe.destroy(); resolve(true); });
+  probe.once('connect', () => { clearTimeout(timer); probe.destroy(); resolve(fs.existsSync(socket)); });
   probe.once('error', () => { clearTimeout(timer); resolve(false); });
 });
 
@@ -605,7 +605,7 @@ async function daemon(command) {
   const pidFile = path.join(root, 'fixture-daemon.pid');
   if (command === 'start') {
     fs.mkdirSync(root, {recursive: true, mode: 0o700});
-    if (!await reachable(socket)) {
+    if (!fs.existsSync(socket) || !await reachable(socket)) {
       const script = fileURLToPath(import.meta.url);
       // Ignore stdio. A stderr pipe closed by this parent delivers EPIPE and
       // the child exits, unlinking the socket it just bound.
