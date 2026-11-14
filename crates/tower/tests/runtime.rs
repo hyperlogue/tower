@@ -934,9 +934,11 @@ fn native_messaging_approval_retry_and_persistent_privacy() {
         let until = Instant::now() + Duration::from_secs(15);
         while Instant::now() < until {
             if let Ok((stream, _)) = listener.accept() {
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
+                // macOS copies O_NONBLOCK from the listener and rejects
+                // SO_RCVTIMEO on a unix socket. The sender shuts the write
+                // side down, so a blocking read still ends.
+                stream.set_nonblocking(false).unwrap();
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
                 let lines = SyncReader::new(stream)
                     .lines()
                     .collect::<std::io::Result<Vec<_>>>()

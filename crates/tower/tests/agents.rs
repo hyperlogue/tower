@@ -120,6 +120,16 @@ impl Drop for Fixture {
         }
     }
 }
+fn holds_open(pid: u32, path: &std::path::Path) -> bool {
+    let Ok(path) = std::fs::canonicalize(path) else {
+        return false;
+    };
+    tower_pal::open_files(pid).is_ok_and(|files| {
+        files
+            .iter()
+            .any(|open| std::fs::canonicalize(open).ok().as_deref() == Some(path.as_path()))
+    })
+}
 const FAKE: &str = r#"#!/bin/sh
 if [ "$1" = queue ] && [ "$2" = --help ]; then printf '%s\n' '--thread --message'; exit 0; fi
 name=${0##*/}
@@ -1229,7 +1239,7 @@ fn unmanaged_codex_rollouts_are_discovered_from_their_writer() {
         .unwrap();
     let pid = child.id();
     let until = Instant::now() + Duration::from_secs(5);
-    while !tower_pal::open_files(pid).is_ok_and(|files| files.contains(&rollout)) {
+    while !holds_open(pid, &rollout) {
         assert!(Instant::now() < until, "fixture never opened its rollout");
         thread::sleep(Duration::from_millis(20));
     }
@@ -1270,7 +1280,7 @@ fn unmanaged_codex_rollouts_are_discovered_from_their_writer() {
         .spawn()
         .unwrap();
     let until = Instant::now() + Duration::from_secs(5);
-    while !tower_pal::open_files(child.id()).is_ok_and(|files| files.contains(&rollout)) {
+    while !holds_open(child.id(), &rollout) {
         assert!(Instant::now() < until, "fixture never opened its rollout");
         thread::sleep(Duration::from_millis(20));
     }
@@ -1314,9 +1324,7 @@ fn unmanaged_sessions_of_other_harnesses_are_discovered_from_their_files() {
         }
         let child = command.spawn().unwrap();
         let until = Instant::now() + Duration::from_secs(5);
-        while held.is_some_and(|held| {
-            !tower_pal::open_files(child.id()).is_ok_and(|files| files.iter().any(|f| f == held))
-        }) {
+        while held.is_some_and(|held| !holds_open(child.id(), held)) {
             assert!(Instant::now() < until, "{name} never opened its file");
             thread::sleep(Duration::from_millis(20));
         }

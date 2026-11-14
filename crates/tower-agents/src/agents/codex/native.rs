@@ -173,7 +173,8 @@ mod tests {
         let exe = Path::new("/opt/tower-cli");
         configure(exe, &mut env, &mut argv).unwrap();
         assert_eq!(argv, ["codex", "--profile", "tower", "--enable", "hooks"]);
-        let path = root.join("tower.config.toml");
+        // configure canonicalizes CODEX_HOME, so the trust key uses that path.
+        let path = std::fs::canonicalize(root.join("tower.config.toml")).unwrap();
         let first = std::fs::read_to_string(&path).unwrap();
         assert!(!first.contains("dangerously"));
         assert!(!root.join("config.toml").exists());

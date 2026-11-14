@@ -312,9 +312,12 @@ pub fn prompt_secret(prompt: &str, limit: usize) -> io::Result<String> {
         })?;
     let original = termios::tcgetattr(&tty)?;
     let mut hidden = original.clone();
-    hidden
-        .local_flags
-        .remove(termios::LocalFlags::ECHO | termios::LocalFlags::ECHONL);
+    hidden.local_flags.remove(
+        termios::LocalFlags::ECHO | termios::LocalFlags::ECHONL | termios::LocalFlags::ICANON,
+    );
+    // A macOS pty line discipline can hold NL until CR. Read each byte instead.
+    hidden.control_chars[termios::SpecialCharacterIndices::VMIN as usize] = 1;
+    hidden.control_chars[termios::SpecialCharacterIndices::VTIME as usize] = 0;
     let mut restore = Restore {
         tty,
         original,
@@ -364,9 +367,15 @@ pub fn prompt_secret(prompt: &str, limit: usize) -> io::Result<String> {
                 "Input cancelled",
             ));
         }
-        if byte[0] == b'\n' {
+        if byte[0] == b'\n' || byte[0] == b'\r' {
             return String::from_utf8(bytes)
                 .map_err(|_| io::Error::other("Invalid input encoding"));
+        }
+        if byte[0] == b'\x04' && bytes.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "Input cancelled",
+            ));
         }
         if bytes.len() == limit {
             return Err(io::Error::other("Input exceeds limit"));
