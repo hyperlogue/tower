@@ -461,7 +461,6 @@ impl Service {
                 _ => Ok(Actor::Unregistered),
             };
         }
-        let all = self.all()?;
         let mut pid = peer.pid;
         let mut seen = HashSet::new();
         for _ in 0..64 {
@@ -472,16 +471,16 @@ impl Service {
             let Ok(p) = tower_pal::process_identity(current) else {
                 break;
             };
-            let matches = all
-                .iter()
-                .filter(|r| r.pid == Some(p.pid) && r.pid_start_time == Some(p.start_time))
-                .collect::<Vec<_>>();
+            let matches = self
+                .store
+                .agents_by_process(p.pid, Some(p.start_time))
+                .map_err(storage)?;
             if matches.len() > 1 || matches.iter().any(|r| r.shared_process) {
                 return Ok(Actor::Unregistered);
             }
             if let Some(record) = matches.first() {
                 return Ok(Actor::Agent {
-                    record: Box::new((*record).clone()),
+                    record: Box::new(record.clone()),
                     strong: false,
                 });
             }

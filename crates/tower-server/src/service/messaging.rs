@@ -716,9 +716,11 @@ impl Service {
         }
         if let Some(pid) = p.register.pid
             && self
-                .all()?
+                .store
+                .agents_by_process(pid, None)
+                .map_err(storage)?
                 .iter()
-                .any(|r| r.ownership == "owned" && r.pid == Some(pid))
+                .any(|r| r.ownership == "owned")
         {
             return value(serde_json::json!({"ignored":true}));
         }

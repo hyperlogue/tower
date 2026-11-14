@@ -689,6 +689,22 @@ impl Store {
         tx.commit()?;
         Ok(host)
     }
+    /// The records bound to a process ID, or to one incarnation of it when
+    /// its start time is given.
+    pub fn agents_by_process(&self, pid: u32, start: Option<u64>) -> Result<Vec<AgentRecord>> {
+        let conn = self.lock()?;
+        let mut query = conn.prepare_cached(
+            "SELECT public_json FROM agents WHERE pid=?1 AND (?2 IS NULL OR pid_start=?2) ORDER BY id",
+        )?;
+        let rows = query
+            .query_map(params![pid, start.map(|s| s.to_string())], |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows.iter()
+            .map(|json| Ok(serde_json::from_str(json)?))
+            .collect()
+    }
     /// Changes whenever an agent record is added, removed or takes a new
     /// revision: the revision counter and the number of records.
     pub fn agents_version(&self) -> Result<(u64, u64)> {
