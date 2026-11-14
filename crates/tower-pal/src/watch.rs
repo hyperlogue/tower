@@ -79,6 +79,9 @@ impl FileWatch {
             return Err(io::Error::other("no observable file parents"));
         }
         for root in roots {
+            // macOS reports events for the real directory. Linux already
+            // watches the path the caller opened.
+            #[cfg(target_os = "macos")]
             let root = std::fs::canonicalize(&root).unwrap_or(root);
             watcher
                 .watch(&root, notify::RecursiveMode::NonRecursive)
@@ -120,7 +123,10 @@ impl TreeWatch {
                 }
             })
             .map_err(io::Error::other)?;
+        #[cfg(target_os = "macos")]
         let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        #[cfg(not(target_os = "macos"))]
+        let root = root.to_path_buf();
         watcher
             .watch(&root, notify::RecursiveMode::Recursive)
             .map_err(io::Error::other)?;
@@ -174,7 +180,10 @@ impl PathWatch {
                 updates.send_modify(|revision| *revision = revision.wrapping_add(1));
             })
             .map_err(io::Error::other)?;
+        #[cfg(target_os = "macos")]
         let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        #[cfg(not(target_os = "macos"))]
+        let root = root.to_path_buf();
         watcher
             .watch(&root, notify::RecursiveMode::Recursive)
             .map_err(io::Error::other)?;
