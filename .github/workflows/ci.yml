@@ -100,4 +100,4 @@ jobs:
         run: nix develop --command cargo build --workspace --all-targets --locked
 
       - name: Test
-        run: nix develop --command cargo test --workspace --locked
+        run: nix develop --command cargo test --workspace --locked --no-fail-fast
