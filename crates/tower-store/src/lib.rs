@@ -499,7 +499,11 @@ impl Store {
         .collect()
     }
     pub fn observe_managed(&self, protocol: &str, o: Observation, now: u64) -> Result<()> {
-        let mut conn = self.lock()?;
+        // A newly assigned binding is what a later resume starts from.
+        let mut conn = self.database.lock_relaxed()?;
+        if o.binding.is_some() {
+            conn.pragma_update(None, "synchronous", "FULL")?;
+        }
         let tx = conn.transaction()?;
         let id = &o.id;
         let mut stored = stored_agent(&tx, id)?;
@@ -827,7 +831,7 @@ impl Store {
         delivery: Option<DeliveryState>,
         heartbeat: Option<u64>,
     ) -> Result<UpdateResult> {
-        let mut conn = self.lock()?;
+        let mut conn = self.database.lock_relaxed()?;
         let tx = conn.transaction()?;
         let mut agent = stored_agent(&tx, &update.id)?;
         if agent.ended_at.is_some() {

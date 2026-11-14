@@ -489,3 +489,33 @@ fn a_repeated_report_writes_nothing_until_the_record_goes_unseen() {
     assert!(changed.applied && changed.revision > first.revision);
     assert!(s.agent("a").unwrap().record.needs_attention);
 }
+
+#[test]
+fn only_status_writes_commit_without_waiting_for_the_disk() {
+    let (_dir, s) = setup();
+    s.register_test(record("a", Some("n"), None), b"hash")
+        .unwrap();
+    let level = |s: &Store| -> u32 {
+        s.lock()
+            .unwrap()
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .unwrap()
+    };
+    assert_eq!(level(&s), 2);
+    {
+        let relaxed = s.database.lock_relaxed().unwrap();
+        let during: u32 = relaxed
+            .pragma_query_value(None, "synchronous", |row| row.get(0))
+            .unwrap();
+        assert_eq!(during, 1);
+    }
+    // Every later commit waits again, whether the status write succeeded,
+    // was skipped or failed.
+    s.update(&update("a", 1, "working"), 200).unwrap();
+    assert_eq!(level(&s), 2);
+    s.update_repeating(&update("a", 2, "working"), 300, 30_000)
+        .unwrap();
+    assert_eq!(level(&s), 2);
+    assert!(s.update(&update("missing", 1, "working"), 400).is_err());
+    assert_eq!(level(&s), 2);
+}

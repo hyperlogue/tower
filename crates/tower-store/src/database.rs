@@ -139,6 +139,16 @@ impl Database {
     pub fn lock(&self) -> Result<MutexGuard<'_, Connection>> {
         self.conn.lock().map_err(|_| Error::Poisoned)
     }
+    /// The connection for writes that only restate what their source will
+    /// report again, such as a session's status. Their commits do not wait
+    /// for the disk: after a power loss the last of them may be missing,
+    /// while the database stays consistent. Every other commit still waits,
+    /// and takes these with it.
+    pub fn lock_relaxed(&self) -> Result<Relaxed<'_>> {
+        let conn = self.lock()?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        Ok(Relaxed(conn))
+    }
 
     pub fn runtime_directory(&self) -> PathBuf {
         self.runtime_directory.clone()
@@ -171,3 +181,21 @@ fn attach_journal(conn: &Connection, path: &Path, directory: &Path) -> Result<()
 
 #[cfg(test)]
 mod tests;
+
+pub struct Relaxed<'a>(MutexGuard<'a, Connection>);
+impl std::ops::Deref for Relaxed<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.0
+    }
+}
+impl std::ops::DerefMut for Relaxed<'_> {
+    fn deref_mut(&mut self) -> &mut Connection {
+        &mut self.0
+    }
+}
+impl Drop for Relaxed<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.pragma_update(None, "synchronous", "FULL");
+    }
+}
