@@ -35,6 +35,22 @@ pub enum Error {
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// A killed predecessor can refuse connections before the kernel releases its
+/// lock. Wait for it, but give up while the client is still polling for us.
+async fn acquire_singleton(paths: &Paths) -> std::io::Result<SingletonLock> {
+    let path = paths.run.join("towerd.lock");
+    let mut attempts = 0;
+    loop {
+        match SingletonLock::acquire(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && attempts < 60 => {
+                attempts += 1;
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            result => return result,
+        }
+    }
+}
+
 /// Runs the server. `backends` is built only after the singleton lock is
 /// held, so recovery of a previous server's sessions never runs twice.
 pub async fn run<F, B>(paths: Paths, startup: &str, backends: B) -> Result<()>
@@ -43,7 +59,7 @@ where
     F: std::future::Future<Output = Result<tower_sessions::Backends>>,
 {
     paths.prepare()?;
-    let _lock = SingletonLock::acquire(&paths.run.join("towerd.lock"))?;
+    let _lock = acquire_singleton(&paths).await?;
     tower_pal::ignore_hangup()?;
     let database = Arc::new(tower_store::Database::open(&paths.database)?);
     let backends = backends(database.clone()).await?;
