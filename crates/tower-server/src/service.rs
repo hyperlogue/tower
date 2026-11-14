@@ -820,8 +820,31 @@ impl Service {
     }
     pub fn dispatch(&self, request: &Request, peer: Peer) -> std::result::Result<Value, RpcError> {
         let result = self.dispatch_inner(request, peer);
-        if result.is_ok() {
-            self.publish()?;
+        let method = request.method.as_str();
+        // These read the registry and change nothing.
+        if result.is_err()
+            || matches!(
+                method,
+                "hello" | "identity.whoami" | "agent.list" | "agent.get"
+            )
+        {
+            return result;
+        }
+        self.publish()?;
+        // Reports about a session change records, which `publish` weighs.
+        // Anything else may have changed rules, tokens, enrollment or
+        // ownership, so every connection checks its authority again.
+        if !matches!(
+            method,
+            "agent.hook"
+                | "agent.update"
+                | "agent.heartbeat"
+                | "session.tags.patch"
+                | "session.attention.clear"
+                | "subscribe"
+                | "unsubscribe"
+        ) {
+            self.authority_changed();
         }
         result
     }

@@ -689,6 +689,20 @@ impl Store {
         tx.commit()?;
         Ok(host)
     }
+    /// Changes whenever an agent record is added, removed or takes a new
+    /// revision: the revision counter and the number of records.
+    pub fn agents_version(&self) -> Result<(u64, u64)> {
+        let conn = self.lock()?;
+        let (revision, count): (i64, i64) = conn.query_row(
+            "SELECT (SELECT value FROM counters WHERE name='registry'),(SELECT count(*) FROM agents)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((
+            u64::try_from(revision).map_err(|_| Error::Schema)?,
+            u64::try_from(count).map_err(|_| Error::Schema)?,
+        ))
+    }
     pub fn host(&self) -> Result<Host> {
         host_info(&*self.lock()?)
     }

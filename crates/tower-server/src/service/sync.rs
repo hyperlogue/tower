@@ -155,6 +155,7 @@ impl Service {
         );
         if result.is_ok() {
             self.publish()?;
+            self.authority_changed();
         }
         result
     }
