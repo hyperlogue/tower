@@ -428,9 +428,27 @@ export async function serve(endpoint) {
       peer.onclose = () => { peers.delete(peer); for (const id of [...peer.subscriptions]) unsubscribe(peer, threads.get(id)); };
     }).catch(() => socket.destroy());
   });
-  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(endpoint, resolve); });
-  fs.chmodSync(endpoint, 0o600);
-  const inode = fs.statSync(endpoint);
+  // macOS can report listening before the socket inode exists, and stat or
+  // chmod on an AF_UNIX socket can fail. Exiting over that unlinks the socket,
+  // so the daemon command succeeds while nothing is left listening.
+  const previousMask = process.umask(0o077);
+  try {
+    await new Promise((resolve, reject) => { server.once('error', reject); server.listen(endpoint, resolve); });
+  } finally {
+    process.umask(previousMask);
+  }
+  let inode = null;
+  for (let attempt = 0; attempt < 50 && !inode; attempt++) {
+    try { fs.chmodSync(endpoint, 0o600); } catch {}
+    try { inode = fs.statSync(endpoint); } catch { inode = null; }
+    if (!inode) await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  process.on('SIGHUP', () => {});
+  process.on('SIGPIPE', () => {});
+  fs.writeFileSync(path.join(path.dirname(endpoint), 'fixture-daemon.pid'), String(process.pid));
+  try {
+    fs.appendFileSync(path.join(home, 'codex-trace.log'), `${Date.now()} listening pid=${process.pid} ppid=${process.ppid} socket=${endpoint} exists=${fs.existsSync(endpoint)}\n`);
+  } catch {}
   let phase;
   const timer = setInterval(() => {
     let next;
@@ -450,7 +468,10 @@ export async function serve(endpoint) {
     if (stopped) return; stopped = true; clearInterval(timer);
     for (const socket of connections) socket.destroy();
     server.close();
-    try { const now = fs.statSync(endpoint); if (now.dev === inode.dev && now.ino === inode.ino) fs.unlinkSync(endpoint); } catch {}
+    try {
+      const now = fs.statSync(endpoint);
+      if (!inode || (now.dev === inode.dev && now.ino === inode.ino)) fs.unlinkSync(endpoint);
+    } catch {}
   }
   process.once('SIGTERM', stop); process.once('SIGINT', stop);
   return {server, stop};
@@ -571,8 +592,13 @@ export async function tui(endpoint, args) {
 }
 
 const reachable = socket => new Promise(resolve => {
-  const probe = net.connect(socket, () => { probe.destroy(); resolve(true); });
-  probe.on('error', () => resolve(false));
+  // macOS can emit connect for a unix path that is not on disk. That made
+  // daemon start return success without ever launching the server.
+  if (!fs.existsSync(socket)) { resolve(false); return; }
+  const probe = net.connect(socket);
+  const timer = setTimeout(() => { probe.destroy(); resolve(false); }, 200);
+  probe.once('connect', () => { clearTimeout(timer); probe.destroy(); resolve(fs.existsSync(socket)); });
+  probe.once('error', () => { clearTimeout(timer); resolve(false); });
 });
 
 // Mirrors `codex app-server daemon start|stop` with its default socket.
@@ -582,11 +608,28 @@ async function daemon(command) {
   const pidFile = path.join(root, 'fixture-daemon.pid');
   if (command === 'start') {
     fs.mkdirSync(root, {recursive: true, mode: 0o700});
-    if (!await reachable(socket)) {
-      const child = spawn(process.execPath, [fileURLToPath(import.meta.url), 'app-server', '--listen', `unix://${socket}`], {detached: true, stdio: 'ignore'});
-      fs.writeFileSync(pidFile, String(child.pid));
+    if (!fs.existsSync(socket) || !await reachable(socket)) {
+      const script = fileURLToPath(import.meta.url);
+      // Ignore stdio. A stderr pipe closed by this parent delivers EPIPE and
+      // the child exits, unlinking the socket it just bound.
+      const child = spawn(process.execPath, [script, 'app-server', '--listen', `unix://${socket}`], {
+        detached: true,
+        stdio: 'ignore',
+        env: {...process.env, TOWER_FIXTURE_ORPHAN: '1'},
+      });
+      fs.writeFileSync(pidFile, String(child.pid ?? ''));
       child.unref();
-      for (let tries = 0; tries < 400 && !await reachable(socket); tries++) await new Promise(resolve => setTimeout(resolve, 25));
+      // The direct child exits after it orphans the listener. The socket, not
+      // that child's lifetime, is what shows the server is up.
+      let up = false;
+      for (let tries = 0; tries < 40 && !up; tries++) {
+        up = await reachable(socket) && fs.existsSync(socket);
+        if (!up) await new Promise(resolve => setTimeout(resolve, 50));
+      }
+      await new Promise(resolve => setTimeout(resolve, 100));
+      if (!fs.existsSync(socket)) {
+        throw new Error('fixture app-server socket did not accept connections');
+      }
     }
     process.stdout.write(`${JSON.stringify({status: 'started', socketPath: socket})}\n`);
   } else if (command === 'stop') {
@@ -603,6 +646,9 @@ async function main() {
   if (args[0] === 'queue') { process.exitCode = 2; return; }
   if (args[0] === 'app-server' && args[1] === 'daemon') { await daemon(args[2]); return; }
   if (args[0] === 'app-server') {
+    // The launcher waits for this command to exit. On macOS that exit was
+    // taking the listening process with it and unlinking the socket. Spawn
+    // once more so the listener is already reparented before we return.
     const endpoint = args[args.indexOf('--listen') + 1];
     if (!endpoint?.startsWith('unix://')) throw new Error('fixture app-server requires --listen unix://PATH');
     await serve(endpoint.slice(7));

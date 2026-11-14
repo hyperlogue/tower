@@ -712,14 +712,29 @@ impl Service {
             .filter(|h| h.harness == harness)
             .map(|h| h.executable)
             .collect::<Vec<_>>();
+        let named = |name: &str| {
+            programs.iter().any(|program| program == name)
+                || (harness == "codex" && name == "codex-tui")
+        };
+        // macOS names a shebang script after its interpreter. The script path is
+        // still in the first arguments, which is what scan already matches.
+        let runs = |pid: u32| {
+            tower_pal::process_name(pid).is_ok_and(|name| named(&name))
+                || tower_pal::inspect_process(pid).is_ok_and(|process| {
+                    process.argv.iter().take(2).any(|arg| {
+                        std::path::Path::new(arg)
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(named)
+                    })
+                })
+        };
         let mut current = tower_pal::process_identity(pid).ok()?.parent;
         for _ in 0..32 {
             if current <= 1 {
                 return None;
             }
-            if tower_pal::process_name(current).is_ok_and(|name| {
-                programs.contains(&name) || (harness == "codex" && name == "codex-tui")
-            }) {
+            if runs(current) {
                 return Some(current);
             }
             current = tower_pal::process_identity(current).ok()?.parent;

@@ -14,6 +14,24 @@ pub async fn ensure(paths: &Paths) -> Result<Host> {
     ensure_configured(paths, Config::load(paths)?).await
 }
 
+fn trace(message: &str) {
+    let Ok(home) = std::env::var("HOME") else {
+        return;
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::path::Path::new(&home).join("codex-trace.log"))
+    {
+        use std::io::Write;
+        let _ = write!(
+            file,
+            "{} pid={} {message}\n",
+            tower_pal::monotonic_ms(),
+            std::process::id()
+        );
+    }
+}
 pub async fn ensure_configured(paths: &Paths, config: Config) -> Result<Host> {
     let mut client = match Client::connect(&config.endpoint).await {
         Ok(client) => client,
@@ -36,7 +54,16 @@ pub async fn ensure_configured(paths: &Paths, config: Config) -> Result<Host> {
             match Client::connect(&config.endpoint).await {
                 Ok(client) => client,
                 Err(Error::Unavailable) => {
-                    start_daemon(paths).await?;
+                    trace(&format!(
+                        "start_daemon.begin exists={}",
+                        config.endpoint.exists()
+                    ));
+                    let started = start_daemon(paths).await;
+                    trace(&format!(
+                        "start_daemon.end exists={} result={started:?}",
+                        config.endpoint.exists()
+                    ));
+                    started?;
                     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
                     loop {
                         match Client::connect(&config.endpoint).await {
@@ -126,7 +153,10 @@ async fn start_daemon(paths: &Paths) -> Result<()> {
             .current_dir(&paths.home)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            // The daemon's own errors are the only explanation when its socket
+            // never accepts connections. They belong on this process's stderr,
+            // which is the session terminal.
+            .stderr(std::process::Stdio::inherit())
             .kill_on_drop(true)
             .status(),
     )

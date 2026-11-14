@@ -199,18 +199,87 @@ pub struct Peer {
     pub pid: Option<u32>,
 }
 pub fn peer(stream: &IpcStream) -> io::Result<Peer> {
-    let c = stream.peer_cred()?;
-    Ok(Peer {
-        uid: c.uid(),
-        pid: c.pid().and_then(|p| u32::try_from(p).ok()),
-    })
+    #[cfg(target_os = "macos")]
+    {
+        // tokio's peer_cred fails the whole lookup when LOCAL_PEEREPID returns
+        // ENOTCONN, even if getpeereid still knows the uid. A missing pid must
+        // not drop a connection that belongs to this user.
+        return macos_peer(stream);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let c = stream.peer_cred()?;
+        Ok(Peer {
+            uid: c.uid(),
+            pid: c.pid().and_then(|p| u32::try_from(p).ok()),
+        })
+    }
+}
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn macos_peer(stream: &IpcStream) -> io::Result<Peer> {
+    use std::os::fd::AsRawFd;
+    let fd = stream.as_raw_fd();
+    let mut uid = 0u32;
+    let mut gid = 0u32;
+    if unsafe { libc::getpeereid(fd, &mut uid, &mut gid) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut epid: libc::pid_t = 0;
+    let mut len = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    let pid = if unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEEREPID,
+            &mut epid as *mut libc::pid_t as *mut libc::c_void,
+            &mut len,
+        )
+    } == 0
+        && epid > 0
+    {
+        Some(epid as u32)
+    } else {
+        None
+    };
+    Ok(Peer { uid, pid })
+}
+/// Whether `fd` becomes readable within `timeout`.
+/// Unix sockets on macOS reject `SO_RCVTIMEO`, so callers use this instead.
+pub fn wait_readable(fd: impl std::os::fd::AsFd, timeout: Duration) -> io::Result<bool> {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    let mut fds = [PollFd::new(fd.as_fd(), PollFlags::POLLIN)];
+    let timeout = PollTimeout::try_from(timeout).unwrap_or(PollTimeout::MAX);
+    Ok(poll(&mut fds, timeout).map_err(io::Error::from)? > 0)
 }
 pub async fn connect(path: &Path) -> io::Result<IpcStream> {
     let stream = UnixStream::connect(path).await?;
-    if peer(&stream)?.uid != uid() {
-        return Err(denied("tower socket peer belongs to another user"));
+    // macOS can return ENOTCONN for a moment after a unix connect even though
+    // the peer is this user. Linux keeps the credential after the peer closes,
+    // so a miss there still means the connection is gone.
+    let mut attempts = 0;
+    loop {
+        match peer(&stream) {
+            Ok(peer) if peer.uid == uid() => return Ok(stream),
+            Ok(_) => return Err(denied("tower socket peer belongs to another user")),
+            Err(error)
+                if cfg!(target_os = "macos")
+                    && error.kind() == io::ErrorKind::NotConnected
+                    && attempts < 20 =>
+            {
+                attempts += 1;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            // Callers already retry a reset handshake.
+            Err(error) if error.kind() == io::ErrorKind::NotConnected => {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "socket peer disconnected before its identity could be checked",
+                ));
+            }
+            Err(error) => return Err(error),
+        }
     }
-    Ok(stream)
 }
 /// Call while holding the owning service's singleton lock.
 pub async fn prepare_socket_path(path: &Path) -> io::Result<()> {
@@ -256,7 +325,21 @@ fn resolve_owned_socket(path: &Path) -> io::Result<(PathBuf, fs::Metadata)> {
     if alias.uid() != uid() || (!alias.file_type().is_socket() && !alias.file_type().is_symlink()) {
         return Err(denied("invalid socket alias owner or type"));
     }
-    let resolved = fs::canonicalize(path)?;
+    // macOS realpath(3) can fail for a socket inode that is present. The
+    // directory still canonicalizes, and the file name is unchanged.
+    let resolved = match fs::canonicalize(path) {
+        Ok(path) => path,
+        Err(error) if cfg!(target_os = "macos") => {
+            let name = path
+                .file_name()
+                .ok_or_else(|| io::Error::other("invalid socket path"))?;
+            let parent = path
+                .parent()
+                .ok_or_else(|| io::Error::other("invalid socket path"))?;
+            fs::canonicalize(parent).map_err(|_| error)?.join(name)
+        }
+        Err(error) => return Err(error),
+    };
     let metadata = fs::symlink_metadata(&resolved)?;
     if !metadata.file_type().is_socket() || metadata.uid() != uid() {
         return Err(denied("invalid private socket owner or type"));
@@ -618,9 +701,11 @@ mod tests {
         assert!(SingletonLock::acquire(&lockpath).is_err());
         let listener = IpcListener::bind(&path).await.unwrap();
         let stream = connect(&path).await.unwrap();
-        let (_, p) = listener.accept().await.unwrap();
+        // macOS withholds peer credentials after the accepted socket is closed.
+        let (accepted, p) = listener.accept().await.unwrap();
         assert_eq!(p.uid, uid());
         assert_eq!(peer(&stream).unwrap().uid, uid());
+        drop(accepted);
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
         assert!(IpcListener::bind(&path).await.is_err());
         drop(listener);
