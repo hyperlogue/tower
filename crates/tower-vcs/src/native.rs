@@ -178,20 +178,29 @@ pub(crate) async fn binding(path: &Path) -> Result<Binding> {
     if !path.is_dir() {
         return Err(fail("not_directory"));
     }
-    let git_dir = PathBuf::from(text(
-        at(&path, &["rev-parse", "--absolute-git-dir"]).await?,
-    )?);
-    let common_dir = PathBuf::from(text(
+    // One answer per line, in the order asked.
+    let facts = text(
         at(
             &path,
-            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--absolute-git-dir",
+                "--git-common-dir",
+                "--is-bare-repository",
+                "--is-inside-work-tree",
+            ],
         )
         .await?,
-    )?);
+    )?;
+    let mut facts = facts.lines();
+    let mut fact = || facts.next().ok_or_else(|| fail("git_protocol"));
+    let git_dir = PathBuf::from(fact()?);
+    let common_dir = PathBuf::from(fact()?);
     let git_dir = std::fs::canonicalize(git_dir).map_err(|_| fail("path_unavailable"))?;
     let common_dir = std::fs::canonicalize(common_dir).map_err(|_| fail("path_unavailable"))?;
-    let bare = text(at(&path, &["rev-parse", "--is-bare-repository"]).await?)? == "true";
-    let inside = text(at(&path, &["rev-parse", "--is-inside-work-tree"]).await?)? == "true";
+    let bare = fact()? == "true";
+    let inside = fact()? == "true";
     let directory = if inside {
         Some(
             std::fs::canonicalize(PathBuf::from(text(
