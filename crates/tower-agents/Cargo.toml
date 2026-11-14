@@ -23,6 +23,7 @@ tokio.workspace = true
 rusqlite.workspace = true
 futures-util = "0.3"
 tokio-tungstenite = "0.28"
+getrandom.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

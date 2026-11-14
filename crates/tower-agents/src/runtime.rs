@@ -2,6 +2,9 @@ use crate::Harness;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+mod contract;
+pub use contract::*;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NativeSession {
     pub id: String,

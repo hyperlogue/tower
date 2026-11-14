@@ -1,13 +1,11 @@
-use crate::{
-    launcher::{Report, now},
-    session::*,
-};
+use crate::{launcher::now, session::*};
 use std::{io, path::Path, sync::Arc, time::Duration};
 use subtle::ConstantTimeEq;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::{Semaphore, mpsc},
 };
+use tower_agents::runtime::Report;
 use tower_agents::{
     environment::project_environment,
     events::{self, AgentEvent},
@@ -145,7 +143,7 @@ async fn configure(
         state.private.insert("queue_supported".into(), queue.into());
     }
     // The shim reaches the pool's clipboard; a plain terminal has its own.
-    if daemon && super::clipboard_mode(plan.spec.harness).is_some() {
+    if daemon && tower_agents::runtime::clipboard_paste(plan.spec.harness).is_some() {
         tower_clipboard::shim::install(
             Path::new(&plan.state_dir),
             &exe,
@@ -325,7 +323,7 @@ async fn serve(
                         let _=ack.send(Err(tower_protocol::RpcError::application("delivery_failed","Target session is unavailable"))); continue;
                     }
                     if report.pty_only {
-                        if !daemon || !super::injection::allowed(paths,plan.spec.harness){let _=ack.send(Err(tower_protocol::RpcError::application("unsupported","PTY injection is disabled")));continue;}
+                        if !daemon || !tower_agents::runtime::injection_allowed(paths,plan.spec.harness){let _=ack.send(Err(tower_protocol::RpcError::application("unsupported","PTY injection is disabled")));continue;}
                         match super::injection::proof(state) {
                             Ok(proof)=>{let paths=paths.clone();let name=plan.id.clone();tokio::spawn(async move{let _=ack.send(super::injection::send(paths,name,proof,text).await.map(Some));});}
                             Err(e)=>{let _=ack.send(Err(e));}
@@ -449,7 +447,7 @@ fn drain_observations(observed: &mut mpsc::Receiver<AgentEvent>, state: &mut Run
 fn continue_turn(paths: &tower_pal::Paths, plan: &LauncherPlan, state: &mut RuntimeState) {
     if !plan.continue_turn
         || state.private.contains_key("continued")
-        || !super::injection::allowed(paths, plan.spec.harness)
+        || !tower_agents::runtime::injection_allowed(paths, plan.spec.harness)
     {
         return;
     }

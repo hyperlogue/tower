@@ -7,6 +7,7 @@ use std::{
     io,
     path::{Path, PathBuf},
 };
+use tower_agents::runtime as contract;
 use tower_agents::{
     Harness,
     inventory::Candidate,
@@ -94,7 +95,7 @@ impl Local {
                 "session is already running",
             ));
         }
-        let plan = launcher::plan(&self.paths, id, spec, Some(self.embedding.clone()))?;
+        let plan = contract::plan(&self.paths, id, spec, Some(self.embedding.clone()))?;
         tower_pal::private_dir(&self.paths.tokens)?;
         tower_pal::write_private(&token_path, random(32)?.as_bytes())?;
         let path = Path::new(&plan.state_dir).join("plan.json");
@@ -130,7 +131,7 @@ impl Local {
             self.embedding.codex_endpoint.as_deref(),
         )
         .map_err(io::Error::other)?;
-        crate::codex_block(crate::codex_thread(&self.paths, config, native_id))
+        contract::codex_block(contract::codex_thread(&self.paths, config, native_id))
             .map_err(|error| io::Error::other(error.message))
     }
 
@@ -167,7 +168,7 @@ impl Local {
             .filter(|s| s.plan.id == id)
             .max_by_key(|s| s.state.updated_at)
             .ok_or_else(|| unavailable("session is not recorded"))?;
-        let mut spec = launcher::continued(last.plan.spec, last.state).map_err(unavailable)?;
+        let mut spec = contract::continued(last.plan.spec, last.state).map_err(unavailable)?;
         spec.args = tower_agents::config::resume_options(spec.harness, &spec.args)?;
         spec.fork = false;
         self.prepare(id, spec)
@@ -183,7 +184,7 @@ impl Local {
             for generation in entries(&id)? {
                 let (Ok(plan), Ok(state)) = (
                     tower_pal::read_private(&generation.join("plan.json")),
-                    launcher::read_state(&generation.join("state.json")),
+                    contract::read_state(&generation.join("state.json")),
                 ) else {
                     continue;
                 };
@@ -194,7 +195,7 @@ impl Local {
                     continue;
                 }
                 let live =
-                    state.exit_code.is_none() && crate::launcher_alive(&state).unwrap_or(false);
+                    state.exit_code.is_none() && contract::launcher_alive(&state).unwrap_or(false);
                 found.push(Session { plan, state, live });
             }
         }
@@ -351,7 +352,7 @@ impl Local {
             .into_iter()
             .find(|s| s.plan.id == id && s.live)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "session is not running"))?;
-        launcher::stop(&session.plan, &token)
+        contract::stop(&session.plan, &token)
     }
 
     /// Removes the records of a session that is no longer running.

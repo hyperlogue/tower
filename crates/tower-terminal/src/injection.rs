@@ -1,28 +1,10 @@
 use std::time::Duration;
-use tower_agents::{Harness, runtime::RuntimeState};
+use tower_agents::runtime::RuntimeState;
 use tower_pool_proto::{InputProof, Reply, Request};
 use tower_protocol::{DeliveryReceipt, RpcError, Value};
 
 fn error(code: &str, message: &str) -> RpcError {
     RpcError::application(code, message)
-}
-pub fn allowed(paths: &tower_pal::Paths, harness: Harness) -> bool {
-    if harness == Harness::Codex {
-        return false;
-    }
-    let Ok(config) = tower_pal::read_config(&paths.config_home.join("tower/config.toml")) else {
-        return false;
-    };
-    let config: toml::Table = match config.map(|s| s.parse()).transpose() {
-        Ok(c) => c.unwrap_or_default(),
-        Err(_) => return false,
-    };
-    config
-        .get("inject")
-        .and_then(|v| v.get(harness.id()))
-        .and_then(|v| v.get("pty"))
-        .map(|v| v.as_bool().unwrap_or(false))
-        .unwrap_or(harness == Harness::ClaudeCode)
 }
 async fn connect(paths: &tower_pal::Paths) -> tower_sessions::Result<tower_pal::IpcStream> {
     let mut stream = tower_pal::connect(&paths.pool_socket())

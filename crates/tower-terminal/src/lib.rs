@@ -8,6 +8,7 @@ mod pool;
 mod session;
 pub use client::{attach, attach_with_terminal};
 use serde::{Serialize, de::DeserializeOwned};
+use tower_agents::runtime as contract;
 use tower_pal::Paths;
 use tower_pool_proto::{Launch, Reply, Request, Session};
 use tower_protocol::{
@@ -124,7 +125,7 @@ impl TerminalBackend {
         {
             return Ok(found.clone());
         }
-        let found = codex_block(async {
+        let found = contract::codex_block(async {
             let host = tower_agents::codex_host::ensure(&self.paths).await?;
             let mut client =
                 tower_agents::codex_service::Client::connect(&host.config.endpoint).await?;
@@ -141,7 +142,7 @@ impl TerminalBackend {
                     return Err(tower_agents::codex_service::Error::Limit);
                 }
                 for row in rows {
-                    if let Some(candidate) = codex_candidate(row, &host.config.endpoint) {
+                    if let Some(candidate) = contract::codex_candidate(row, &host.config.endpoint) {
                         if !ids.insert(candidate.native.id.clone()) {
                             return Err(tower_agents::codex_service::Error::Protocol);
                         }
@@ -174,9 +175,9 @@ impl TerminalBackend {
         if !tower_agents::events::native_id(id) {
             return Err(error("invalid_params", "Invalid native session identity"));
         }
-        codex_block(async {
+        contract::codex_block(async {
             let config = tower_agents::codex_service::Config::load(&self.paths)?;
-            codex_thread(&self.paths, config, id).await
+            contract::codex_thread(&self.paths, config, id).await
         })
     }
     fn codex_mode(&self, request: &SessionOpenParams) -> Result<String> {
@@ -201,77 +202,6 @@ impl TerminalBackend {
         })?;
         Ok("app-server".into())
     }
-}
-/// Reads the conversation `id` from the Codex app-server at `config`.
-async fn codex_thread(
-    paths: &tower_pal::Paths,
-    config: tower_agents::codex_service::Config,
-    id: &str,
-) -> tower_agents::codex_service::Result<tower_agents::inventory::Candidate> {
-    let host = tower_agents::codex_host::ensure_configured(paths, config).await?;
-    let mut client = tower_agents::codex_service::Client::connect(&host.config.endpoint).await?;
-    let response = client
-        .request(
-            "thread/read",
-            serde_json::json!({"threadId":id,"includeTurns":false}),
-        )
-        .await?;
-    codex_candidate(&response["thread"], &host.config.endpoint)
-        .filter(|candidate| candidate.native.id == id)
-        .ok_or(tower_agents::codex_service::Error::Protocol)
-}
-fn codex_block<T>(
-    operation: impl std::future::Future<Output = tower_agents::codex_service::Result<T>>,
-) -> Result<T> {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|_| error("backend_unavailable", "Cannot start Codex inventory reader"))?
-        .block_on(async {
-            tokio::time::timeout(std::time::Duration::from_secs(20), operation)
-                .await
-                .map_err(|_| error("conversation_unavailable", "Host Codex inventory timed out"))?
-                .map_err(|_| {
-                    error(
-                        "conversation_unavailable",
-                        "Host Codex inventory is unavailable",
-                    )
-                })
-        })
-}
-fn codex_candidate(
-    row: &serde_json::Value,
-    endpoint: &std::path::Path,
-) -> Option<tower_agents::inventory::Candidate> {
-    if row["ephemeral"] == true
-        || !row["parentThreadId"].is_null()
-        || row["threadSource"]
-            .as_str()
-            .is_some_and(|source| source != "user")
-    {
-        return None;
-    }
-    let id = row["id"]
-        .as_str()
-        .filter(|id| tower_agents::events::native_id(id))?;
-    let cwd = row["cwd"]
-        .as_str()
-        .filter(|cwd| cwd.len() <= 4096 && std::path::Path::new(cwd).is_absolute())?;
-    let updated_at = row["updatedAt"].as_u64()?.saturating_mul(1000);
-    Some(tower_agents::inventory::Candidate {
-        harness: tower_agents::Harness::Codex,
-        native: tower_agents::runtime::NativeSession {
-            id: id.into(),
-            resume_ref: None,
-        },
-        cwd: cwd.into(),
-        title: row["name"]
-            .as_str()
-            .filter(|name| !name.is_empty())
-            .map(|name| name.chars().take(200).collect()),
-        updated_at,
-        namespace: Some(format!("codex-endpoint:{}", endpoint.display())),
-    })
 }
 
 fn error(code: &str, message: &str) -> RpcError {
@@ -341,7 +271,7 @@ fn binding(session: &ManagedSession) -> Result<Binding> {
     decode(&session.binding)
 }
 fn codex_cleanup_confirmed(plan: &tower_agents::runtime::LauncherPlan) -> bool {
-    launcher::read_state(&std::path::Path::new(&plan.state_dir).join("state.json")).is_ok_and(
+    contract::read_state(&std::path::Path::new(&plan.state_dir).join("state.json")).is_ok_and(
         |state| {
             state.id == plan.id
                 && state.generation == plan.generation
@@ -351,37 +281,6 @@ fn codex_cleanup_confirmed(plan: &tower_agents::runtime::LauncherPlan) -> bool {
     )
 }
 
-fn launcher_alive(state: &tower_agents::runtime::RuntimeState) -> Result<bool> {
-    if state.boot_id
-        != tower_pal::boot_id()
-            .map_err(|_| error("backend_unavailable", "Cannot verify boot identity"))?
-    {
-        return Ok(false);
-    }
-    for (pid, start) in [
-        (Some(state.launcher_pid), Some(state.launcher_start_time)),
-        (state.agent_pid, state.agent_start_time),
-    ] {
-        if let (Some(pid), Some(start)) = (pid, start) {
-            match tower_pal::process_identity(pid) {
-                Ok(p) if p.start_time == start => return Ok(true),
-                Err(e)
-                    if !matches!(
-                        e.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
-                    ) =>
-                {
-                    return Err(error(
-                        "backend_unavailable",
-                        "Cannot verify previous process exit",
-                    ));
-                }
-                _ => {}
-            }
-        }
-    }
-    Ok(false)
-}
 impl TerminalBackend {
     fn state(&self, session: &ManagedSession, record: Option<&Session>) -> Result<Observation> {
         let name = name(session)?;
@@ -391,7 +290,7 @@ impl TerminalBackend {
         }
 
         if let Ok(binding) = binding(session)
-            && let Ok(mut state) = launcher::read_state(
+            && let Ok(mut state) = contract::read_state(
                 &std::path::Path::new(&binding.plan.state_dir).join("state.json"),
             )
             && state.id == session.id
@@ -408,7 +307,7 @@ impl TerminalBackend {
                 terminal.running = live && state.exit_code.is_none();
                 let gone = record.is_none()
                     && state.exit_code.is_some()
-                    && !launcher_alive(&state)?
+                    && !contract::launcher_alive(&state)?
                     && tower_pal::protocol_group_terminated(tower_pal::ProcessIdentity {
                         pid: state.launcher_pid,
                         start_time: state.launcher_start_time,
@@ -438,7 +337,7 @@ impl TerminalBackend {
                     }
                 }
                 if record.is_none() {
-                    if launcher_alive(&state)? {
+                    if contract::launcher_alive(&state)? {
                         result.status = "unknown".into();
                         result.recovery_pending = true;
                     } else if tower_agents::config::resume_options(
@@ -501,7 +400,7 @@ impl TerminalBackend {
                     if caps.message == "none"
                         && state.private.get("pty_supported")
                             == Some(&serde_json::Value::Bool(true))
-                        && injection::allowed(&self.paths, state.harness)
+                        && contract::injection_allowed(&self.paths, state.harness)
                     {
                         caps.message = "pty".into();
                         caps.message_reason = None;
@@ -585,13 +484,11 @@ fn scrollback(paths: &tower_pal::Paths) -> Option<tower_pool_proto::Scrollback> 
     })
 }
 fn clipboard_mode(harness: tower_agents::Harness) -> Option<tower_pool_proto::ClipboardMode> {
-    match harness {
-        tower_agents::Harness::Codex => Some(tower_pool_proto::ClipboardMode::FileUrl),
-        tower_agents::Harness::ClaudeCode if tower_pal::operating_system() == "linux" => {
-            Some(tower_pool_proto::ClipboardMode::NativeKey)
-        }
-        _ => None,
-    }
+    use tower_agents::runtime::ClipboardPaste;
+    tower_agents::runtime::clipboard_paste(harness).map(|paste| match paste {
+        ClipboardPaste::FileUrl => tower_pool_proto::ClipboardMode::FileUrl,
+        ClipboardPaste::NativeKey => tower_pool_proto::ClipboardMode::NativeKey,
+    })
 }
 fn pool_unavailable(e: std::io::Error) -> RpcError {
     if pool::outdated(&e) {
@@ -616,12 +513,12 @@ impl TerminalBackend {
         {
             return Ok(None);
         }
-        match launcher::read_state(&std::path::Path::new(&old.plan.state_dir).join("state.json")) {
+        match contract::read_state(&std::path::Path::new(&old.plan.state_dir).join("state.json")) {
             Ok(state) => {
                 if state.id != session.id || state.generation != old.plan.generation {
                     return Err(error("backend_error", "Session state identity mismatch"));
                 }
-                if launcher_alive(&state)?
+                if contract::launcher_alive(&state)?
                     || state.exit_code.is_some()
                     || state.stop_requested
                     || state.native.is_none()
@@ -680,7 +577,7 @@ impl ManagedBackend for TerminalBackend {
     ) -> Result<tower_protocol::DeliveryReceipt> {
         let binding = binding(session)?;
         let state =
-            launcher::read_state(&std::path::Path::new(&binding.plan.state_dir).join("state.json"))
+            contract::read_state(&std::path::Path::new(&binding.plan.state_dir).join("state.json"))
                 .map_err(|_| error("delivery_failed", "Session state is unavailable"))?;
         if state.generation != binding.plan.generation
             || state.id != session.id
@@ -701,14 +598,14 @@ impl ManagedBackend for TerminalBackend {
         .map_err(|_| error("internal_error", "Session credential is unavailable"))?;
         let token = String::from_utf8(token)
             .map_err(|_| error("internal_error", "Invalid session credential"))?;
-        match launcher::send_message(&binding.plan, &token, text, false) {
+        match contract::send_message(&binding.plan, &token, text, false) {
             Err(e)
                 if matches!(e.data.code.as_str(), "channel_unavailable" | "unsupported")
-                    && injection::allowed(&self.paths, binding.plan.spec.harness)
+                    && contract::injection_allowed(&self.paths, binding.plan.spec.harness)
                     && state.private.get("pty_supported")
                         == Some(&serde_json::Value::Bool(true)) =>
             {
-                launcher::send_message(&binding.plan, &token, text, true)
+                contract::send_message(&binding.plan, &token, text, true)
             }
             Err(mut e) if e.data.code == "channel_unavailable" => {
                 e.data.code = "delivery_failed".into();
@@ -808,11 +705,11 @@ impl ManagedBackend for TerminalBackend {
     }
     fn cleanup(&self, session: &ManagedSession) -> Result<()> {
         if let Ok(binding) = binding(session)
-            && let Ok(state) = launcher::read_state(
+            && let Ok(state) = contract::read_state(
                 &std::path::Path::new(&binding.plan.state_dir).join("state.json"),
             )
         {
-            if launcher_alive(&state)? {
+            if contract::launcher_alive(&state)? {
                 return Err(error(
                     "session_running",
                     "Cannot remove a live session's resources",
@@ -940,7 +837,7 @@ impl ManagedBackend for TerminalBackend {
         tower_agents::config::validate(&spec)
             .map_err(|e| error("invalid_params", &e.to_string()))?;
         pool::ensure(&self.paths).map_err(pool_unavailable)?;
-        let plan = launcher::plan(&self.paths, id, spec.clone(), None)
+        let plan = contract::plan(&self.paths, id, spec.clone(), None)
             .map_err(|_| error("internal_error", "Cannot create session directory"))?;
         let binding = Binding {
             name: id.into(),
@@ -1111,7 +1008,7 @@ impl ManagedBackend for TerminalBackend {
                 .ok()
                 .and_then(|path| tower_pal::read_private(&path).ok())
                 .and_then(|token| String::from_utf8(token).ok())
-                .is_some_and(|token| launcher::stop(&binding.plan, &token).is_ok());
+                .is_some_and(|token| contract::stop(&binding.plan, &token).is_ok());
             if codex && !stopped && !codex_cleanup_confirmed(&binding.plan) {
                 return Err(error(
                     "stop_unconfirmed",
@@ -1152,7 +1049,7 @@ impl ManagedBackend for TerminalBackend {
         terminal.defer = false;
         let old = binding(session)?;
         let mut spec = old.plan.spec;
-        match launcher::read_state(&std::path::Path::new(&old.plan.state_dir).join("state.json")) {
+        match contract::read_state(&std::path::Path::new(&old.plan.state_dir).join("state.json")) {
             Ok(state) => {
                 if state.generation != old.plan.generation || state.id != session.id {
                     return Err(error(
@@ -1160,7 +1057,7 @@ impl ManagedBackend for TerminalBackend {
                         "Session state belongs to another incarnation",
                     ));
                 }
-                spec = launcher::continued(spec, state)
+                spec = contract::continued(spec, state)
                     .map_err(|reason| error("resume_unavailable", reason))?;
             }
             Err(e)
