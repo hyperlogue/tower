@@ -254,16 +254,27 @@ pub fn wait_readable(fd: impl std::os::fd::AsFd, timeout: Duration) -> io::Resul
 }
 pub async fn connect(path: &Path) -> io::Result<IpcStream> {
     let stream = UnixStream::connect(path).await?;
-    match peer(&stream) {
-        Ok(peer) if peer.uid == uid() => Ok(stream),
-        Ok(_) => Err(denied("tower socket peer belongs to another user")),
-        // macOS forgets the peer identity once that side has closed. The
-        // connection is gone; callers already retry a reset handshake.
-        Err(error) if error.kind() == io::ErrorKind::NotConnected => Err(io::Error::new(
-            io::ErrorKind::ConnectionReset,
-            "socket peer disconnected before its identity could be checked",
-        )),
-        Err(error) => Err(error),
+    // macOS can return ENOTCONN for a moment after a unix connect even though
+    // the peer is this user. One failure used to discard a live daemon socket.
+    let mut attempts = 0;
+    loop {
+        match peer(&stream) {
+            Ok(peer) if peer.uid == uid() => return Ok(stream),
+            Ok(_) => return Err(denied("tower socket peer belongs to another user")),
+            Err(error) if error.kind() == io::ErrorKind::NotConnected && attempts < 20 => {
+                attempts += 1;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            // Still disconnected after the grace period. Callers already retry
+            // a reset handshake.
+            Err(error) if error.kind() == io::ErrorKind::NotConnected => {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "socket peer disconnected before its identity could be checked",
+                ));
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 /// Call while holding the owning service's singleton lock.

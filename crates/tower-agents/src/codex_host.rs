@@ -126,7 +126,10 @@ async fn start_daemon(paths: &Paths) -> Result<()> {
             .current_dir(&paths.home)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            // The daemon's own errors are the only explanation when its socket
+            // never accepts connections. They belong on this process's stderr,
+            // which is the session terminal.
+            .stderr(std::process::Stdio::inherit())
             .kill_on_drop(true)
             .status(),
     )

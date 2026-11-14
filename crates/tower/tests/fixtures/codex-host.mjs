@@ -447,7 +447,14 @@ export async function serve(endpoint) {
       await new Promise(resolve => setTimeout(resolve, 10));
     }
   }
-  const inode = fs.statSync(endpoint);
+  let inode;
+  for (let attempt = 0; ; attempt++) {
+    try { inode = fs.statSync(endpoint); break; }
+    catch (error) {
+      if (error.code !== 'ENOENT' || attempt === 50) throw error;
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+  }
   let phase;
   const timer = setInterval(() => {
     let next;
@@ -602,15 +609,22 @@ async function daemon(command) {
   if (command === 'start') {
     fs.mkdirSync(root, {recursive: true, mode: 0o700});
     if (!await reachable(socket)) {
-      const child = spawn(process.execPath, [fileURLToPath(import.meta.url), 'app-server', '--listen', `unix://${socket}`], {detached: true, stdio: 'ignore'});
-      fs.writeFileSync(pidFile, String(child.pid));
-      child.unref();
+      let childError = '';
+      const child = spawn(process.execPath, [fileURLToPath(import.meta.url), 'app-server', '--listen', `unix://${socket}`], {detached: true, stdio: ['ignore', 'ignore', 'pipe']});
+      child.on('error', error => { childError = (childError + error.message).slice(-800); });
+      child.stderr?.setEncoding('utf8');
+      child.stderr?.on('data', chunk => { childError = (childError + chunk).slice(-800); });
+      fs.writeFileSync(pidFile, String(child.pid ?? ''));
       let up = false;
-      for (let tries = 0; tries < 400 && !up; tries++) {
+      for (let tries = 0; tries < 40 && !up; tries++) {
+        if (child.exitCode !== null) break;
         up = await reachable(socket);
-        if (!up) await new Promise(resolve => setTimeout(resolve, 25));
+        if (!up) await new Promise(resolve => setTimeout(resolve, 50));
       }
-      if (!up) throw new Error('fixture app-server socket did not accept connections');
+      // The stderr pipe would keep this process alive after the server is up.
+      child.stderr?.destroy();
+      child.unref();
+      if (!up) throw new Error(`fixture app-server socket did not accept connections${childError ? `: ${childError.trim()}` : ''}`);
     }
     process.stdout.write(`${JSON.stringify({status: 'started', socketPath: socket})}\n`);
   } else if (command === 'stop') {
