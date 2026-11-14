@@ -53,7 +53,7 @@ fn save(tx: &Transaction<'_>, c: &StoredCheckout) -> Result<()> {
 }
 fn detach_catalog(tx: &Transaction<'_>, valid: Option<&BTreeSet<&str>>) -> Result<()> {
     let rows = tx
-        .prepare("SELECT identity,binding,record,association_manual FROM checkouts")?
+        .prepare_cached("SELECT identity,binding,record,association_manual FROM checkouts")?
         .query_map([], checkout_row)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     for row in rows {
@@ -293,7 +293,7 @@ impl Store {
     pub fn checkouts(&self, filter: &CheckoutFilter) -> Result<Vec<StoredCheckout>> {
         let conn = self.lock()?;
         let rows = conn
-            .prepare(
+            .prepare_cached(
                 "SELECT identity,binding,record,association_manual FROM checkouts ORDER BY id",
             )?
             .query_map([], checkout_row)?
@@ -424,7 +424,7 @@ impl Store {
             return Ok(None);
         }
         let records = conn
-            .prepare("SELECT record FROM checkouts ORDER BY id")?
+            .prepare_cached("SELECT record FROM checkouts ORDER BY id")?
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?
             .into_iter()
@@ -527,7 +527,7 @@ impl Store {
     fn vcs_operations(&self, query: &str) -> Result<Vec<StoredVcsOperation>> {
         let conn = self.lock()?;
         let rows = conn
-            .prepare(query)?
+            .prepare_cached(query)?
             .query_map([], operation_row)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         rows.into_iter().map(decode_operation).collect()

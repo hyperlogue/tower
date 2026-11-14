@@ -420,8 +420,12 @@ impl Vcs {
         // arrive in between are answered by one refresh at its end.
         let mut refreshed: BTreeMap<String, tokio::time::Instant> = BTreeMap::new();
         let mut hinted: BTreeMap<String, tokio::time::Instant> = BTreeMap::new();
+        // The watch and session sets only change with a commit.
+        let mut stale = true;
         loop {
-            if let Ok(checkouts) = self.store.checkouts(&CheckoutFilter::default()) {
+            if std::mem::take(&mut stale)
+                && let Ok(checkouts) = self.store.checkouts(&CheckoutFilter::default())
+            {
                 let ids: BTreeSet<_> = checkouts.iter().map(|c| c.record.id.clone()).collect();
                 watched.retain(|id, task| {
                     let keep = ids.contains(id);
@@ -440,11 +444,13 @@ impl Vcs {
                         watched.insert(c.record.id, task);
                     }
                 }
-            }
-            if let Ok(sessions) = self.store.agents(&AgentFilter {
-                ownership: Some("owned".into()),
-                ..Default::default()
-            }) {
+                let sessions = self
+                    .store
+                    .agents(&AgentFilter {
+                        ownership: Some("owned".into()),
+                        ..Default::default()
+                    })
+                    .unwrap_or_default();
                 for session in sessions {
                     if session.checkout_id.is_none()
                         && attempted.insert((session.id.clone(), session.cwd.clone()))
@@ -460,7 +466,7 @@ impl Vcs {
             }
             let next_hint = hinted.values().min().copied();
             tokio::select! {
-                _ = changes.changed() => {}
+                _ = changes.changed() => stale = true,
                 event = events.recv() => match event {
                     Ok(event) if event.method.starts_with("agent.") => {
                         if let Ok(agent) = self.store.agent(&event.params.id)

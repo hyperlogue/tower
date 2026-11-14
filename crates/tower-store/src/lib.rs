@@ -52,6 +52,14 @@ pub struct StoredAgent {
     pub recovery_pending: bool,
 }
 #[derive(Clone, Debug)]
+pub struct Liveness {
+    pub id: String,
+    pub registered: bool,
+    pub pid: Option<u32>,
+    pub pid_start_time: Option<u64>,
+    pub last_seen: u64,
+}
+#[derive(Clone, Debug)]
 pub struct Registration {
     pub agent: StoredAgent,
     pub created: bool,
@@ -233,6 +241,14 @@ fn disable_delivery(caps: &mut tower_protocol::Capabilities, reason: &str) {
     caps.reply_path = false;
     caps.steer = false;
 }
+/// Selects sessions whose end is confirmed and final.
+const ENDED: &str = "ended_at IS NOT NULL AND recovery_pending=0 AND json_extract(public_json,'$.status') IN ('exited','lost')";
+/// How long an ended session is kept, with the owned retention as `?2`.
+const RETENTION: &str = "CASE WHEN json_extract(public_json,'$.ownership')='owned' THEN ?2 WHEN json_extract(public_json,'$.status')='lost' THEN 600000 ELSE 60000 END";
+/// Clamped so that adding two of them stays within SQLite's integers.
+fn millis(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX).min(i64::MAX / 4)
+}
 fn next_revision(tx: &Transaction<'_>) -> Result<u64> {
     let n: i64 = tx.query_row(
         "UPDATE counters SET value=value+1 WHERE name='registry' RETURNING value",
@@ -267,36 +283,37 @@ fn registration_target(conn: &Connection, candidate: &AgentRecord) -> Result<Opt
     } else {
         None
     };
-    let process: Option<String> =
-        if let (Some(pid), Some(start)) = (candidate.pid, candidate.pid_start_time) {
-            let mut query =
-                conn.prepare("SELECT id FROM agents WHERE pid=?1 AND pid_start=?2 ORDER BY id")?;
-            let ids = query
-                .query_map(params![pid, start.to_string()], |r| r.get::<_, String>(0))?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            let mut matches = Vec::new();
-            for id in ids {
-                let record = stored_agent(conn, &id)?.record;
-                if candidate.shared_process
-                    && record.shared_process
-                    && candidate.harness == record.harness
-                    && candidate.native_session_id.is_some()
-                    && record.native_session_id.is_some()
-                    && candidate.native_session_id != record.native_session_id
-                {
-                    continue;
-                }
-                matches.push(id);
+    let process: Option<String> = if let (Some(pid), Some(start)) =
+        (candidate.pid, candidate.pid_start_time)
+    {
+        let mut query =
+            conn.prepare_cached("SELECT id FROM agents WHERE pid=?1 AND pid_start=?2 ORDER BY id")?;
+        let ids = query
+            .query_map(params![pid, start.to_string()], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut matches = Vec::new();
+        for id in ids {
+            let record = stored_agent(conn, &id)?.record;
+            if candidate.shared_process
+                && record.shared_process
+                && candidate.harness == record.harness
+                && candidate.native_session_id.is_some()
+                && record.native_session_id.is_some()
+                && candidate.native_session_id != record.native_session_id
+            {
+                continue;
             }
-            if matches.len() > 1 {
-                return Err(Error::Conflict(
-                    "process hosts multiple sessions; provide a native session identity",
-                ));
-            }
-            matches.pop()
-        } else {
-            None
-        };
+            matches.push(id);
+        }
+        if matches.len() > 1 {
+            return Err(Error::Conflict(
+                "process hosts multiple sessions; provide a native session identity",
+            ));
+        }
+        matches.pop()
+    } else {
+        None
+    };
     if native.is_some() && process.is_some() && native != process {
         return Err(Error::Conflict(
             "native and process identities identify different sessions",
@@ -328,7 +345,7 @@ fn save_record(tx: &Transaction<'_>, record: &AgentRecord) -> Result<()> {
     Ok(())
 }
 fn all_records(conn: &Connection) -> Result<Vec<AgentRecord>> {
-    let mut q = conn.prepare("SELECT public_json FROM agents ORDER BY id")?;
+    let mut q = conn.prepare_cached("SELECT public_json FROM agents ORDER BY id")?;
     let data = q
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -338,7 +355,7 @@ fn all_records(conn: &Connection) -> Result<Vec<AgentRecord>> {
 }
 fn read_rules(conn: &Connection, table: &str) -> Result<Vec<Rule>> {
     // table names originate only from static call sites, never request input.
-    let mut q = conn.prepare(&format!("SELECT data FROM {table} ORDER BY position"))?;
+    let mut q = conn.prepare_cached(&format!("SELECT data FROM {table} ORDER BY position"))?;
     let data = q
         .query_map([], |r| r.get::<_, String>(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -476,7 +493,7 @@ impl Store {
     }
     pub fn managed_sessions(&self) -> Result<Vec<ManagedSession>> {
         let conn = self.lock()?;
-        let mut query = conn.prepare("SELECT m.id,m.protocol,m.binding,m.launch,m.auto_resume FROM managed_sessions m JOIN agents a ON a.id=m.id WHERE a.ended_at IS NULL")?;
+        let mut query = conn.prepare_cached("SELECT m.id,m.protocol,m.binding,m.launch,m.auto_resume FROM managed_sessions m JOIN agents a ON a.id=m.id WHERE a.ended_at IS NULL")?;
         let rows = query.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -832,27 +849,61 @@ impl Store {
         stored_agent(&conn, &id)
     }
     pub fn agents(&self, filter: &AgentFilter) -> Result<Vec<AgentRecord>> {
-        Ok(all_records(&*self.lock()?)?
-            .into_iter()
-            .filter(|r| {
-                (filter.include_exited
-                    || filter.status.is_some()
-                    || !matches!(r.status.as_str(), "exited" | "lost"))
-                    && filter.harness.as_ref().is_none_or(|v| v == &r.harness)
-                    && filter.status.as_ref().is_none_or(|v| v == &r.status)
-                    && filter.ownership.as_ref().is_none_or(|v| v == &r.ownership)
-                    && filter
-                        .protocol
-                        .as_ref()
-                        .is_none_or(|v| r.protocol.as_ref() == Some(v))
-                    && filter.cwd_prefix.as_ref().is_none_or(|p| {
-                        r.cwd == *p
-                            || r.cwd
-                                .strip_prefix(p)
-                                .is_some_and(|tail| p.ends_with('/') || tail.starts_with('/'))
-                    })
-            })
-            .collect())
+        let conn = self.lock()?;
+        let mut query = conn.prepare_cached(
+            "SELECT public_json FROM agents WHERE \
+             (?1 OR json_extract(public_json,'$.status') NOT IN ('exited','lost')) \
+             AND (?2 IS NULL OR json_extract(public_json,'$.harness')=?2) \
+             AND (?3 IS NULL OR json_extract(public_json,'$.status')=?3) \
+             AND (?4 IS NULL OR json_extract(public_json,'$.ownership')=?4) \
+             AND (?5 IS NULL OR json_extract(public_json,'$.protocol')=?5) ORDER BY id",
+        )?;
+        let data = query
+            .query_map(
+                params![
+                    filter.include_exited || filter.status.is_some(),
+                    filter.harness,
+                    filter.status,
+                    filter.ownership,
+                    filter.protocol
+                ],
+                |r| r.get::<_, String>(0),
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut records = Vec::with_capacity(data.len());
+        for row in &data {
+            let r: AgentRecord = serde_json::from_str(row)?;
+            if filter.cwd_prefix.as_ref().is_none_or(|p| {
+                r.cwd == *p
+                    || r.cwd
+                        .strip_prefix(p)
+                        .is_some_and(|tail| p.ends_with('/') || tail.starts_with('/'))
+            }) {
+                records.push(r);
+            }
+        }
+        Ok(records)
+    }
+    /// What maintenance needs to judge whether each unended session is still alive.
+    pub fn liveness(&self) -> Result<Vec<Liveness>> {
+        let conn = self.lock()?;
+        let mut query = conn.prepare_cached(
+            "SELECT id,json_extract(public_json,'$.ownership'),json_extract(public_json,'$.pid'),\
+             json_extract(public_json,'$.pid_start_time'),json_extract(public_json,'$.last_seen') \
+             FROM agents WHERE json_extract(public_json,'$.status') NOT IN ('exited','lost') ORDER BY id",
+        )?;
+        let rows = query
+            .query_map([], |r| {
+                Ok(Liveness {
+                    id: r.get(0)?,
+                    registered: r.get::<_, String>(1)? == "registered",
+                    pid: r.get(2)?,
+                    pid_start_time: r.get::<_, Option<i64>>(3)?.map(|v| v as u64),
+                    last_seen: r.get::<_, i64>(4)? as u64,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
     fn apply_update(
         &self,
@@ -1085,25 +1136,16 @@ impl Store {
     pub fn expire(&self, now: u64, owned_retention_ms: u64) -> Result<Vec<String>> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
-        let mut removed = Vec::new();
-        for r in all_records(&tx)? {
-            let a = stored_agent(&tx, &r.id)?;
-            let Some(ended) = a.ended_at else { continue };
-            if a.recovery_pending || !matches!(r.status.as_str(), "exited" | "lost") {
-                continue;
-            }
-            let retention = if r.ownership == "owned" {
-                owned_retention_ms
-            } else if r.status == "lost" {
-                600_000
-            } else {
-                60_000
-            };
-            if now.saturating_sub(ended) >= retention {
-                tx.execute("DELETE FROM agents WHERE id=?1", [&r.id])?;
-                removed.push(r.id);
-            }
-        }
+        let removed = {
+            let mut query = tx.prepare_cached(&format!(
+                "DELETE FROM agents WHERE {ENDED} AND ?1-ended_at>={RETENTION} RETURNING id"
+            ))?;
+            query
+                .query_map(params![millis(now), millis(owned_retention_ms)], |r| {
+                    r.get::<_, String>(0)
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
         tx.commit()?;
         Ok(removed)
     }
@@ -1113,29 +1155,19 @@ impl Store {
         let conn = self.lock()?;
         let mut next: Option<u64> = None;
         let mut consider = |at: u64| next = Some(next.map_or(at, |n| n.min(at)));
-        for r in all_records(&conn)? {
-            let a = stored_agent(&conn, &r.id)?;
-            match a.ended_at {
-                Some(ended) if !a.recovery_pending => {
-                    if matches!(r.status.as_str(), "exited" | "lost") {
-                        consider(ended.saturating_add(if r.ownership == "owned" {
-                            owned_retention_ms
-                        } else if r.status == "lost" {
-                            600_000
-                        } else {
-                            60_000
-                        }));
-                    }
-                }
-                Some(_) => {}
-                None => {
-                    if r.ownership == "registered"
-                        && (r.pid.is_none() || r.pid_start_time.is_none())
-                    {
-                        consider(r.last_seen.saturating_add(180_000));
-                    }
-                }
-            }
+        let ended: Option<i64> = conn.query_row(
+            &format!("SELECT MIN(ended_at+{RETENTION}) FROM agents WHERE {ENDED}"),
+            params![0, millis(owned_retention_ms)],
+            |r| r.get(0),
+        )?;
+        // A registration without a process to watch is lost once unseen.
+        let unseen: Option<i64> = conn.query_row(
+            "SELECT MIN(json_extract(public_json,'$.last_seen')+180000) FROM agents WHERE ended_at IS NULL AND (json_extract(public_json,'$.pid') IS NULL OR json_extract(public_json,'$.pid_start_time') IS NULL) AND json_extract(public_json,'$.ownership')='registered'",
+            [],
+            |r| r.get(0),
+        )?;
+        for at in [ended, unseen].into_iter().flatten() {
+            consider(u64::try_from(at).unwrap_or(0));
         }
         let min = |sql: &str| -> Result<Option<u64>> {
             Ok(conn
@@ -1162,7 +1194,7 @@ impl Store {
         let cutoff = now.saturating_sub(retention_ms);
         let ids = {
             let conn = self.lock()?;
-            let mut query=conn.prepare("SELECT a.id FROM agents a JOIN managed_sessions m ON a.id=m.id WHERE a.ended_at IS NOT NULL AND a.ended_at<=?1 AND a.recovery_pending=0")?;
+            let mut query=conn.prepare_cached("SELECT a.id FROM agents a JOIN managed_sessions m ON a.id=m.id WHERE a.ended_at IS NOT NULL AND a.ended_at<=?1 AND a.recovery_pending=0")?;
             query
                 .query_map([i64::try_from(cutoff).map_err(|_| Error::Schema)?], |r| {
                     r.get::<_, String>(0)
@@ -1231,7 +1263,7 @@ impl Store {
     }
     pub fn tokens(&self) -> Result<Vec<StoredToken>> {
         let conn = self.lock()?;
-        let mut q = conn.prepare("SELECT data,hash FROM tokens ORDER BY name")?;
+        let mut q = conn.prepare_cached("SELECT data,hash FROM tokens ORDER BY name")?;
         let data = q
             .query_map([], |r| {
                 Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))

@@ -59,6 +59,7 @@ impl Database {
         }
         let mut conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(5))?;
+        conn.set_prepared_statement_cache_capacity(64);
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
@@ -94,7 +95,7 @@ impl Database {
                         "force_resumes",
                     ] {
                         let columns = tx
-                            .prepare(&format!("PRAGMA main.table_info({table})"))?
+                            .prepare_cached(&format!("PRAGMA main.table_info({table})"))?
                             .query_map([], |row| row.get::<_, String>(1))?
                             .collect::<std::result::Result<Vec<_>, _>>()?
                             .join(",");
@@ -102,7 +103,7 @@ impl Database {
                     }
                     tx.execute_batch("DELETE FROM main.runtime_counters; INSERT INTO main.runtime_counters SELECT * FROM previous.counters;")?;
                     if tx
-                        .prepare("PRAGMA main.foreign_key_check")?
+                        .prepare_cached("PRAGMA main.foreign_key_check")?
                         .query([])?
                         .next()?
                         .is_some()

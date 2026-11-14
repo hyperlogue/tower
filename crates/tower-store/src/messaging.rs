@@ -57,8 +57,9 @@ impl Store {
     }
     pub fn approvals(&self) -> Result<Vec<StoredApproval>> {
         let conn = self.lock()?;
-        let mut query =
-            conn.prepare("SELECT data,body_hash,consumed FROM approvals ORDER BY created_at DESC")?;
+        let mut query = conn.prepare_cached(
+            "SELECT data,body_hash,consumed FROM approvals ORDER BY created_at DESC",
+        )?;
         let rows = query
             .query_map([], |r| {
                 Ok((
@@ -107,7 +108,7 @@ impl Store {
         digest: &[u8],
     ) -> Result<Vec<StoredApproval>> {
         let conn = self.lock()?;
-        let mut query=conn.prepare("SELECT data,body_hash,consumed FROM approvals WHERE body_hash=?1 AND json_extract(data,'$.from')=?2 AND json_extract(data,'$.to')=?3 ORDER BY created_at DESC")?;
+        let mut query=conn.prepare_cached("SELECT data,body_hash,consumed FROM approvals WHERE body_hash=?1 AND json_extract(data,'$.from')=?2 AND json_extract(data,'$.to')=?3 ORDER BY created_at DESC")?;
         let rows = query
             .query_map(params![digest, from, to], |r| {
                 Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?))
@@ -147,7 +148,7 @@ impl Store {
         let mut expired = Vec::new();
         let due: Vec<StoredApproval> = {
             let conn = self.lock()?;
-            let mut query=conn.prepare("SELECT data,body_hash,consumed FROM approvals WHERE json_extract(data,'$.state')='pending' AND json_extract(data,'$.expires_at')<=?1")?;
+            let mut query=conn.prepare_cached("SELECT data,body_hash,consumed FROM approvals WHERE json_extract(data,'$.state')='pending' AND json_extract(data,'$.expires_at')<=?1")?;
             let rows = query
                 .query_map([i64::try_from(now).map_err(|_| Error::Schema)?], |r| {
                     Ok((

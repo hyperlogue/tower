@@ -306,8 +306,8 @@ impl Service {
         self.scan_processes()?;
         self.store.expire_vcs_plans(now_ms())?;
         let now = now_ms();
-        for r in self.store.agents(&AgentFilter::default())? {
-            if r.ownership != "registered" {
+        for r in self.store.liveness()? {
+            if !r.registered {
                 continue;
             }
             let dead = match (r.pid, r.pid_start_time) {
@@ -342,10 +342,9 @@ impl Service {
     pub fn maintenance_plan(&self) -> Result<MaintenancePlan> {
         let next = self.store.next_deadline(self.retention_ms)?;
         let processes = self
-            .all()
-            .map_err(Error::Rpc)?
+            .store
+            .liveness()?
             .into_iter()
-            .filter(|r| !matches!(r.status.as_str(), "exited" | "lost"))
             .filter_map(|r| Some((r.pid?, r.pid_start_time?)))
             .collect();
         Ok((next, processes))

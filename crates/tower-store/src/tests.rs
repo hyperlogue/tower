@@ -197,6 +197,30 @@ fn expiration_uses_confirmed_end_and_protects_active_and_pending_recovery() {
     assert!(s.agent("candidate").is_ok());
 }
 #[test]
+fn the_next_deadline_is_the_earliest_expiry_or_unseen_registration() {
+    let (_dir, s) = setup();
+    assert_eq!(s.next_deadline(1000).unwrap(), None);
+    let mut owned = record("owned", None, None);
+    owned.ownership = "owned".into();
+    s.register_test(owned, b"hash").unwrap();
+    s.register_test(record("watched", Some("w"), Some(7)), b"hash")
+        .unwrap();
+    assert_eq!(s.next_deadline(1000).unwrap(), None);
+    s.unregister("owned", 500_000).unwrap();
+    assert_eq!(s.next_deadline(1000).unwrap(), Some(501_000));
+    assert_eq!(
+        s.next_deadline(u64::MAX).unwrap(),
+        Some(500_000 + (i64::MAX / 4) as u64)
+    );
+    s.unregister("watched", 300).unwrap();
+    assert_eq!(s.next_deadline(1000).unwrap(), Some(60_300));
+    s.register_test(record("unseen", Some("u"), None), b"hash")
+        .unwrap();
+    assert_eq!(s.next_deadline(1000).unwrap(), Some(60_300));
+    assert_eq!(s.expire(60_300, 1000).unwrap(), vec!["watched"]);
+    assert_eq!(s.next_deadline(1000).unwrap(), Some(180_100));
+}
+#[test]
 fn token_names_are_unique_and_revocation_is_immediate() {
     let (_dir, s) = setup();
     let info = TokenInfo {
