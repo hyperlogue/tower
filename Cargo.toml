@@ -8,6 +8,7 @@ members = [
     "crates/tower-store",
     "crates/tower-sessions",
     "crates/tower-terminal",
+    "crates/tower-launcher",
     "crates/tower-runtime",
     "crates/tower-clipboard",
     "crates/tower-vcs",
@@ -45,6 +46,7 @@ tower-pool = { path = "crates/tower-pool" }
 tower-agents = { path = "crates/tower-agents" }
 tower-sessions = { path = "crates/tower-sessions" }
 tower-terminal = { path = "crates/tower-terminal" }
+tower-launcher = { path = "crates/tower-launcher" }
 tower-runtime = { path = "crates/tower-runtime" }
 tower-clipboard = { path = "crates/tower-clipboard" }
 tower-vcs = { path = "crates/tower-vcs" }

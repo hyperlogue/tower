@@ -5,7 +5,7 @@ use std::{
     time::Duration,
 };
 use tower_agents::runtime::Embedding;
-use tower_terminal::local::{Local, Session};
+use tower_launcher::local::{Local, Session};
 
 // Stands in for Claude Code: reports through the helper the way its hooks do.
 const AGENT: &str = r#"#!/bin/sh
@@ -33,7 +33,7 @@ fn embedder() -> PathBuf {
     // Cargo builds examples for a package's whole test run, not for `--test`.
     assert!(
         path.exists(),
-        "build the fixture first: cargo build -p tower-terminal --example embedder"
+        "build the fixture first: cargo build -p tower-launcher --example embedder"
     );
     path
 }

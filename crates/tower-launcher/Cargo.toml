@@ -1,0 +1,30 @@
+[package]
+name = "tower-launcher"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Supervisor for one agent session, and the API for programs that embed it."
+
+[lints]
+workspace = true
+
+[dependencies]
+tower-protocol.workspace = true
+tower-sessions.workspace = true
+tower-pal.workspace = true
+tower-agents.workspace = true
+tower-pool-proto.workspace = true
+tower-clipboard.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+subtle.workspace = true
+getrandom.workspace = true
+futures-util = { version = "0.3", features = ["sink"] }
+tokio-tungstenite = "0.28"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tempfile.workspace = true

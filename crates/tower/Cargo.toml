@@ -30,6 +30,7 @@ tower-runtime.workspace = true
 tower-sessions.workspace = true
 tower-agents.workspace = true
 tower-terminal.workspace = true
+tower-launcher.workspace = true
 tower-protocol.workspace = true
 tower-pal.workspace = true
 tower-server.workspace = true

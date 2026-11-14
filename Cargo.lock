@@ -2261,6 +2261,7 @@ dependencies = [
  "tokio-tungstenite",
  "tower-agents",
  "tower-clipboard",
+ "tower-launcher",
  "tower-pal",
  "tower-pool",
  "tower-pool-proto",
@@ -2338,6 +2339,26 @@ dependencies = [
  "tower-layer",
  "tower-service",
  "url",
+]
+
+[[package]]
+name = "tower-launcher"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "getrandom 0.4.3",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite",
+ "tower-agents",
+ "tower-clipboard",
+ "tower-pal",
+ "tower-pool-proto",
+ "tower-protocol",
+ "tower-sessions",
 ]
 
 [[package]]
@@ -2482,17 +2503,11 @@ dependencies = [
 name = "tower-terminal"
 version = "0.1.0"
 dependencies = [
- "futures-util",
- "getrandom 0.4.3",
  "serde",
  "serde_json",
- "subtle",
- "tempfile",
  "tokio",
- "tokio-tungstenite",
  "toml",
  "tower-agents",
- "tower-clipboard",
  "tower-pal",
  "tower-pool-proto",
  "tower-protocol",

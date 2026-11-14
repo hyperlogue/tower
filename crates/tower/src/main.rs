@@ -523,7 +523,7 @@ fn execute(mut cli: Cli) -> Result<()> {
     }
     if let Command::Hook { harness, event } = &cli.command {
         if std::env::var_os("TOWER_LAUNCHER_SOCKET").is_some() {
-            tower_terminal::launcher::hook(harness, event);
+            tower_launcher::hook(harness, event);
         } else {
             let _ = hooks::report(harness, event);
         }
@@ -536,7 +536,7 @@ fn execute(mut cli: Cli) -> Result<()> {
                 let code = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?
-                    .block_on(tower_terminal::launcher::run(plan))?;
+                    .block_on(tower_launcher::run(plan))?;
                 if code != 0 {
                     return Err(format!("agent exited with status {code}").into());
                 }

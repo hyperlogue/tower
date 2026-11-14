@@ -19,8 +19,7 @@ pub async fn run(
     }
     let cwd = std::env::current_dir()?;
     let exe = tower_pal::Program::Cli.path()?;
-    let mut env =
-        tower_terminal::launcher::project_environment(&cwd, &exe, tower_pal::environment()).await?;
+    let mut env = tower_launcher::project_environment(&cwd, &exe, tower_pal::environment()).await?;
     for key in [
         "TOWER_AGENT_ID",
         "TOWER_AGENT_TOKEN",

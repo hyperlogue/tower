@@ -10,7 +10,6 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-tower-clipboard.workspace = true
 tower-protocol.workspace = true
 tower-sessions.workspace = true
 tower-pal = { workspace = true, features = ["terminal"] }
@@ -19,12 +18,4 @@ tower-pool-proto.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
-subtle.workspace = true
-getrandom.workspace = true
 toml.workspace = true
-futures-util = { version = "0.3", features = ["sink"] }
-tokio-tungstenite = "0.28"
-
-[dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
-tempfile.workspace = true

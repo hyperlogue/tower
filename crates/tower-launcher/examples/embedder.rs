@@ -1,9 +1,9 @@
 //! A minimal embedding program: it runs agents in its own terminal and tracks
-//! them through `tower_terminal::local`, with no Tower daemon or pool.
+//! them through `tower_launcher::local`, with no Tower daemon or pool.
 
 use std::{io, process::ExitCode};
 use tower_agents::runtime::{AgentSpec, Embedding};
-use tower_terminal::local::{self, Local};
+use tower_launcher::local::{self, Local};
 
 fn local() -> io::Result<Local> {
     Local::new(Embedding {

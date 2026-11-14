@@ -201,6 +201,7 @@ cargo test --workspace --locked
 - **`tower-server`**: Core daemon for registry, governance, approvals, and HTTP/SSE.
 - **`tower-pool`** / **`tower-pool-proto`**: Terminal multiplexer and IPC protocol.
 - **`tower-terminal`**: Terminal backend adapter and PTY attach client.
+- **`tower-launcher`**: Per-session agent supervisor and the API for programs that embed it.
 - **`tower-agents`**: Launchers, hooks, and adapters for nine harnesses.
 - **`tower-runtime`**: Structured ACP and app-server runtimes and event journals.
 - **`tower-vcs`**: Git repository and worktree lifecycle management.
