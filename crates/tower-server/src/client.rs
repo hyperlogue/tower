@@ -26,7 +26,7 @@ impl Client {
     }
     /// Connects and makes `method` the first request in place of the version
     /// handshake, for a caller that cannot afford both. The request may be
-    /// sent more than once, so it must change nothing.
+    /// sent more than once, so repeating it must be harmless.
     pub async fn connect_calling<T: serde::Serialize>(
         paths: &Paths,
         context: CallerContext,
@@ -49,7 +49,7 @@ impl Client {
                         ) =>
                 {
                     // The old listener can accept a socket while its process exits.
-                    // Only the first request is retried, and it changes nothing.
+                    // Only the first request is retried, and it is safe to repeat.
                     retries += 1;
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }

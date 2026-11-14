@@ -205,13 +205,6 @@ impl Service {
             .agent_by_native_id(session.harness, &session.native)
             .ok()
             .filter(|a| a.ended_at.is_none() && a.record.pid == Some(session.pid));
-        let token = existing.as_ref().and_then(|a| {
-            let bytes = tower_pal::read_private(&self.paths.token_path(&a.record.id).ok()?).ok()?;
-            String::from_utf8(bytes).ok()
-        });
-        if existing.is_some() && token.is_none() {
-            return Ok(true);
-        }
         let request = Request {
             jsonrpc: "2.0".into(),
             id: None,
@@ -226,7 +219,6 @@ impl Service {
                 "kind": if existing.is_some() { "metadata" } else { "ready" },
                 "status": session.status,
                 "detail": {},
-                "token": token,
             }))
             .map_err(Error::Rpc)?,
         };

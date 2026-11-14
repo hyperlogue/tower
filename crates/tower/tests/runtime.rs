@@ -473,7 +473,10 @@ fn concurrent_autostart_registration_and_restart_preserve_identity() {
     assert_eq!(f.run(&["get", id])["status"], "idle");
     f.run(&["unregister", "--id", id, "--token", token]);
     assert_eq!(f.run(&["ls"]), json!([]));
-    assert_eq!(f.run(&["ls", "--all"])[0]["status"], "exited");
+    // The startup scan may also have registered another test's harness.
+    let all = f.run(&["ls", "--all"]);
+    let ended = all.as_array().unwrap().iter().find(|r| r["id"] == id);
+    assert_eq!(ended.unwrap()["status"], "exited");
 }
 
 #[test]
@@ -1420,6 +1423,72 @@ async fn startup_retries_only_the_handshake_not_an_uncertain_mutation() {
             .is_err()
     );
     peer.await.unwrap();
+}
+
+#[test]
+fn a_hook_updates_its_session_only_from_below_the_session_process() {
+    use std::io::{BufRead, BufReader, Write};
+    let f = Fixture::new();
+    let bin = f.dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let harness = bin.join("claude");
+    std::fs::write(
+        &harness,
+        "#!/bin/sh\nwhile read event; do printf '{\"session_id\":\"native-1\"}' | \"$TOWER\" hook claude \"$event\"; echo done; done\n",
+    )
+    .unwrap();
+    tower_pal::make_executable(&harness).unwrap();
+    // Another test's fork can briefly hold the script open for writing.
+    let mut running = loop {
+        match f
+            .program(&harness, &[])
+            .env("TOWER", &f.binary)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+        {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                thread::sleep(Duration::from_millis(10))
+            }
+            spawned => break spawned.unwrap(),
+        }
+    };
+    let mut input = running.stdin.take().unwrap();
+    let mut output = BufReader::new(running.stdout.take().unwrap());
+    // The startup scan may also have registered another test's harness.
+    let session = |f: &Fixture| {
+        let rows = f.run(&["ls"]);
+        let found = rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["native_session_id"] == "native-1");
+        found
+            .unwrap_or_else(|| panic!("no session: {rows}"))
+            .clone()
+    };
+    let mut report = |event: &str| {
+        writeln!(input, "{event}").unwrap();
+        let mut line = String::new();
+        output.read_line(&mut line).unwrap();
+        session(&f)
+    };
+    let started = report("SessionStart");
+    assert_eq!(started["pid"], running.id());
+    // No credential is on disk for the hook to find first: one request does it.
+    assert_eq!(report("UserPromptSubmit")["status"], "working");
+
+    let forged = json!({"harness":"claude-code","native_session_id":"native-1","pid":running.id(),"cwd":f.dir.path(),"kind":"idle","status":"idle","detail":{}}).to_string();
+    let denied = f
+        .command(&["--json", "rpc", "agent.hook", &forged])
+        .output()
+        .unwrap();
+    let denied: Value = serde_json::from_slice(&denied.stdout).unwrap();
+    assert_eq!(denied["error"]["data"]["code"], "denied", "{denied}");
+    assert_eq!(session(&f)["status"], "working");
+    assert_eq!(report("Stop")["status"], "idle");
+    drop(input);
+    running.wait().unwrap();
 }
 
 #[test]

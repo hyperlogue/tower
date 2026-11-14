@@ -118,25 +118,16 @@ pub fn report(harness: &str, event: &str) -> Result<()> {
         .build()?
         .block_on(async {
             tokio::time::timeout(Duration::from_secs(1), async {
-                // Asking who the caller is doubles as the handshake: a hook
-                // runs on every tool call and reports in a fixed format.
-                let (mut client, identity) = tower_server::client::Client::connect_calling(
+                // A hook runs on every tool call, so its report is the only
+                // request; a repeat after a dropped connection changes nothing.
+                tower_server::client::Client::connect_calling(
                     &paths,
                     caller,
                     true,
-                    "identity.whoami",
-                    &json!({}),
+                    "agent.hook",
+                    &report,
                 )
-                .await?;
-                let identity = serde_json::to_value(identity)?;
-                if let Some(id) = identity["id"].as_str()
-                    && id != "human"
-                    && let Ok(bytes) = tower_pal::read_private(&paths.token_path(id)?)
-                    && let Ok(token) = String::from_utf8(bytes)
-                {
-                    report["token"] = token.into();
-                }
-                client.call("agent.hook", &report).await
+                .await
             })
             .await??;
             Ok(())

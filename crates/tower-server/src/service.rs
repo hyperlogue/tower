@@ -909,7 +909,7 @@ impl Service {
             "allgather.login" | "allgather.logout" | "allgather.status" => {
                 self.enrollment(request, &actor)
             }
-            "agent.hook" => self.hook_report(request, &actor),
+            "agent.hook" => self.hook_report(request, &actor, peer),
             "agent.delivery" => self.set_delivery(params(&request.params)?),
             "approval.list" | "approval.status" | "approval.resolve" => {
                 self.approval_dispatch(request, &actor)

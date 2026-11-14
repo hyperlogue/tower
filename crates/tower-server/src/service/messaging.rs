@@ -681,7 +681,23 @@ struct HookReport {
     kind: String,
     status: String,
     detail: serde_json::Value,
-    token: Option<Secret>,
+}
+/// Whether process `pid` is, or runs below, the process `ancestor` that started at `start`.
+fn descends(pid: u32, ancestor: u32, start: u64) -> bool {
+    let mut current = pid;
+    for _ in 0..32 {
+        let Ok(process) = tower_pal::process_identity(current) else {
+            return false;
+        };
+        if current == ancestor {
+            return process.start_time == start;
+        }
+        if process.parent <= 1 {
+            return false;
+        }
+        current = process.parent;
+    }
+    false
 }
 /// How stale `last_seen` may get while hooks only repeat what is known. It
 /// stays well inside the time after which an unseen session counts as lost.
@@ -691,6 +707,7 @@ impl Service {
         &self,
         request: &Request,
         actor: &Actor,
+        peer: Peer,
     ) -> std::result::Result<Value, RpcError> {
         let mut p: HookReport = params(&request.params)?;
         let mut endpoint = p.register.delivery.clone().unwrap_or_default();
@@ -728,13 +745,18 @@ impl Service {
         let known = self.store.agent_by_native_id(&p.register.harness, native);
         let (id, token, seq) = match known {
             Ok(a) => {
-                if p.token
-                    .as_ref()
-                    .is_none_or(|t| !authentic(t, &a.token_hash))
+                // Every local caller could read the session's credential, so
+                // what tells this session's hooks from another's is that they
+                // run below its process. A caller the kernel gives no process
+                // for, and a session without a live one, pass as before.
+                if let (Some(caller), Some(pid), Some(start)) =
+                    (peer.pid, a.record.pid, a.record.pid_start_time)
+                    && tower_pal::process_identity(pid).is_ok_and(|p| p.start_time == start)
+                    && !descends(caller, pid, start)
                 {
                     return Err(app(
-                        "unauthorized",
-                        "Hook update requires its registration credential",
+                        "denied",
+                        "Hook update must come from the session's own process",
                     ));
                 }
                 if a.record.ownership == "owned" {

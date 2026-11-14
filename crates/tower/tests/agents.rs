@@ -457,7 +457,8 @@ fn missing_native_identity_fails_recovery_without_creating_a_new_conversation() 
         .unwrap()
         .path();
     let until = Instant::now() + Duration::from_secs(5);
-    while !generation.join("state.json").exists() {
+    // The harness must have run once before the pool is replaced under it.
+    while !generation.join("state.json").exists() || !f.root.path().join("starts").exists() {
         assert!(Instant::now() < until);
         thread::sleep(Duration::from_millis(20));
     }
