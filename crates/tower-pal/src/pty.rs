@@ -315,6 +315,9 @@ pub fn prompt_secret(prompt: &str, limit: usize) -> io::Result<String> {
     hidden
         .local_flags
         .remove(termios::LocalFlags::ECHO | termios::LocalFlags::ECHONL);
+    // A macOS pty can map NL to CR and then wait for NL, so Return never arrives.
+    hidden.input_flags.insert(termios::InputFlags::ICRNL);
+    hidden.input_flags.remove(termios::InputFlags::INLCR);
     let mut restore = Restore {
         tty,
         original,
@@ -364,7 +367,7 @@ pub fn prompt_secret(prompt: &str, limit: usize) -> io::Result<String> {
                 "Input cancelled",
             ));
         }
-        if byte[0] == b'\n' {
+        if byte[0] == b'\n' || byte[0] == b'\r' {
             return String::from_utf8(bytes)
                 .map_err(|_| io::Error::other("Invalid input encoding"));
         }

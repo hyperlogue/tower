@@ -6,6 +6,30 @@ use std::{
 };
 use tokio::sync::watch;
 
+/// `changed` names `target` or a directory that contains it.
+/// macOS reports the real path (`/private/tmp`) for a watch opened through
+/// `/tmp`, so the original string comparison misses the event.
+fn concerns(target: &Path, changed: &Path) -> bool {
+    let hit = |target: &Path, changed: &Path| target == changed || target.starts_with(changed);
+    if hit(target, changed) {
+        return true;
+    }
+    let changed = std::fs::canonicalize(changed).unwrap_or_else(|_| changed.to_path_buf());
+    if let Ok(target) = std::fs::canonicalize(target) {
+        return hit(&target, &changed);
+    }
+    for ancestor in target.ancestors() {
+        let Ok(real) = std::fs::canonicalize(ancestor) else {
+            continue;
+        };
+        let Ok(rest) = target.strip_prefix(ancestor) else {
+            continue;
+        };
+        return hit(&real.join(rest), &changed);
+    }
+    false
+}
+
 pub struct FileWatch {
     _watcher: notify::RecommendedWatcher,
     #[cfg(target_os = "macos")]
@@ -31,11 +55,10 @@ impl FileWatch {
             notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
                 if event.is_ok_and(|event| {
                     matches!(event.kind, notify::EventKind::Access(_))
-                        || !event.paths.iter().any(|changed| {
-                            targets
-                                .iter()
-                                .any(|target| target == changed || target.starts_with(changed))
-                        })
+                        || !event
+                            .paths
+                            .iter()
+                            .any(|changed| targets.iter().any(|target| concerns(target, changed)))
                 }) {
                     return;
                 }
@@ -56,6 +79,7 @@ impl FileWatch {
             return Err(io::Error::other("no observable file parents"));
         }
         for root in roots {
+            let root = std::fs::canonicalize(&root).unwrap_or(root);
             watcher
                 .watch(&root, notify::RecursiveMode::NonRecursive)
                 .map_err(io::Error::other)?;
@@ -96,8 +120,9 @@ impl TreeWatch {
                 }
             })
             .map_err(io::Error::other)?;
+        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
         watcher
-            .watch(root, notify::RecursiveMode::Recursive)
+            .watch(&root, notify::RecursiveMode::Recursive)
             .map_err(io::Error::other)?;
         Ok(Self {
             _watcher: watcher,
@@ -149,8 +174,9 @@ impl PathWatch {
                 updates.send_modify(|revision| *revision = revision.wrapping_add(1));
             })
             .map_err(io::Error::other)?;
+        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
         watcher
-            .watch(root, notify::RecursiveMode::Recursive)
+            .watch(&root, notify::RecursiveMode::Recursive)
             .map_err(io::Error::other)?;
         Ok(Self {
             _watcher: watcher,

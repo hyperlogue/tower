@@ -207,10 +207,17 @@ pub fn peer(stream: &IpcStream) -> io::Result<Peer> {
 }
 pub async fn connect(path: &Path) -> io::Result<IpcStream> {
     let stream = UnixStream::connect(path).await?;
-    if peer(&stream)?.uid != uid() {
-        return Err(denied("tower socket peer belongs to another user"));
+    match peer(&stream) {
+        Ok(peer) if peer.uid == uid() => Ok(stream),
+        Ok(_) => Err(denied("tower socket peer belongs to another user")),
+        // macOS forgets the peer identity once that side has closed. The
+        // connection is gone; callers already retry a reset handshake.
+        Err(error) if error.kind() == io::ErrorKind::NotConnected => Err(io::Error::new(
+            io::ErrorKind::ConnectionReset,
+            "socket peer disconnected before its identity could be checked",
+        )),
+        Err(error) => Err(error),
     }
-    Ok(stream)
 }
 /// Call while holding the owning service's singleton lock.
 pub async fn prepare_socket_path(path: &Path) -> io::Result<()> {
@@ -618,9 +625,11 @@ mod tests {
         assert!(SingletonLock::acquire(&lockpath).is_err());
         let listener = IpcListener::bind(&path).await.unwrap();
         let stream = connect(&path).await.unwrap();
-        let (_, p) = listener.accept().await.unwrap();
+        // macOS withholds peer credentials after the accepted socket is closed.
+        let (accepted, p) = listener.accept().await.unwrap();
         assert_eq!(p.uid, uid());
         assert_eq!(peer(&stream).unwrap().uid, uid());
+        drop(accepted);
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
         assert!(IpcListener::bind(&path).await.is_err());
         drop(listener);

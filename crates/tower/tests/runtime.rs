@@ -934,6 +934,9 @@ fn native_messaging_approval_retry_and_persistent_privacy() {
         let until = Instant::now() + Duration::from_secs(15);
         while Instant::now() < until {
             if let Ok((stream, _)) = listener.accept() {
+                // macOS copies the listener's O_NONBLOCK onto the accepted
+                // socket, and SO_RCVTIMEO is rejected on a nonblocking fd.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .unwrap();

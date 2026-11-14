@@ -860,7 +860,15 @@ async fn missing_relative_worktree_keeps_its_administrative_identity() {
         .iter()
         .find(|b| b.identity_key() == binding.identity_key())
         .expect("relative backlink must retain checkout identity");
-    assert_eq!(missing.directory.as_ref(), Some(&path));
+    // Git records the worktree through the real path. On macOS that resolves
+    // the /tmp symlink, and the directory itself has already been removed.
+    let expected = path
+        .parent()
+        .unwrap()
+        .canonicalize()
+        .unwrap()
+        .join(path.file_name().unwrap());
+    assert_eq!(missing.directory.as_deref(), Some(expected.as_path()));
     assert!(!tower_vcs::status(missing).await.unwrap().available);
     assert!(!missing.can_reconcile(&binding));
 }
