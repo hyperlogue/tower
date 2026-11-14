@@ -488,10 +488,13 @@ async fn bridge(
     let mut native_requests = BTreeSet::new();
     let mut next_message = 0u64;
     let mut client_open = true;
+    // Once its client is gone a relay stays only until another connection
+    // selects a conversation or its own requests are answered. The first is
+    // not signalled, so it is checked on a timer, and only then.
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     loop {
         tokio::select! {
-            _=tick.tick()=>{},
+            _=tick.tick(),if !client_open=>{},
             Some(submission)=submissions.recv()=> {
                 let _gate=shared.gate.read().await;
                 if shared.paused.load(Ordering::Acquire) || monitor.thread.as_deref()!=Some(&submission.thread) || messages.len()>=16 {
