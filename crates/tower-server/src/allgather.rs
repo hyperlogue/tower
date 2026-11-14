@@ -491,8 +491,9 @@ async fn connection(
                 let Some(incoming)=incoming else{return Ok(())};
                 let incoming=incoming.map_err(|_|Error::Other("Sync read failed".into()))?;
                 match incoming {
-                    Message::Pong(_)=>{last_response=tokio::time::Instant::now();continue;}
-                    Message::Ping(_)=>{socket.flush().await.map_err(|_|Error::Other("Sync pong failed".into()))?;continue;}
+                    // A keepalive carries no state, so nothing needs republishing.
+                    Message::Pong(_)=>{dirty=false;last_response=tokio::time::Instant::now();continue;}
+                    Message::Ping(_)=>{dirty=false;socket.flush().await.map_err(|_|Error::Other("Sync pong failed".into()))?;continue;}
                     Message::Close(_)=>return Ok(()),
                     Message::Text(text)=>{
                         last_response=tokio::time::Instant::now();
