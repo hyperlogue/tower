@@ -607,6 +607,7 @@ async function daemon(command) {
   const socket = path.join(root, 'app-server-control.sock');
   const pidFile = path.join(root, 'fixture-daemon.pid');
   if (command === 'start') {
+    process.stderr.write('codex fixture: daemon start\n');
     fs.mkdirSync(root, {recursive: true, mode: 0o700});
     if (!await reachable(socket)) {
       let childError = '';
@@ -616,7 +617,7 @@ async function daemon(command) {
       child.stderr?.on('data', chunk => { childError = (childError + chunk).slice(-800); });
       fs.writeFileSync(pidFile, String(child.pid ?? ''));
       let up = false;
-      for (let tries = 0; tries < 40 && !up; tries++) {
+      for (let tries = 0; tries < 20 && !up; tries++) {
         if (child.exitCode !== null) break;
         up = await reachable(socket);
         if (!up) await new Promise(resolve => setTimeout(resolve, 50));
