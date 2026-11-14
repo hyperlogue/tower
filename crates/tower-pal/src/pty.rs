@@ -176,7 +176,12 @@ impl PtyProcess {
         if unsafe { info.si_pid() } == 0 {
             return Ok(None);
         }
-        self.signal(true)?;
+        match self.signal(true) {
+            // macOS answers EPERM, not ESRCH, for a group in which only
+            // exited processes remain.
+            Err(e) if e.raw_os_error() == Some(libc::EPERM) => {}
+            signalled => signalled?,
+        }
         let status = self.child.wait()?;
         self.reaped = true;
         use std::os::unix::process::ExitStatusExt;

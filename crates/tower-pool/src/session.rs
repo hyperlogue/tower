@@ -399,6 +399,10 @@ impl Actor {
     async fn run(mut self) {
         let mut bytes = vec![0; 32 * 1024];
         let mut exit: Option<(u32, ExitWatch)> = None;
+        // The agent is this process's child, so its exit also arrives as a
+        // signal; that does not depend on the exit watch being available.
+        let mut children =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::child()).ok();
         loop {
             match self.pty.as_ref().map(|p| (p.pid(), p.start_time)) {
                 Some((pid, start)) if exit.as_ref().is_none_or(|(watched, _)| *watched != pid) => {
@@ -481,6 +485,10 @@ impl Actor {
                     if let Some((_, fired)) = &mut exit { *fired = Box::pin(std::future::pending()); }
                     self.reap();
                 }
+                _ = async { children.as_mut().unwrap().recv().await },
+                    if children.is_some() && pty.is_some() && self.pending_exit.is_none() => {
+                    self.reap();
+                }
                 _ = tokio::time::sleep_until(wake.unwrap_or_else(Instant::now).into()), if pty.is_some() && wake.is_some() => {
                     let now = Instant::now();
                     let closed=self.clients.iter().filter(|(_,c)|c.out.is_closed()).map(|(id,_)|*id).collect::<Vec<_>>();
@@ -505,6 +513,8 @@ impl Actor {
                         && let Some(p) = &self.pty {
                         let _ = p.signal(true);
                         self.killing = Some(now + Duration::from_secs(1));
+                        // A kill must be answered even if no exit event arrives.
+                        if self.pending_exit.is_none() { self.reap(); }
                     }
                 }
                 event = self.clipboard.receive.recv() => {
