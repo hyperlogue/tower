@@ -118,10 +118,17 @@ pub fn report(harness: &str, event: &str) -> Result<()> {
         .build()?
         .block_on(async {
             tokio::time::timeout(Duration::from_secs(1), async {
-                let mut client =
-                    tower_server::client::Client::connect(&paths, caller, true).await?;
-                let identity =
-                    serde_json::to_value(client.call("identity.whoami", &json!({})).await?)?;
+                // Asking who the caller is doubles as the handshake: a hook
+                // runs on every tool call and reports in a fixed format.
+                let (mut client, identity) = tower_server::client::Client::connect_calling(
+                    &paths,
+                    caller,
+                    true,
+                    "identity.whoami",
+                    &json!({}),
+                )
+                .await?;
+                let identity = serde_json::to_value(identity)?;
                 if let Some(id) = identity["id"].as_str()
                     && id != "human"
                     && let Ok(bytes) = tower_pal::read_private(&paths.token_path(id)?)

@@ -15,9 +15,28 @@ pub struct Client {
 }
 impl Client {
     pub async fn connect(paths: &Paths, context: CallerContext, autostart: bool) -> Result<Self> {
+        let hello = HelloParams {
+            protocol_version: PROTOCOL_VERSION,
+        };
+        Ok(
+            Self::connect_calling(paths, context, autostart, "hello", &hello)
+                .await?
+                .0,
+        )
+    }
+    /// Connects and makes `method` the first request in place of the version
+    /// handshake, for a caller that cannot afford both. The request may be
+    /// sent more than once, so it must change nothing.
+    pub async fn connect_calling<T: serde::Serialize>(
+        paths: &Paths,
+        context: CallerContext,
+        autostart: bool,
+        method: &str,
+        params: &T,
+    ) -> Result<(Self, Value)> {
         let mut retries = 0;
         loop {
-            match Self::connect_once(paths, context.clone(), autostart).await {
+            match Self::connect_once(paths, context.clone(), autostart, method, params).await {
                 Err(Error::Io(error))
                     if autostart
                         && retries < 2
@@ -30,7 +49,7 @@ impl Client {
                         ) =>
                 {
                     // The old listener can accept a socket while its process exits.
-                    // Only hello is retried; no application request has been sent.
+                    // Only the first request is retried, and it changes nothing.
                     retries += 1;
                     tokio::time::sleep(Duration::from_millis(50)).await;
                 }
@@ -38,7 +57,13 @@ impl Client {
             }
         }
     }
-    async fn connect_once(paths: &Paths, context: CallerContext, autostart: bool) -> Result<Self> {
+    async fn connect_once<T: serde::Serialize>(
+        paths: &Paths,
+        context: CallerContext,
+        autostart: bool,
+        method: &str,
+        params: &T,
+    ) -> Result<(Self, Value)> {
         let stream = match connect(&paths.socket).await {
             Ok(s) => s,
             Err(e)
@@ -114,15 +139,8 @@ impl Client {
             events: Default::default(),
             failed: false,
         };
-        client
-            .call(
-                "hello",
-                &HelloParams {
-                    protocol_version: PROTOCOL_VERSION,
-                },
-            )
-            .await?;
-        Ok(client)
+        let first = client.call(method, params).await?;
+        Ok((client, first))
     }
     pub async fn call<T: serde::Serialize>(&mut self, method: &str, params: &T) -> Result<Value> {
         if self.failed {
