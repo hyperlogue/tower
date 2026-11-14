@@ -153,7 +153,29 @@ pub async fn connect(path: &Path) -> Result<Connection> {
     if !path.is_absolute() {
         return Err(Error::Config("Codex socket path must be absolute"));
     }
-    let resolved = tower_pal::require_private_socket(path).map_err(|_| Error::Unavailable)?;
+    let resolved = match tower_pal::require_private_socket(path) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            if let Ok(home) = std::env::var("HOME") {
+                let line = format!(
+                    "{} pid={} socket_unavailable path={} exists={} error={error}\n",
+                    tower_pal::monotonic_ms(),
+                    std::process::id(),
+                    path.display(),
+                    path.exists()
+                );
+                if let Ok(mut file) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(std::path::Path::new(&home).join("codex-trace.log"))
+                {
+                    use std::io::Write;
+                    let _ = file.write_all(line.as_bytes());
+                }
+            }
+            return Err(Error::Unavailable);
+        }
+    };
     tokio::time::timeout(REQUEST_TIMEOUT, async {
         let stream = tower_pal::connect(&resolved)
             .await

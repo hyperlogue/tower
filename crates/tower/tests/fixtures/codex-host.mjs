@@ -446,6 +446,9 @@ export async function serve(endpoint) {
   process.on('SIGHUP', () => {});
   process.on('SIGPIPE', () => {});
   fs.writeFileSync(path.join(path.dirname(endpoint), 'fixture-daemon.pid'), String(process.pid));
+  try {
+    fs.appendFileSync(path.join(home, 'codex-trace.log'), `${Date.now()} pid=${process.pid} ppid=${process.ppid} listening socket=${endpoint} exists=${fs.existsSync(endpoint)}\n`);
+  } catch {}
   let phase;
   const timer = setInterval(() => {
     let next;
