@@ -82,6 +82,79 @@ async fn cancelled_waiter_does_not_release_an_inflight_mutation() {
         .unwrap();
 }
 
+#[tokio::test]
+async fn a_read_is_answered_while_a_mutation_holds_the_gate() {
+    let (_dir, _store, service) = setup();
+    let request = |method: &str| Request {
+        jsonrpc: "2.0".into(),
+        id: Some(RequestId::String("test".into())),
+        method: method.into(),
+        params: serde_json::from_value(serde_json::json!({})).unwrap(),
+        context: human(),
+    };
+    let peer = Peer {
+        uid: tower_pal::uid(),
+        pid: None,
+    };
+    // Before the first maintenance pass a read waits like anything else.
+    let unsettled = crate::worker::ServiceWorker::new(setup().2);
+    let (started, entered) = tokio::sync::oneshot::channel();
+    let (release, blocked) = std::sync::mpsc::channel::<()>();
+    let task_worker = unsettled.clone();
+    let holder = tokio::spawn(async move {
+        task_worker
+            .execute(move |_| {
+                let _ = started.send(());
+                let _ = blocked.recv();
+            })
+            .await
+    });
+    entered.await.unwrap();
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            unsettled.request(request("agent.list"), peer),
+        )
+        .await
+        .is_err()
+    );
+    release.send(()).unwrap();
+    holder.await.unwrap().unwrap();
+
+    service.maintain().unwrap();
+    let worker = crate::worker::ServiceWorker::new(service);
+    let (started, entered) = tokio::sync::oneshot::channel();
+    let (release, blocked) = std::sync::mpsc::channel();
+    let task_worker = worker.clone();
+    let holder = tokio::spawn(async move {
+        task_worker
+            .execute(move |_| {
+                let _ = started.send(());
+                let _ = blocked.recv();
+            })
+            .await
+    });
+    entered.await.unwrap();
+    let listed = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        worker.request(request("agent.list"), peer),
+    )
+    .await
+    .expect("a read waited for the gate");
+    assert!(listed.is_ok());
+    // A mutation still waits its turn.
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            worker.request(request("rule.list"), peer),
+        )
+        .await
+        .is_err()
+    );
+    release.send(()).unwrap();
+    holder.await.unwrap().unwrap();
+}
+
 #[test]
 fn registration_cannot_acquire_another_sessions_credential_or_create_an_alias() {
     let (_dir, store, s) = setup();

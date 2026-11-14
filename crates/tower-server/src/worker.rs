@@ -10,6 +10,7 @@ use tokio::sync::Semaphore;
 pub(super) struct ServiceWorker {
     service: Arc<Service>,
     gate: Arc<Semaphore>,
+    read_gate: Arc<Semaphore>,
     inventory_gate: Arc<Semaphore>,
     delivery_gate: Arc<Semaphore>,
     enrollment_gate: Arc<Semaphore>,
@@ -39,6 +40,7 @@ impl ServiceWorker {
         Self {
             service: Arc::new(service),
             gate: Arc::new(Semaphore::new(1)),
+            read_gate: Arc::new(Semaphore::new(8)),
             inventory_gate: Arc::new(Semaphore::new(2)),
             delivery_gate: Arc::new(Semaphore::new(16)),
             enrollment_gate: Arc::new(Semaphore::new(4)),
@@ -56,6 +58,24 @@ impl ServiceWorker {
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
             operation(&service)
+        })
+        .await
+        .map_err(|_| Error::Other("service worker failed".into()))
+    }
+    /// Runs a read beside whatever holds the gate, so a slow operation does not stall it.
+    async fn read(
+        &self,
+        request: tower_protocol::Request,
+        peer: tower_pal::Peer,
+    ) -> Result<std::result::Result<tower_protocol::Value, tower_protocol::RpcError>> {
+        let permit = Arc::clone(&self.read_gate)
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::Other("service worker closed".into()))?;
+        let service = Arc::clone(&self.service);
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            service.read(&request, peer)
         })
         .await
         .map_err(|_| Error::Other("service worker failed".into()))
@@ -83,6 +103,9 @@ impl ServiceWorker {
             "approval.watch" => self.approval_watch(request, peer).await,
             "conversation.list" => self.conversations(request, peer).await,
             "allgather.enrollment.begin" => self.enroll(request, peer).await,
+            method if Service::reads(method) && self.service.settled() => {
+                self.read(request, peer).await
+            }
             _ => self.execute(move |s| s.dispatch(&request, peer)).await,
         };
         match result {

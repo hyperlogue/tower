@@ -164,6 +164,8 @@ pub(super) struct Service {
     traffic: Mutex<messaging::Traffic>,
     scan: scan::Config,
     scanned: std::sync::atomic::AtomicBool,
+    /// Set once the first maintenance pass has reconciled the registry with the machine.
+    settled: std::sync::atomic::AtomicBool,
     /// Serialize identity resolution and writes, including filesystem credential publication.
     mutation: Mutex<()>,
     events: tokio::sync::broadcast::Sender<Arc<EventNotification>>,
@@ -265,6 +267,7 @@ impl Service {
             traffic: Mutex::new(messaging::Traffic::default()),
             scan: config.scan,
             scanned: Default::default(),
+            settled: Default::default(),
             mutation: Mutex::new(()),
             events: tokio::sync::broadcast::channel(256).0,
             published: Mutex::new(events::Published::default()),
@@ -295,6 +298,12 @@ impl Service {
     }
     /// Apply due expiries and liveness checks; `managed` also re-reads managed session state.
     pub fn maintain_with(&self, managed: bool) -> Result<()> {
+        let result = self.maintain_once(managed);
+        self.settled
+            .store(true, std::sync::atomic::Ordering::Release);
+        result
+    }
+    fn maintain_once(&self, managed: bool) -> Result<()> {
         let _guard = self
             .mutation
             .lock()
@@ -820,12 +829,7 @@ impl Service {
         let result = self.dispatch_inner(request, peer);
         let method = request.method.as_str();
         // These read the registry and change nothing.
-        if result.is_err()
-            || matches!(
-                method,
-                "hello" | "identity.whoami" | "agent.list" | "agent.get"
-            )
-        {
+        if result.is_err() || Self::reads(method) {
             return result;
         }
         self.publish()?;
@@ -845,6 +849,24 @@ impl Service {
             self.authority_changed();
         }
         result
+    }
+    /// Whether `method` only reads the registry.
+    pub(crate) fn reads(method: &str) -> bool {
+        matches!(
+            method,
+            "hello" | "identity.whoami" | "agent.list" | "agent.get"
+        )
+    }
+    /// Whether reads may run beside a mutation. Until the startup scan is
+    /// done they wait, so that none reports a half-reconciled registry.
+    pub(crate) fn settled(&self) -> bool {
+        self.settled.load(std::sync::atomic::Ordering::Acquire)
+    }
+    /// Answers a method for which [`Self::reads`] holds without waiting for a mutation in progress.
+    pub fn read(&self, request: &Request, peer: Peer) -> std::result::Result<Value, RpcError> {
+        debug_assert!(Self::reads(&request.method));
+        let actor = self.actor(&request.context, peer)?;
+        self.dispatch_actor(request, actor, peer)
     }
     fn dispatch_inner(
         &self,
