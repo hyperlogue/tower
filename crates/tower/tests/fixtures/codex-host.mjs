@@ -444,6 +444,8 @@ export async function serve(endpoint) {
     if (!inode) await new Promise(resolve => setTimeout(resolve, 10));
   }
   process.on('SIGHUP', () => {});
+  process.on('SIGPIPE', () => {});
+  fs.writeFileSync(path.join(path.dirname(endpoint), 'fixture-daemon.pid'), String(process.pid));
   let phase;
   const timer = setInterval(() => {
     let next;
@@ -607,14 +609,15 @@ async function daemon(command) {
       const child = spawn(process.execPath, [script, 'app-server', '--listen', `unix://${socket}`], {detached: true, stdio: 'ignore'});
       fs.writeFileSync(pidFile, String(child.pid ?? ''));
       child.unref();
+      // The direct child exits after it orphans the listener. The socket, not
+      // that child's lifetime, is what shows the server is up.
       let up = false;
       for (let tries = 0; tries < 40 && !up; tries++) {
-        if (child.exitCode !== null) break;
         up = await reachable(socket) && fs.existsSync(socket);
         if (!up) await new Promise(resolve => setTimeout(resolve, 50));
       }
       await new Promise(resolve => setTimeout(resolve, 100));
-      if (child.exitCode !== null || !fs.existsSync(socket)) {
+      if (!fs.existsSync(socket)) {
         throw new Error('fixture app-server socket did not accept connections');
       }
     }
@@ -633,6 +636,18 @@ async function main() {
   if (args[0] === 'queue') { process.exitCode = 2; return; }
   if (args[0] === 'app-server' && args[1] === 'daemon') { await daemon(args[2]); return; }
   if (args[0] === 'app-server') {
+    // The launcher waits for this command to exit. On macOS that exit was
+    // taking the listening process with it and unlinking the socket. Spawn
+    // once more so the listener is already reparented before we return.
+    if (process.env.TOWER_FIXTURE_ORPHAN !== '1') {
+      const child = spawn(process.execPath, process.argv.slice(1), {
+        detached: true,
+        stdio: 'ignore',
+        env: {...process.env, TOWER_FIXTURE_ORPHAN: '1'},
+      });
+      child.unref();
+      return;
+    }
     const endpoint = args[args.indexOf('--listen') + 1];
     if (!endpoint?.startsWith('unix://')) throw new Error('fixture app-server requires --listen unix://PATH');
     await serve(endpoint.slice(7));

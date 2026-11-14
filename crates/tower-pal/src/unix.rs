@@ -325,7 +325,21 @@ fn resolve_owned_socket(path: &Path) -> io::Result<(PathBuf, fs::Metadata)> {
     if alias.uid() != uid() || (!alias.file_type().is_socket() && !alias.file_type().is_symlink()) {
         return Err(denied("invalid socket alias owner or type"));
     }
-    let resolved = fs::canonicalize(path)?;
+    // macOS realpath(3) can fail for a socket inode that is present. The
+    // directory still canonicalizes, and the file name is unchanged.
+    let resolved = match fs::canonicalize(path) {
+        Ok(path) => path,
+        Err(error) if cfg!(target_os = "macos") => {
+            let name = path
+                .file_name()
+                .ok_or_else(|| io::Error::other("invalid socket path"))?;
+            let parent = path
+                .parent()
+                .ok_or_else(|| io::Error::other("invalid socket path"))?;
+            fs::canonicalize(parent).map_err(|_| error)?.join(name)
+        }
+        Err(error) => return Err(error),
+    };
     let metadata = fs::symlink_metadata(&resolved)?;
     if !metadata.file_type().is_socket() || metadata.uid() != uid() {
         return Err(denied("invalid private socket owner or type"));
