@@ -446,6 +446,9 @@ export async function serve(endpoint) {
   process.on('SIGHUP', () => {});
   process.on('SIGPIPE', () => {});
   fs.writeFileSync(path.join(path.dirname(endpoint), 'fixture-daemon.pid'), String(process.pid));
+  try {
+    fs.appendFileSync(path.join(home, 'codex-trace.log'), `${Date.now()} listening pid=${process.pid} ppid=${process.ppid} socket=${endpoint} exists=${fs.existsSync(endpoint)}\n`);
+  } catch {}
   let phase;
   const timer = setInterval(() => {
     let next;
@@ -609,7 +612,11 @@ async function daemon(command) {
       const script = fileURLToPath(import.meta.url);
       // Ignore stdio. A stderr pipe closed by this parent delivers EPIPE and
       // the child exits, unlinking the socket it just bound.
-      const child = spawn(process.execPath, [script, 'app-server', '--listen', `unix://${socket}`], {detached: true, stdio: 'ignore'});
+      const child = spawn(process.execPath, [script, 'app-server', '--listen', `unix://${socket}`], {
+        detached: true,
+        stdio: 'ignore',
+        env: {...process.env, TOWER_FIXTURE_ORPHAN: '1'},
+      });
       fs.writeFileSync(pidFile, String(child.pid ?? ''));
       child.unref();
       // The direct child exits after it orphans the listener. The socket, not
@@ -642,15 +649,6 @@ async function main() {
     // The launcher waits for this command to exit. On macOS that exit was
     // taking the listening process with it and unlinking the socket. Spawn
     // once more so the listener is already reparented before we return.
-    if (process.env.TOWER_FIXTURE_ORPHAN !== '1') {
-      const child = spawn(process.execPath, process.argv.slice(1), {
-        detached: true,
-        stdio: 'ignore',
-        env: {...process.env, TOWER_FIXTURE_ORPHAN: '1'},
-      });
-      child.unref();
-      return;
-    }
     const endpoint = args[args.indexOf('--listen') + 1];
     if (!endpoint?.startsWith('unix://')) throw new Error('fixture app-server requires --listen unix://PATH');
     await serve(endpoint.slice(7));
