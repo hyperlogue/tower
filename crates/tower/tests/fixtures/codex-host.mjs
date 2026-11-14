@@ -601,27 +601,21 @@ async function daemon(command) {
   if (command === 'start') {
     fs.mkdirSync(root, {recursive: true, mode: 0o700});
     if (!await reachable(socket)) {
-      let childError = '';
       const script = fileURLToPath(import.meta.url);
-      const child = spawn(process.execPath, [script, 'app-server', '--listen', `unix://${socket}`], {detached: true, stdio: ['ignore', 'ignore', 'pipe']});
-      child.on('error', error => { childError = (childError + error.message).slice(-800); });
-      child.stderr?.setEncoding('utf8');
-      child.stderr?.on('data', chunk => { childError = (childError + chunk).slice(-800); });
+      // Ignore stdio. A stderr pipe closed by this parent delivers EPIPE and
+      // the child exits, unlinking the socket it just bound.
+      const child = spawn(process.execPath, [script, 'app-server', '--listen', `unix://${socket}`], {detached: true, stdio: 'ignore'});
       fs.writeFileSync(pidFile, String(child.pid ?? ''));
+      child.unref();
       let up = false;
       for (let tries = 0; tries < 40 && !up; tries++) {
         if (child.exitCode !== null) break;
         up = await reachable(socket) && fs.existsSync(socket);
         if (!up) await new Promise(resolve => setTimeout(resolve, 50));
       }
-      // Stay up only when the listening socket is still on disk. A child that
-      // exits after the first accept unlinks it, and Tower then cannot connect.
       await new Promise(resolve => setTimeout(resolve, 100));
-      // The stderr pipe would keep this process alive after the server is up.
-      child.stderr?.destroy();
-      child.unref();
       if (child.exitCode !== null || !fs.existsSync(socket)) {
-        throw new Error(`fixture app-server socket did not accept connections${childError ? `: ${childError.trim()}` : ''}`);
+        throw new Error('fixture app-server socket did not accept connections');
       }
     }
     process.stdout.write(`${JSON.stringify({status: 'started', socketPath: socket})}\n`);
