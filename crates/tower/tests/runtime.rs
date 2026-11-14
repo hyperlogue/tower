@@ -1486,6 +1486,17 @@ fn a_hook_updates_its_session_only_from_below_the_session_process() {
     let denied: Value = serde_json::from_slice(&denied.stdout).unwrap();
     assert_eq!(denied["error"]["data"]["code"], "denied", "{denied}");
     assert_eq!(session(&f)["status"], "working");
+    // Nor can a caller bind a new session to a process it does not run under.
+    let claimed = forged.replace("native-1", "native-2");
+    f.run(&["rpc", "agent.hook", &claimed]);
+    let rows = f.run(&["ls"]);
+    let other = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["native_session_id"] == "native-2")
+        .unwrap();
+    assert_ne!(other["pid"], running.id());
     assert_eq!(report("Stop")["status"], "idle");
     drop(input);
     running.wait().unwrap();

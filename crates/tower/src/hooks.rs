@@ -30,22 +30,6 @@ pub fn report(harness: &str, event: &str) -> Result<()> {
     let mut caller = context()?;
     caller.harness = Some(h.id().into());
     caller.native_session_id = Some(native.clone());
-    let mut pid = tower_pal::process_identity(tower_pal::pid())
-        .ok()
-        .map(|p| p.parent);
-    let mut found = None;
-    for _ in 0..32 {
-        let Some(current) = pid.filter(|p| *p > 1) else {
-            break;
-        };
-        if tower_pal::process_name(current)
-            .is_ok_and(|name| name == h.program() || (h == Harness::Codex && name == "codex-tui"))
-        {
-            found = Some(current);
-            break;
-        }
-        pid = tower_pal::process_identity(current).ok().map(|p| p.parent);
-    }
     let cwd = parsed
         .cwd
         .map(PathBuf::from)
@@ -92,7 +76,7 @@ pub fn report(harness: &str, event: &str) -> Result<()> {
         EventKind::Compacted => Some("compacted"),
         _ => None,
     };
-    let mut report = json!({"harness":h.id(),"native_session_id":native,"pid":found,"cwd":cwd,"display_name":parsed.title,"kind":parsed.kind,"status":status,"detail":{"last_tool":parsed.tool,"model":parsed.model,"effort":parsed.effort,"phase":phase,"context_tokens":parsed.context_tokens},"delivery":endpoint});
+    let mut report = json!({"harness":h.id(),"native_session_id":native,"cwd":cwd,"display_name":parsed.title,"kind":parsed.kind,"status":status,"detail":{"last_tool":parsed.tool,"model":parsed.model,"effort":parsed.effort,"phase":phase,"context_tokens":parsed.context_tokens},"delivery":endpoint});
     let detail = report["detail"].as_object_mut().unwrap();
     if let Some(prompt) = &parsed.prompt {
         detail.insert("last_prompt".into(), json!(prompt));

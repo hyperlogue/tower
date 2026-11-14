@@ -703,6 +703,29 @@ fn descends(pid: u32, ancestor: u32, start: u64) -> bool {
 /// stays well inside the time after which an unseen session counts as lost.
 const HOOK_HEARTBEAT_MS: u64 = 30_000;
 impl Service {
+    /// The nearest process above `pid` that runs `harness`.
+    fn harness_above(&self, pid: u32, harness: &str) -> Option<u32> {
+        let programs = self
+            .backends
+            .iter()
+            .flat_map(|b| b.harnesses())
+            .filter(|h| h.harness == harness)
+            .map(|h| h.executable)
+            .collect::<Vec<_>>();
+        let mut current = tower_pal::process_identity(pid).ok()?.parent;
+        for _ in 0..32 {
+            if current <= 1 {
+                return None;
+            }
+            if tower_pal::process_name(current).is_ok_and(|name| {
+                programs.contains(&name) || (harness == "codex" && name == "codex-tui")
+            }) {
+                return Some(current);
+            }
+            current = tower_pal::process_identity(current).ok()?.parent;
+        }
+        None
+    }
     pub(super) fn hook_report(
         &self,
         request: &Request,
@@ -730,6 +753,11 @@ impl Service {
             && record.ownership == "owned"
         {
             return value(serde_json::json!({"id":record.id,"ignored":true}));
+        }
+        // A caller the kernel identifies is not asked which process it
+        // reports for: the session belongs to the harness it runs under.
+        if let Some(caller) = peer.pid {
+            p.register.pid = self.harness_above(caller, &p.register.harness);
         }
         if let Some(pid) = p.register.pid
             && self
