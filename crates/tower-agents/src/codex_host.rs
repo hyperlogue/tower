@@ -15,59 +15,30 @@ pub async fn ensure(paths: &Paths) -> Result<Host> {
 }
 
 pub async fn ensure_configured(paths: &Paths, config: Config) -> Result<Host> {
-    tower_pal::codex_trace(&format!(
-        "ensure_configured.enter endpoint={} bytes={} managed={} home={} run={}",
-        config.endpoint.display(),
-        config.endpoint.as_os_str().len(),
-        config.managed,
-        paths.home.display(),
-        paths.run.display()
-    ));
-    tower_pal::codex_trace("ensure_configured.await first_connect");
     let mut client = match Client::connect(&config.endpoint).await {
-        Ok(client) => {
-            tower_pal::codex_trace("ensure_configured.first_connect.ok");
-            client
-        }
+        Ok(client) => client,
         Err(Error::Unavailable) if config.managed => {
-            tower_pal::codex_trace("ensure_configured.first_connect.unavailable");
             paths.prepare().map_err(|_| Error::Unavailable)?;
             let lock_path = paths.run.join("codex-start.lock");
-            tower_pal::codex_trace(&format!(
-                "ensure_configured.lock path={} exists={}",
-                lock_path.display(),
-                lock_path.exists()
-            ));
             let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
             let _lock = loop {
                 match SingletonLock::acquire(&lock_path) {
-                    Ok(lock) => {
-                        tower_pal::codex_trace("ensure_configured.lock.acquired");
-                        break lock;
-                    }
+                    Ok(lock) => break lock,
                     Err(e)
                         if e.kind() == std::io::ErrorKind::WouldBlock
                             && tokio::time::Instant::now() < deadline =>
                     {
-                        tower_pal::codex_trace("ensure_configured.lock.busy");
                         tokio::time::sleep(Duration::from_millis(25)).await;
                     }
-                    Err(e) => {
-                        tower_pal::codex_trace(&format!("ensure_configured.lock.error {e}"));
-                        return Err(Error::Unavailable);
-                    }
+                    Err(_) => return Err(Error::Unavailable),
                 }
             };
-            tower_pal::codex_trace("ensure_configured.await second_connect");
             match Client::connect(&config.endpoint).await {
                 Ok(client) => client,
                 Err(Error::Unavailable) => {
-                    tower_pal::codex_trace("ensure_configured.await start_daemon");
                     start_daemon(paths).await?;
-                    tower_pal::codex_trace("ensure_configured.start_daemon.done");
                     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
                     loop {
-                        tower_pal::codex_trace("ensure_configured.await post_start_connect");
                         match Client::connect(&config.endpoint).await {
                             Ok(client) => break client,
                             Err(Error::Unavailable) if tokio::time::Instant::now() < deadline => {
@@ -88,11 +59,9 @@ pub async fn ensure_configured(paths: &Paths, config: Config) -> Result<Host> {
         Err(e) => return Err(e),
     };
     let process = client.process();
-    tower_pal::codex_trace("ensure_configured.await environment/info");
     let info = client
         .request("environment/info", json!({"environmentId":"local"}))
         .await?;
-    tower_pal::codex_trace("ensure_configured.environment/info.done");
     let shell = info
         .pointer("/environment/shell/path")
         .or_else(|| info.pointer("/shell/path"))
@@ -148,18 +117,6 @@ async fn start_daemon(paths: &Paths) -> Result<()> {
     let codex = tower_pal::find_program("codex", &env).ok_or(Error::DaemonStart(
         "could not run because `codex` is not on PATH",
     ))?;
-    let socket = paths
-        .home
-        .join(".codex/app-server-control/app-server-control.sock");
-    tower_pal::codex_trace(&format!(
-        "start_daemon argv={} app-server daemon start cwd={} socket={} socket_bytes={} sun_path_limit=103",
-        codex.display(),
-        paths.home.display(),
-        socket.display(),
-        socket.as_os_str().len()
-    ));
-    tower_pal::codex_trace_env("start_daemon.env", &env);
-    tower_pal::codex_trace("start_daemon.await process");
     let status = tokio::time::timeout(
         Duration::from_secs(60),
         tokio::process::Command::new(codex)
@@ -178,22 +135,10 @@ async fn start_daemon(paths: &Paths) -> Result<()> {
     )
     .await;
     match status {
-        Ok(Ok(status)) if status.success() => {
-            tower_pal::codex_trace("start_daemon.exit 0");
-            Ok(())
-        }
-        Ok(Ok(status)) => {
-            tower_pal::codex_trace(&format!("start_daemon.exit {status}"));
-            Err(Error::DaemonStart("failed"))
-        }
-        Ok(Err(error)) => {
-            tower_pal::codex_trace(&format!("start_daemon.spawn_error {error}"));
-            Err(Error::DaemonStart("could not run"))
-        }
-        Err(_) => {
-            tower_pal::codex_trace("start_daemon.timeout");
-            Err(Error::DaemonStart("did not finish within 60 seconds"))
-        }
+        Ok(Ok(status)) if status.success() => Ok(()),
+        Ok(Ok(_)) => Err(Error::DaemonStart("failed")),
+        Ok(Err(_)) => Err(Error::DaemonStart("could not run")),
+        Err(_) => Err(Error::DaemonStart("did not finish within 60 seconds")),
     }
 }
 

@@ -533,13 +533,6 @@ fn execute(mut cli: Cli) -> Result<()> {
         match command {
             AgentCommand::Env => println!("{}", serde_json::to_string(&tower_pal::environment())?),
             AgentCommand::Run { plan } => {
-                tower_pal::codex_trace(&format!(
-                    "agent.run cwd={} plan={}",
-                    std::env::current_dir()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|e| e.to_string()),
-                    plan.display()
-                ));
                 let code = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?

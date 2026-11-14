@@ -413,7 +413,6 @@ export async function serve(endpoint) {
       else peer.error(id, error instanceof RpcFailure ? error.code : -32603, error instanceof RpcFailure ? error.message : 'fixture operation failed');
     }
   }
-  trace(`serve.listen endpoint=${endpoint} bytes=${Buffer.byteLength(endpoint)}`);
   const server = net.createServer(socket => {
     if (connections.size >= 64) { socket.destroy(); return; }
     connections.add(socket);
@@ -429,34 +428,22 @@ export async function serve(endpoint) {
       peer.onclose = () => { peers.delete(peer); for (const id of [...peer.subscriptions]) unsubscribe(peer, threads.get(id)); };
     }).catch(() => socket.destroy());
   });
-  // macOS can report the listening event before the socket inode exists, and
-  // chmod on an AF_UNIX socket can return ENOTSUP. Either one used to kill
-  // this process after bind, so Tower never saw a daemon.
+  // macOS can report listening before the socket inode exists, and stat or
+  // chmod on an AF_UNIX socket can fail. Exiting over that unlinks the socket,
+  // so the daemon command succeeds while nothing is left listening.
   const previousMask = process.umask(0o077);
   try {
     await new Promise((resolve, reject) => { server.once('error', reject); server.listen(endpoint, resolve); });
-    trace(`serve.listening endpoint=${endpoint}`);
   } finally {
     process.umask(previousMask);
   }
-  for (let attempt = 0; attempt < 50; attempt++) {
-    try {
-      fs.chmodSync(endpoint, 0o600);
-      break;
-    } catch (error) {
-      if (!['ENOENT', 'ENOTSUP', 'EINVAL', 'EPERM'].includes(error.code)) throw error;
-      if (error.code !== 'ENOENT' || attempt === 49) break;
-      await new Promise(resolve => setTimeout(resolve, 10));
-    }
+  let inode = null;
+  for (let attempt = 0; attempt < 50 && !inode; attempt++) {
+    try { fs.chmodSync(endpoint, 0o600); } catch {}
+    try { inode = fs.statSync(endpoint); } catch { inode = null; }
+    if (!inode) await new Promise(resolve => setTimeout(resolve, 10));
   }
-  let inode;
-  for (let attempt = 0; ; attempt++) {
-    try { inode = fs.statSync(endpoint); break; }
-    catch (error) {
-      if (error.code !== 'ENOENT' || attempt === 50) throw error;
-      await new Promise(resolve => setTimeout(resolve, 10));
-    }
-  }
+  process.on('SIGHUP', () => {});
   let phase;
   const timer = setInterval(() => {
     let next;
@@ -476,7 +463,10 @@ export async function serve(endpoint) {
     if (stopped) return; stopped = true; clearInterval(timer);
     for (const socket of connections) socket.destroy();
     server.close();
-    try { const now = fs.statSync(endpoint); if (now.dev === inode.dev && now.ino === inode.ino) fs.unlinkSync(endpoint); } catch {}
+    try {
+      const now = fs.statSync(endpoint);
+      if (!inode || (now.dev === inode.dev && now.ino === inode.ino)) fs.unlinkSync(endpoint);
+    } catch {}
   }
   process.once('SIGTERM', stop); process.once('SIGINT', stop);
   return {server, stop};
@@ -596,11 +586,6 @@ export async function tui(endpoint, args) {
   } catch (error) { peer.socket.destroy(); throw error; }
 }
 
-function trace(message) {
-  const file = process.env.TOWER_CODEX_TRACE;
-  if (!file) return;
-  try { fs.appendFileSync(file, `${Date.now()} pid=${process.pid} ${message}\n`); } catch {}
-}
 const reachable = socket => new Promise(resolve => {
   const probe = net.connect(socket);
   const timer = setTimeout(() => { probe.destroy(); resolve(false); }, 200);
@@ -614,28 +599,30 @@ async function daemon(command) {
   const socket = path.join(root, 'app-server-control.sock');
   const pidFile = path.join(root, 'fixture-daemon.pid');
   if (command === 'start') {
-    trace(`daemon.start socket=${socket} bytes=${Buffer.byteLength(socket)} sun_path_limit=103 cwd=${process.cwd()} home=${process.env.HOME ?? ''} shell=${process.env.SHELL ?? ''}`);
     fs.mkdirSync(root, {recursive: true, mode: 0o700});
     if (!await reachable(socket)) {
       let childError = '';
       const script = fileURLToPath(import.meta.url);
-      trace(`daemon.spawn exe=${process.execPath} script=${script} listen=unix://${socket}`);
       const child = spawn(process.execPath, [script, 'app-server', '--listen', `unix://${socket}`], {detached: true, stdio: ['ignore', 'ignore', 'pipe']});
       child.on('error', error => { childError = (childError + error.message).slice(-800); });
       child.stderr?.setEncoding('utf8');
       child.stderr?.on('data', chunk => { childError = (childError + chunk).slice(-800); });
       fs.writeFileSync(pidFile, String(child.pid ?? ''));
       let up = false;
-      for (let tries = 0; tries < 20 && !up; tries++) {
+      for (let tries = 0; tries < 40 && !up; tries++) {
         if (child.exitCode !== null) break;
-        up = await reachable(socket);
+        up = await reachable(socket) && fs.existsSync(socket);
         if (!up) await new Promise(resolve => setTimeout(resolve, 50));
       }
+      // Stay up only when the listening socket is still on disk. A child that
+      // exits after the first accept unlinks it, and Tower then cannot connect.
+      await new Promise(resolve => setTimeout(resolve, 100));
       // The stderr pipe would keep this process alive after the server is up.
       child.stderr?.destroy();
       child.unref();
-      trace(`daemon.reachable=${up} exit=${child.exitCode} err=${childError.trim()}`);
-      if (!up) throw new Error(`fixture app-server socket did not accept connections${childError ? `: ${childError.trim()}` : ''}`);
+      if (child.exitCode !== null || !fs.existsSync(socket)) {
+        throw new Error(`fixture app-server socket did not accept connections${childError ? `: ${childError.trim()}` : ''}`);
+      }
     }
     process.stdout.write(`${JSON.stringify({status: 'started', socketPath: socket})}\n`);
   } else if (command === 'stop') {

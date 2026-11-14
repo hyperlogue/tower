@@ -70,16 +70,6 @@ impl Fixture {
                 env!("CARGO_BIN_EXE_tower-cli").into(),
             ),
             ("TERM".into(), "xterm-256color".into()),
-            (
-                "TOWER_CODEX_TRACE".into(),
-                std::env::temp_dir()
-                    .join(format!(
-                        "codex-trace-{}",
-                        path.file_name().unwrap_or_default().to_string_lossy()
-                    ))
-                    .display()
-                    .to_string(),
-            ),
             ("TOKIO_WORKER_THREADS".into(), "2".into()),
         ]
         .into();
@@ -243,27 +233,7 @@ async fn output(stream: &mut tower_pal::IpcStream, needle: &str) -> String {
         }
     })
     .await
-    .unwrap_or_else(|_| panic!("terminal output timed out; {}", dump_traces()))
-}
-fn dump_traces() -> String {
-    let mut out = String::new();
-    let Ok(dir) = std::fs::read_dir(std::env::temp_dir()) else {
-        return "no temp dir".into();
-    };
-    for entry in dir.flatten() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if !name.starts_with("codex-trace-") {
-            continue;
-        }
-        let body = std::fs::read_to_string(entry.path()).unwrap_or_default();
-        out.push_str(&format!("\n== {name} ==\n{body}"));
-    }
-    if out.is_empty() {
-        "no trace files".into()
-    } else {
-        out
-    }
+    .expect("terminal output timed out")
 }
 fn image(red: u8) -> Vec<u8> {
     image_size(red, 1, 1)
@@ -698,7 +668,7 @@ async fn attach_binds_stdin_credentials_without_echo_and_rejects_agent_providers
             let mut buf = [0; 8192];
             loop {
                 let n = terminal.read(&mut buf).await.unwrap();
-                assert!(n > 0, "{}", dump_traces());
+                assert!(n > 0);
                 all.push_str(&String::from_utf8_lossy(&buf[..n]));
                 if all.contains(needle) {
                     return all;
