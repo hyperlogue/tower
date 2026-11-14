@@ -101,6 +101,19 @@ pub fn read_state(path: &Path) -> io::Result<RuntimeState> {
 fn save(plan: &LauncherPlan, state: &RuntimeState) -> io::Result<()> {
     tower_pal::write_private(&file(plan), &serde_json::to_vec(state)?)
 }
+/// What a resume after a crash or power loss depends on. The rest of the
+/// state describes the running agent and is reported again as it changes.
+fn lasting(state: &RuntimeState) -> impl PartialEq + use<> {
+    (
+        state.native.as_ref().map(|n| n.id.clone()),
+        state.cwd.clone(),
+        state.agent_pid,
+        state.agent_start_time,
+        state.stop_requested,
+        state.exit_code,
+        state.private.clone(),
+    )
+}
 
 pub fn hook(harness: &str, event: &str) {
     let _ = send_hook(harness, event);
@@ -260,19 +273,34 @@ pub async fn run(path: &Path) -> io::Result<i32> {
         .embedding
         .is_some()
         .then(|| super::session::Attention::new(&state));
+    // Status changes on every tool call; only a change to what a resume
+    // needs waits for the disk.
+    let mut saved = Some(lasting(&state));
     super::session::drive(
         super::agent::task(context),
         updates,
         commands,
         state,
         terminated,
-        |state| match &mut attention {
-            Some(attention) => {
+        |state| {
+            let noted = attention.as_mut().map(|attention| {
                 let mut state = state.clone();
                 attention.note(&mut state);
-                save(&plan, &state)
+                state
+            });
+            let state = noted.as_ref().unwrap_or(state);
+            let now = Some(lasting(state));
+            if now == saved {
+                return tower_pal::write_private_unsynced(
+                    &file(&plan),
+                    &serde_json::to_vec(state)?,
+                );
             }
-            None => save(&plan, state),
+            // A failed write is retried in full.
+            saved = None;
+            save(&plan, state)?;
+            saved = now;
+            Ok(())
         },
     )
     .await

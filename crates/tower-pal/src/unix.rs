@@ -106,13 +106,23 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     write_owned_config(path, bytes)
 }
 
+/// As `write_private`, without waiting for the disk. Readers still see the
+/// old or the new contents, never a mixture; after a power loss the file
+/// may hold either or be empty. For state that its writer can rebuild.
+pub fn write_private_unsynced(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| denied("invalid private file path"))?;
+    require_private_dir(parent)?;
+    write_owned(path, bytes, true, false)
+}
 pub fn write_owned_config(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    write_owned(path, bytes, true)
+    write_owned(path, bytes, true, true)
 }
 pub fn write_new_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    write_owned(path, bytes, false)
+    write_owned(path, bytes, false, true)
 }
-fn write_owned(path: &Path, bytes: &[u8], replace: bool) -> io::Result<()> {
+fn write_owned(path: &Path, bytes: &[u8], replace: bool, sync: bool) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| denied("invalid configuration path"))?;
@@ -134,13 +144,18 @@ fn write_owned(path: &Path, bytes: &[u8], replace: bool) -> io::Result<()> {
     temp.as_file()
         .set_permissions(fs::Permissions::from_mode(0o600))?;
     temp.write_all(bytes)?;
-    temp.as_file().sync_all()?;
+    if sync {
+        temp.as_file().sync_all()?;
+    }
     if replace {
         temp.persist(path).map_err(|e| e.error)?;
     } else {
         temp.persist_noclobber(path).map_err(|e| e.error)?;
     }
-    File::open(parent)?.sync_all()
+    if sync {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 pub fn remove_private(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
