@@ -28,6 +28,49 @@ pub use pty::*;
 #[cfg(not(unix))]
 compile_error!("tower currently supports Linux and macOS");
 
+/// Appends one line to `TOWER_CODEX_TRACE` when that variable names a file.
+/// Absent variable does nothing. Secret-looking values are not written.
+pub fn codex_trace(message: &str) {
+    let Ok(path) = env::var("TOWER_CODEX_TRACE") else {
+        return;
+    };
+    if path.is_empty() {
+        return;
+    }
+    let line = format!(
+        "{} pid={} {message}\n",
+        command::monotonic_ms(),
+        std::process::id()
+    );
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        use std::io::Write;
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+pub fn codex_trace_env(label: &str, env: &command::Environment) {
+    if env::var_os("TOWER_CODEX_TRACE").is_none() {
+        return;
+    }
+    let mut parts = Vec::new();
+    for (key, value) in env {
+        let secret = key.contains("TOKEN")
+            || key.contains("SECRET")
+            || key.contains("PASSWORD")
+            || key.contains("AUTHORIZATION");
+        if secret {
+            parts.push(format!("{key}=<redacted {} bytes>", value.len()));
+        } else if value.len() > 300 {
+            parts.push(format!("{key}=<{} bytes>", value.len()));
+        } else {
+            parts.push(format!("{key}={value}"));
+        }
+    }
+    codex_trace(&format!("{label} {}", parts.join(" ")));
+}
 fn home() -> io::Result<PathBuf> {
     env::var_os("HOME")
         .map(PathBuf::from)

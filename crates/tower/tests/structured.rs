@@ -65,6 +65,17 @@ impl Fixture {
             .env("XDG_STATE_HOME", self.root.path().join("state"))
             .env("XDG_CONFIG_HOME", self.root.path().join("config"))
             .env("TOKIO_WORKER_THREADS", "2")
+            .env(
+                "TOWER_CODEX_TRACE",
+                std::env::temp_dir().join(format!(
+                    "codex-trace-{}",
+                    self.root
+                        .path()
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                )),
+            )
             .current_dir(self.root.path());
         c
     }
@@ -150,7 +161,7 @@ impl Server {
             }
         })
         .await
-        .unwrap()
+        .unwrap_or_else(|_| panic!("timed out waiting; {}", dump_traces()))
     }
     async fn start(f: &Fixture) -> Self {
         Self::start_with_retirement(f, false).await
@@ -260,6 +271,26 @@ impl Server {
         };
         server.until(|v| v["method"] == "policy.ack").await;
         server
+    }
+}
+fn dump_traces() -> String {
+    let mut out = String::new();
+    let Ok(dir) = std::fs::read_dir(std::env::temp_dir()) else {
+        return "no temp dir".into();
+    };
+    for entry in dir.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with("codex-trace-") {
+            continue;
+        }
+        let body = std::fs::read_to_string(entry.path()).unwrap_or_default();
+        out.push_str(&format!("\n== {name} ==\n{body}"));
+    }
+    if out.is_empty() {
+        "no trace files".into()
+    } else {
+        out
     }
 }
 fn command(id: &str, runtime: &str, kind: &str, payload: Value) -> Value {

@@ -413,6 +413,7 @@ export async function serve(endpoint) {
       else peer.error(id, error instanceof RpcFailure ? error.code : -32603, error instanceof RpcFailure ? error.message : 'fixture operation failed');
     }
   }
+  trace(`serve.listen endpoint=${endpoint} bytes=${Buffer.byteLength(endpoint)}`);
   const server = net.createServer(socket => {
     if (connections.size >= 64) { socket.destroy(); return; }
     connections.add(socket);
@@ -434,6 +435,7 @@ export async function serve(endpoint) {
   const previousMask = process.umask(0o077);
   try {
     await new Promise((resolve, reject) => { server.once('error', reject); server.listen(endpoint, resolve); });
+    trace(`serve.listening endpoint=${endpoint}`);
   } finally {
     process.umask(previousMask);
   }
@@ -594,6 +596,11 @@ export async function tui(endpoint, args) {
   } catch (error) { peer.socket.destroy(); throw error; }
 }
 
+function trace(message) {
+  const file = process.env.TOWER_CODEX_TRACE;
+  if (!file) return;
+  try { fs.appendFileSync(file, `${Date.now()} pid=${process.pid} ${message}\n`); } catch {}
+}
 const reachable = socket => new Promise(resolve => {
   const probe = net.connect(socket);
   const timer = setTimeout(() => { probe.destroy(); resolve(false); }, 200);
@@ -607,11 +614,13 @@ async function daemon(command) {
   const socket = path.join(root, 'app-server-control.sock');
   const pidFile = path.join(root, 'fixture-daemon.pid');
   if (command === 'start') {
-    process.stderr.write('codex fixture: daemon start\n');
+    trace(`daemon.start socket=${socket} bytes=${Buffer.byteLength(socket)} sun_path_limit=103 cwd=${process.cwd()} home=${process.env.HOME ?? ''} shell=${process.env.SHELL ?? ''}`);
     fs.mkdirSync(root, {recursive: true, mode: 0o700});
     if (!await reachable(socket)) {
       let childError = '';
-      const child = spawn(process.execPath, [fileURLToPath(import.meta.url), 'app-server', '--listen', `unix://${socket}`], {detached: true, stdio: ['ignore', 'ignore', 'pipe']});
+      const script = fileURLToPath(import.meta.url);
+      trace(`daemon.spawn exe=${process.execPath} script=${script} listen=unix://${socket}`);
+      const child = spawn(process.execPath, [script, 'app-server', '--listen', `unix://${socket}`], {detached: true, stdio: ['ignore', 'ignore', 'pipe']});
       child.on('error', error => { childError = (childError + error.message).slice(-800); });
       child.stderr?.setEncoding('utf8');
       child.stderr?.on('data', chunk => { childError = (childError + chunk).slice(-800); });
@@ -625,6 +634,7 @@ async function daemon(command) {
       // The stderr pipe would keep this process alive after the server is up.
       child.stderr?.destroy();
       child.unref();
+      trace(`daemon.reachable=${up} exit=${child.exitCode} err=${childError.trim()}`);
       if (!up) throw new Error(`fixture app-server socket did not accept connections${childError ? `: ${childError.trim()}` : ''}`);
     }
     process.stdout.write(`${JSON.stringify({status: 'started', socketPath: socket})}\n`);

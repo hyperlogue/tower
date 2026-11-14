@@ -68,6 +68,17 @@ impl Fixture {
                 ),
             )
             .env("TOWER_TEST_BIN", env!("CARGO_BIN_EXE_tower-cli"))
+            .env(
+                "TOWER_CODEX_TRACE",
+                std::env::temp_dir().join(format!(
+                    "codex-trace-{}",
+                    self.root
+                        .path()
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                )),
+            )
             .env("TOKIO_WORKER_THREADS", "2")
             .env("TERM", "xterm-256color")
             .current_dir(self.root.path());
@@ -92,11 +103,20 @@ impl Fixture {
             }
             assert!(
                 Instant::now() < until,
-                "expected {status}: {row}; snapshot {}",
+                "expected {status}: {row}; snapshot {}; trace {}",
                 self.command(&["--json", "snapshot", id])
                     .output()
                     .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
-                    .unwrap_or_default()
+                    .unwrap_or_default(),
+                std::fs::read_to_string(std::env::temp_dir().join(format!(
+                    "codex-trace-{}",
+                    self.root
+                        .path()
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                )))
+                .unwrap_or_else(|error| format!("unread trace: {error}"))
             );
             thread::sleep(Duration::from_millis(40));
         }

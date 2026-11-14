@@ -149,14 +149,31 @@ pub async fn start(
     config: Config,
 ) -> io::Result<Server> {
     let (executable, clipboard) = (host.exe.clone(), host.daemon);
+    tower_pal::codex_trace(&format!(
+        "app_server.await ensure_configured endpoint={} endpoint_bytes={} sun_path_limit=103 cwd={}",
+        config.endpoint.display(),
+        config.endpoint.as_os_str().len(),
+        plan.spec.cwd
+    ));
     let host = tower_agents::codex_host::ensure_configured(&host.paths, config)
         .await
         .map_err(io::Error::other)?;
+    tower_pal::codex_trace(&format!(
+        "app_server.ensure_configured.done pid={:?} shell={}",
+        host.process.as_ref().map(|p| p.pid),
+        host.shell.display()
+    ));
     if host.process.is_none() {
         return Err(io::Error::other("Cannot verify Codex service identity"));
     }
     let relay_path = Path::new(&plan.control_socket).with_extension("relay.sock");
+    tower_pal::codex_trace(&format!(
+        "app_server.relay path={} bytes={}",
+        relay_path.display(),
+        relay_path.as_os_str().len()
+    ));
     let listener = tower_pal::IpcListener::bind(&relay_path).await?;
+    tower_pal::codex_trace("app_server.relay.bound");
     let shared = Arc::new(Shared {
         state: Mutex::new(State::default()),
         paused: AtomicBool::new(false),

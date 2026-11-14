@@ -153,13 +153,38 @@ pub async fn connect(path: &Path) -> Result<Connection> {
     if !path.is_absolute() {
         return Err(Error::Config("Codex socket path must be absolute"));
     }
-    let resolved = tower_pal::require_private_socket(path).map_err(|_| Error::Unavailable)?;
+    let resolved = match tower_pal::require_private_socket(path) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            tower_pal::codex_trace(&format!(
+                "codex_connect.socket_unavailable path={} bytes={} error={error}",
+                path.display(),
+                path.as_os_str().len()
+            ));
+            return Err(Error::Unavailable);
+        }
+    };
+    tower_pal::codex_trace(&format!(
+        "codex_connect.await socket={} bytes={}",
+        resolved.display(),
+        resolved.as_os_str().len()
+    ));
     tokio::time::timeout(REQUEST_TIMEOUT, async {
-        let stream = tower_pal::connect(&resolved)
-            .await
-            .map_err(|_| Error::Unavailable)?;
-        let peer = tower_pal::peer(&stream).map_err(|_| Error::Unavailable)?;
+        let stream = tower_pal::connect(&resolved).await.map_err(|error| {
+            tower_pal::codex_trace(&format!("codex_connect.connect_error {error}"));
+            Error::Unavailable
+        })?;
+        tower_pal::codex_trace("codex_connect.connected");
+        let peer = tower_pal::peer(&stream).map_err(|error| {
+            tower_pal::codex_trace(&format!("codex_connect.peer_error {error}"));
+            Error::Unavailable
+        })?;
         if peer.uid != tower_pal::uid() {
+            tower_pal::codex_trace(&format!(
+                "codex_connect.peer_uid {} != {}",
+                peer.uid,
+                tower_pal::uid()
+            ));
             return Err(Error::Unavailable);
         }
         let process = peer
@@ -169,10 +194,15 @@ pub async fn connect(path: &Path) -> Result<Connection> {
             .max_message_size(Some(MAX_MESSAGE))
             .max_frame_size(Some(MAX_MESSAGE))
             .max_write_buffer_size(MAX_MESSAGE + MAX_REQUEST);
+        tower_pal::codex_trace("codex_connect.await websocket");
         let (socket, _) =
             tokio_tungstenite::client_async_with_config("ws://localhost/", stream, Some(limits))
                 .await
-                .map_err(|_| Error::Unavailable)?;
+                .map_err(|error| {
+                    tower_pal::codex_trace(&format!("codex_connect.websocket_error {error}"));
+                    Error::Unavailable
+                })?;
+        tower_pal::codex_trace("codex_connect.websocket_ok");
         Ok(Connection {
             socket,
             peer,
@@ -180,7 +210,10 @@ pub async fn connect(path: &Path) -> Result<Connection> {
         })
     })
     .await
-    .map_err(|_| Error::Timeout)?
+    .map_err(|_| {
+        tower_pal::codex_trace("codex_connect.timeout");
+        Error::Timeout
+    })?
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

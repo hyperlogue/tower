@@ -69,9 +69,18 @@ async fn configure(
     state: &mut RuntimeState,
     token: String,
 ) -> io::Result<Box<dyn AgentAdapter>> {
+    tower_pal::codex_trace(&format!(
+        "configure.enter harness={:?} cwd={} control={} control_bytes={}",
+        plan.spec.harness,
+        plan.spec.cwd,
+        plan.control_socket,
+        plan.control_socket.len()
+    ));
     let Host { exe, paths, daemon } = host(plan)?;
+    tower_pal::codex_trace("configure.await project_environment");
     let mut env =
         project_environment(Path::new(&plan.spec.cwd), &exe, tower_pal::environment()).await?;
+    tower_pal::codex_trace("configure.project_environment.done");
     let config = match plan.spec.harness.definition().execution(&plan.spec) {
         tower_agents::definition::Execution::Hooks => None,
         tower_agents::definition::Execution::CodexAppServer => Some(
@@ -211,18 +220,34 @@ async fn serve(
 ) -> io::Result<i32> {
     let mut invocation = configured.invocation;
     let token = configured.token;
+    tower_pal::codex_trace(&format!(
+        "serve.enter harness={:?} cwd={} control={} control_bytes={} codex={}",
+        plan.spec.harness,
+        plan.spec.cwd,
+        plan.control_socket,
+        plan.control_socket.len(),
+        codex.is_some()
+    ));
     let host = host(plan)?;
     state.private.insert(
         "pty_supported".into(),
         (host.daemon && super::injection::supported(&host.paths).await).into(),
     );
     let (paths, daemon) = (&host.paths, host.daemon);
+    tower_pal::codex_trace("serve.await control_socket.bind");
     let listener = IpcListener::bind(Path::new(&plan.control_socket)).await?;
+    tower_pal::codex_trace("serve.control_socket.bound");
     let (observations, mut observed) = mpsc::channel(128);
     let mut server = if let Some(config) = codex {
+        tower_pal::codex_trace(&format!(
+            "serve.await app_server.start endpoint={} endpoint_bytes={}",
+            config.endpoint.display(),
+            config.endpoint.as_os_str().len()
+        ));
         match super::app_server::start(plan, &host, &mut invocation, observations, config).await {
             Ok(server) => Some(server),
             Err(e) => {
+                tower_pal::codex_trace(&format!("serve.app_server.error {e}"));
                 // The session's terminal is where the person launching it looks.
                 eprintln!("tower: {e}");
                 state.detail.error = Some("app_server_unavailable".into());
@@ -246,8 +271,15 @@ async fn serve(
         state.stop_requested = true;
         return Ok(143);
     }
+    tower_pal::codex_trace(&format!(
+        "serve.spawn argv={} cwd={}",
+        invocation.argv.join(" "),
+        plan.spec.cwd
+    ));
+    tower_pal::codex_trace_env("serve.spawn.env", &invocation.env);
     let mut child =
         tower_pal::spawn_inherited(&invocation.argv, &invocation.env, Path::new(&plan.spec.cwd))?;
+    tower_pal::codex_trace(&format!("serve.spawned pid={:?}", child.id()));
     let mut activity = plan.spec.harness.definition().hook_session(&invocation.env);
     activity.start();
     state.agent_pid = child.id();
