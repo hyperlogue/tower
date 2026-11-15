@@ -709,6 +709,7 @@ fn relocated_bundle_preserves_owned_session_and_attach_streams_on_restart() {
     output(&mut a, b"READY");
     let mut b = attach();
     output(&mut b, b"READY");
+    wait_for(|| f.run(&["get", id])["attach_count"] == 2);
     let record = f.run(&["get", id]);
     assert_eq!(record["ownership"], "owned");
     assert_eq!(record["attach_count"], 2);
@@ -918,7 +919,6 @@ async fn a_cancelled_partial_response_requires_a_fresh_client_connection() {
 
 #[test]
 fn native_messaging_approval_retry_and_persistent_privacy() {
-    use std::io::{BufRead, BufReader as SyncReader};
     use std::os::unix::net::UnixListener;
     let f = Fixture::new();
     let inbox_dir = PathBuf::from(format!("/tmp/cc-socks-{}", tower_pal::uid()));
@@ -933,14 +933,25 @@ fn native_messaging_approval_retry_and_persistent_privacy() {
     let read = std::thread::spawn(move || {
         let until = Instant::now() + Duration::from_secs(15);
         while Instant::now() < until {
-            if let Ok((stream, _)) = listener.accept() {
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-                let lines = SyncReader::new(stream)
+            if let Ok((mut stream, _)) = listener.accept() {
+                use std::io::Read;
+                stream.set_nonblocking(true).unwrap();
+                let mut bytes = Vec::new();
+                loop {
+                    match stream.read_to_end(&mut bytes) {
+                        Ok(_) => break,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < until, "inbox sender did not close");
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("inbox read failed: {error}"),
+                    }
+                }
+                let lines = String::from_utf8(bytes)
+                    .unwrap()
                     .lines()
-                    .collect::<std::io::Result<Vec<_>>>()
-                    .unwrap();
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
                 received.send(lines).unwrap();
                 return;
             }
@@ -1429,6 +1440,7 @@ async fn startup_retries_only_the_handshake_not_an_uncertain_mutation() {
 fn a_hook_updates_its_session_only_from_below_the_session_process() {
     use std::io::{BufRead, BufReader, Write};
     let f = Fixture::new();
+    f.run(&["daemon", "status"]);
     let bin = f.dir.path().join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let harness = bin.join("claude");

@@ -612,6 +612,6 @@ async function main() {
     await tui(endpoint.slice(7), args);
   }
 }
-if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
+if (process.argv[1] && pathToFileURL(fs.realpathSync(process.argv[1])).href === import.meta.url) {
   main().catch(error => { process.stderr.write(`codex fixture: ${error.message}\n`); process.exitCode = 1; });
 }

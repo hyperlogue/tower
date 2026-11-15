@@ -718,7 +718,18 @@ impl Service {
                 return None;
             }
             if tower_pal::process_name(current).is_ok_and(|name| {
-                programs.contains(&name) || (harness == "codex" && name == "codex-tui")
+                programs.contains(&name)
+                    || (harness == "codex" && name == "codex-tui")
+                    || (matches!(
+                        name.as_str(),
+                        "sh" | "bash" | "node" | "bun" | "python" | "python3"
+                    ) && tower_pal::inspect_process(current).is_ok_and(|process| {
+                        process.argv.iter().take(2).any(|arg| {
+                            std::path::Path::new(arg).file_name().is_some_and(|name| {
+                                programs.iter().any(|program| name == program.as_str())
+                            })
+                        })
+                    }))
             }) {
                 return Some(current);
             }

@@ -320,6 +320,45 @@ fn exit_handle(pid: u32) -> io::Result<Option<std::os::fd::OwnedFd>> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn inspecting_a_script_preserves_arguments_and_open_files() {
+        use std::io::BufRead;
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("tower-test-agent");
+        let data = dir.path().join("transcript");
+        std::fs::write(&data, "").unwrap();
+        std::fs::write(&script, "#!/bin/sh\nexec 3<\"$1\"\necho ready\nread line\n").unwrap();
+        crate::make_executable(&script).unwrap();
+        let mut child = std::process::Command::new(&script)
+            .arg(&data)
+            .current_dir(dir.path())
+            .env_clear()
+            .env("TOWER_AGENT_ID", "inspection-test")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        let inspected = super::inspect_process(child.id());
+        let files = super::open_files(child.id());
+        drop(child.stdin.take());
+        child.wait().unwrap();
+        let inspected = inspected.unwrap();
+        assert!(
+            inspected
+                .argv
+                .iter()
+                .take(2)
+                .any(|arg| std::path::Path::new(arg) == script)
+        );
+        assert_eq!(inspected.cwd, dir.path().canonicalize().unwrap());
+        #[cfg(target_os = "linux")]
+        assert_eq!(inspected.tower_agent.as_deref(), Some("inspection-test"));
+        assert!(files.unwrap().contains(&data.canonicalize().unwrap()));
+    }
     #[tokio::test]
     async fn process_exit_resolves_when_the_watched_incarnation_ends() {
         let mut child = std::process::Command::new("sleep")

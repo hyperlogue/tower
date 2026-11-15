@@ -618,7 +618,7 @@ mod tests {
         assert!(SingletonLock::acquire(&lockpath).is_err());
         let listener = IpcListener::bind(&path).await.unwrap();
         let stream = connect(&path).await.unwrap();
-        let (_, p) = listener.accept().await.unwrap();
+        let (_accepted, p) = listener.accept().await.unwrap();
         assert_eq!(p.uid, uid());
         assert_eq!(peer(&stream).unwrap().uid, uid());
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);

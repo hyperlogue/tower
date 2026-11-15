@@ -121,11 +121,20 @@ impl Paths {
     }
     pub fn display_cwd(&self, input: &str) -> io::Result<String> {
         let normalized = self.absolute_cwd(input)?;
-        Ok(match normalized.strip_prefix(&self.home) {
-            Ok(rest) if rest.as_os_str().is_empty() => "~".into(),
-            Ok(rest) => format!("~/{}", rest.display()),
-            Err(_) => normalized.to_string_lossy().into_owned(),
-        })
+        let canonical_home = self
+            .home
+            .canonicalize()
+            .unwrap_or_else(|_| self.home.clone());
+        Ok(
+            match normalized
+                .strip_prefix(&self.home)
+                .or_else(|_| normalized.strip_prefix(&canonical_home))
+            {
+                Ok(rest) if rest.as_os_str().is_empty() => "~".into(),
+                Ok(rest) => format!("~/{}", rest.display()),
+                Err(_) => normalized.to_string_lossy().into_owned(),
+            },
+        )
     }
     pub fn absolute_cwd(&self, input: &str) -> io::Result<PathBuf> {
         let path = if input == "~" {
@@ -228,4 +237,32 @@ pub fn read_config(path: &Path) -> io::Result<Option<String>> {
 
 pub fn operating_system() -> &'static str {
     std::env::consts::OS
+}
+
+#[cfg(test)]
+mod path_tests {
+    #[test]
+    fn a_canonical_working_directory_under_an_aliased_home_stays_relative() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&home, &alias).unwrap();
+        let mut paths = super::Paths::rooted(dir.path().join("state")).unwrap();
+        paths.home = alias.clone();
+        let canonical = home.canonicalize().unwrap();
+        assert_eq!(paths.display_cwd(canonical.to_str().unwrap()).unwrap(), "~");
+        assert_eq!(
+            paths
+                .display_cwd(canonical.join("deleted").to_str().unwrap())
+                .unwrap(),
+            "~/deleted"
+        );
+        assert_eq!(
+            paths
+                .display_cwd(alias.join("deleted").to_str().unwrap())
+                .unwrap(),
+            "~/deleted"
+        );
+    }
 }

@@ -6,6 +6,21 @@ use std::{
 };
 use tokio::sync::watch;
 
+fn observable_path(path: &Path) -> PathBuf {
+    let path = if path.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        path
+    };
+    if let Ok(path) = path.canonicalize() {
+        return path;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => observable_path(parent).join(name),
+        _ => path.to_path_buf(),
+    }
+}
+
 pub struct FileWatch {
     _watcher: notify::RecommendedWatcher,
     #[cfg(target_os = "macos")]
@@ -15,7 +30,11 @@ pub struct FileWatch {
 impl FileWatch {
     pub fn new(paths: &[PathBuf]) -> io::Result<Self> {
         let (updates, changes) = watch::channel(0u64);
-        let targets = paths.to_vec();
+        let paths = paths
+            .iter()
+            .map(|path| observable_path(path))
+            .collect::<Vec<_>>();
+        let targets = paths.clone();
         #[cfg(target_os = "macos")]
         let vnodes = {
             let updates = updates.clone();
@@ -46,7 +65,7 @@ impl FileWatch {
             })
             .map_err(io::Error::other)?;
         let mut roots = BTreeSet::new();
-        for path in paths {
+        for path in &paths {
             let parent = path.parent().unwrap_or(Path::new("."));
             if let Some(root) = parent.ancestors().find(|p| p.is_dir()) {
                 roots.insert(root.to_path_buf());
@@ -316,6 +335,20 @@ mod vnode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn creation_through_a_directory_alias_is_observed() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let alias = dir.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let target = alias.join("state");
+        let mut watch = FileWatch::new(std::slice::from_ref(&target)).unwrap();
+        std::fs::write(real.join("state"), "created").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), watch.changed())
+            .await
+            .unwrap();
+    }
     #[tokio::test]
     async fn native_file_replacement_is_observed_without_read_feedback() {
         let dir = tempfile::tempdir().unwrap();

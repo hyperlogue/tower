@@ -959,7 +959,8 @@ mod tests {
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>();
-            let path = std::env::temp_dir().join(format!("tower-relay-{suffix}"));
+            // The default macOS temporary path can exceed the Unix socket limit.
+            let path = PathBuf::from("/tmp").join(format!("tower-relay-{suffix}"));
             tower_pal::private_dir(&path).unwrap();
             Self(path)
         }

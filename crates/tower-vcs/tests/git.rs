@@ -853,6 +853,7 @@ async fn missing_relative_worktree_keeps_its_administrative_identity() {
     let binding = tower_vcs::discover(&path).await.unwrap().source;
     let pointer = std::fs::read_to_string(binding.git_dir.join("gitdir")).unwrap();
     assert!(!Path::new(pointer.trim()).is_absolute());
+    let path = path.canonicalize().unwrap();
     std::fs::remove_dir_all(&path).unwrap();
     let discovery = tower_vcs::discover(&binding.common_dir).await.unwrap();
     let missing = discovery

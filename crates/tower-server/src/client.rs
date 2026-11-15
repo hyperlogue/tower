@@ -44,6 +44,7 @@ impl Client {
                             error.kind(),
                             io::ErrorKind::ConnectionReset
                                 | io::ErrorKind::ConnectionAborted
+                                | io::ErrorKind::NotConnected
                                 | io::ErrorKind::BrokenPipe
                                 | io::ErrorKind::UnexpectedEof
                         ) =>

@@ -173,7 +173,7 @@ mod tests {
         let exe = Path::new("/opt/tower-cli");
         configure(exe, &mut env, &mut argv).unwrap();
         assert_eq!(argv, ["codex", "--profile", "tower", "--enable", "hooks"]);
-        let path = root.join("tower.config.toml");
+        let path = root.canonicalize().unwrap().join("tower.config.toml");
         let first = std::fs::read_to_string(&path).unwrap();
         assert!(!first.contains("dangerously"));
         assert!(!root.join("config.toml").exists());
