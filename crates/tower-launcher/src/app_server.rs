@@ -36,6 +36,7 @@ struct State {
 }
 struct Shared {
     state: Mutex<State>,
+    selection: tokio::sync::watch::Sender<()>,
     paused: AtomicBool,
     gate: RwLock<()>,
     next_snapshot: AtomicU64,
@@ -159,6 +160,7 @@ pub async fn start(
     let listener = tower_pal::IpcListener::bind(&relay_path).await?;
     let shared = Arc::new(Shared {
         state: Mutex::new(State::default()),
+        selection: tokio::sync::watch::channel(()).0,
         paused: AtomicBool::new(false),
         gate: RwLock::new(()),
         next_snapshot: AtomicU64::new(0),
@@ -488,13 +490,12 @@ async fn bridge(
     let mut native_requests = BTreeSet::new();
     let mut next_message = 0u64;
     let mut client_open = true;
-    // Once its client is gone a relay stays only until another connection
-    // selects a conversation or its own requests are answered. The first is
-    // not signalled, so it is checked on a timer, and only then.
-    let mut tick = tokio::time::interval(Duration::from_millis(100));
+    // A disconnected selected relay still receives native notifications until
+    // another connection selects a conversation and its pending requests finish.
+    let mut selection = shared.selection.subscribe();
     loop {
         tokio::select! {
-            _=tick.tick(),if !client_open=>{},
+            _=selection.changed(),if !client_open=>{},
             Some(submission)=submissions.recv()=> {
                 let _gate=shared.gate.read().await;
                 if shared.paused.load(Ordering::Acquire) || monitor.thread.as_deref()!=Some(&submission.thread) || messages.len()>=16 {
@@ -580,6 +581,7 @@ async fn bridge(
                             state.selecting=false;
                             if let Some(event)=&event && let Some(id)=&event.native_id {
                                 state.selected=Some((connection,id.clone()));
+                                shared.selection.send_replace(());
                                 let mut options=options;
                                 for field in ["model","modelProvider","approvalPolicy","approvalsReviewer","sandbox","reasoningEffort"] {
                                     if !value["result"][field].is_null() {options[field]=value["result"][field].clone();}
@@ -1042,6 +1044,7 @@ mod tests {
                 options: BTreeMap::from([("owned".into(), json!({"cwd":"/work"}))]),
                 ..Default::default()
             }),
+            selection: tokio::sync::watch::channel(()).0,
             paused: AtomicBool::new(false),
             gate: RwLock::new(()),
             next_snapshot: AtomicU64::new(0),
@@ -1115,6 +1118,56 @@ mod tests {
                     || request["params"]["threadId"] == "owned")
         );
     }
+    #[tokio::test]
+    async fn disconnected_selected_relay_sleeps_without_periodic_wakeups() {
+        let fixture = fake(|_| panic!("idle relay must not send requests")).await;
+        let root = Directory::new();
+        let listener = tower_pal::IpcListener::bind(&root.0.join("relay.sock"))
+            .await
+            .unwrap();
+        let shared = shared(fixture.config.clone());
+        let (observations, _observed) = mpsc::channel(16);
+        let (_messages, submissions) = mpsc::channel(4);
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = polls.clone();
+        let selected = shared.clone();
+        let worker = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let relay = bridge(0, stream, shared, observations, submissions);
+            tokio::pin!(relay);
+            std::future::poll_fn(|cx| {
+                counted.fetch_add(1, Ordering::Relaxed);
+                std::future::Future::poll(relay.as_mut(), cx)
+            })
+            .await
+        });
+        let mut client = codex_service::connect(&root.0.join("relay.sock"))
+            .await
+            .unwrap()
+            .socket;
+        client.close(None).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let before = polls.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let wakes = polls.load(Ordering::Relaxed) - before;
+        let ended = worker.is_finished();
+        selected.state.lock().unwrap().selected = Some((1, "replacement".into()));
+        selected.selection.send_replace(());
+        let retired = tokio::time::timeout(Duration::from_millis(50), worker).await;
+        assert!(
+            !ended,
+            "selected relay must remain available for native notifications"
+        );
+        assert_eq!(
+            wakes, 0,
+            "idle disconnected relay was polled without an event"
+        );
+        retired
+            .expect("selection change must wake the old relay")
+            .unwrap()
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn relay_never_forwards_or_answers_another_threads_approval() {
         let fixture=fake(|request|match request["method"].as_str().unwrap(){
