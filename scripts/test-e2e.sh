@@ -11,8 +11,9 @@ test -x "$(dirname "$TOWER_TEST_BIN")/tower"
 test -x "$(dirname "$TOWER_TEST_BIN")/tower-terminal-pool"
 test -f "$TRACETAPE_ROOT/src/index.ts"
 export TOWER_TEST_SCRIPT="$tower_test_root/tests/e2e/replay.mjs"
+# Bound detached daemons to the replay process, including aborted runs.
 # shellcheck disable=SC2016
-exec unshare --user --map-root-user --net bash -c '
+exec unshare --user --map-root-user --net --pid --fork --kill-child --mount-proc bash -c '
   set -euo pipefail
   ip link set lo up
   test -z "$(ip route show)"

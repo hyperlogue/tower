@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdtemp, mkdir, readFile, writeFile, rm, symlink } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, readdir, writeFile, rm, symlink } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { networkInterfaces } from "node:os";
 import { pathToFileURL } from "node:url";
 
 assert.equal(process.env.TOWER_TEST_OFFLINE, "1", "run scripts/test-e2e.sh");
+assert.equal(process.pid, 1, "replay must run as the init process of its private PID namespace");
 assert.deepEqual(Object.keys(networkInterfaces()), ["lo"], "only loopback networking is allowed");
 const root = await mkdtemp("/tmp/tower-replay-");
 const tapeRoot = resolve(process.env.TRACETAPE_ROOT);
@@ -78,7 +79,14 @@ async function fixture(agent, name, content = "fixture-value\n") {
   return {
     dir, home, work, env, bindings, rpc,
     async close() {
-      for (const [binary, args] of [[pool, ["stop"]], ["codex", ["app-server", "daemon", "stop"]], [tower, ["--no-start", "daemon", "stop"]]]) await subprocess(binary, args, env, work).catch(() => {});
+      const failures = [];
+      for (const [binary, args] of [[pool, ["stop"]], ["codex", ["app-server", "daemon", "stop"]], [tower, ["--no-start", "daemon", "stop"]]]) {
+        try {
+          const result = await subprocess(binary, args, env, work);
+          if (result.code !== 0 && binary !== "codex") failures.push(`${args.join(" ")}: exit ${result.code}`);
+        } catch (error) { failures.push(error.message); }
+      }
+      assert.equal(failures.length, 0, `test shutdown failed: ${failures.join("; ")}`);
     },
     async launch(url) {
       if (agent === "codex") await writeFile(join(home, ".codex/config.toml"), [
@@ -197,4 +205,30 @@ try {
     }
     console.log(agent + ": real tool execution, sanitized capture, relocated replay, changed-output rejection passed");
   }
-} finally { await rm(root, { recursive: true, force: true }); }
+} finally {
+  const forced = [];
+  const alive = async pid => {
+    try {
+      const stat = await readFile(`/proc/${pid}/stat`, "utf8");
+      return !["Z", "X"].includes(stat.slice(stat.lastIndexOf(")") + 2, stat.lastIndexOf(")") + 3));
+    } catch (error) { if (error.code === "ENOENT") return false; throw error; }
+  };
+  // This /proc belongs exclusively to the test's PID namespace.
+  for (const entry of await readdir("/proc")) {
+    if (!/^\d+$/.test(entry) || Number(entry) === process.pid) continue;
+    let name;
+    try { name = (await readFile(`/proc/${entry}/comm`, "utf8")).trim(); }
+    catch (error) { if (error.code === "ENOENT") continue; throw error; }
+    if (!["tower", "tower-cli", "tower-terminal-"].includes(name) || !await alive(entry)) continue;
+    console.error(`Test shutdown failed; force-killing namespace-owned ${name} PID ${entry}`);
+    try { process.kill(Number(entry), "SIGKILL"); forced.push(entry); }
+    catch (error) { if (error.code !== "ESRCH") throw error; }
+  }
+  const deadline = Date.now() + 3000;
+  while ((await Promise.all(forced.map(alive))).some(Boolean)) {
+    assert(Date.now() < deadline, "forced test cleanup did not finish; state preserved");
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  await rm(root, { recursive: true, force: true });
+  if (forced.length) process.exitCode = 1;
+}
