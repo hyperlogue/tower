@@ -674,7 +674,7 @@ async fn attach_binds_stdin_credentials_without_echo_and_rejects_agent_providers
             let mut buf = [0; 8192];
             loop {
                 let n = terminal.read(&mut buf).await.unwrap();
-                assert!(n > 0);
+                assert!(n > 0, "attach exited before {needle:?}: {all}");
                 all.push_str(&String::from_utf8_lossy(&buf[..n]));
                 if all.contains(needle) {
                     return all;

@@ -207,20 +207,57 @@ pub struct LocalTerminal {
     input: AsyncFd<File>,
     output: AsyncFd<File>,
 }
+
+fn open_terminal() -> io::Result<File> {
+    #[cfg(target_os = "macos")]
+    let path = {
+        use libproc::libproc::{bsd_info::BSDInfo, proc_pid::pidinfo};
+        use std::{ffi::CStr, os::unix::ffi::OsStrExt};
+        unsafe extern "C" {
+            fn devname_r(
+                dev: libc::dev_t,
+                kind: libc::mode_t,
+                buffer: *mut libc::c_char,
+                length: libc::c_int,
+            ) -> *mut libc::c_char;
+        }
+        let info = pidinfo::<BSDInfo>(std::process::id() as i32, 0).map_err(io::Error::other)?;
+        if info.e_tdev == u32::MAX {
+            return Err(io::Error::other("No controlling terminal"));
+        }
+        let mut name = [0; 128];
+        // /dev/tty is an indirect device on Darwin and cannot be registered
+        // with kqueue. Resolve this process's controlling device instead.
+        let result = unsafe {
+            devname_r(
+                info.e_tdev as libc::dev_t,
+                libc::S_IFCHR,
+                name.as_mut_ptr(),
+                name.len() as i32,
+            )
+        };
+        if result.is_null() {
+            return Err(io::Error::other("Cannot resolve controlling terminal"));
+        }
+        let name = unsafe { CStr::from_ptr(name.as_ptr()) };
+        Path::new("/dev").join(std::ffi::OsStr::from_bytes(name.to_bytes()))
+    };
+    #[cfg(not(target_os = "macos"))]
+    let path = Path::new("/dev/tty");
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+}
+
 impl LocalTerminal {
     pub fn open() -> io::Result<Self> {
-        let tty = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/tty")?;
+        let tty = open_terminal()?;
         let original = termios::tcgetattr(&tty)?;
         let mut raw = original.clone();
         termios::cfmakeraw(&mut raw);
         // Independent open descriptions keep O_NONBLOCK off the shell's stdio.
-        let input = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open("/dev/tty")?;
+        let input = open_terminal()?;
         fcntl(&input, FcntlArg::F_SETFL(OFlag::O_NONBLOCK))?;
         let output = input.try_clone()?;
         // These owned files are private and their descriptors are never replaced.
@@ -303,13 +340,9 @@ pub fn prompt_secret(prompt: &str, limit: usize) -> io::Result<String> {
             let _ = self.mask.thread_set_mask();
         }
     }
-    let tty = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open("/dev/tty")
-        .map_err(|_| {
-            io::Error::other("No interactive terminal; supply the pairing code as an argument")
-        })?;
+    let tty = open_terminal().map_err(|_| {
+        io::Error::other("No interactive terminal; supply the pairing code as an argument")
+    })?;
     let original = termios::tcgetattr(&tty)?;
     let mut hidden = original.clone();
     hidden
@@ -372,5 +405,83 @@ pub fn prompt_secret(prompt: &str, limit: usize) -> io::Result<String> {
             return Err(io::Error::other("Input exceeds limit"));
         }
         bytes.push(byte[0]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn local_terminal_keeps_stdio_blocking_and_delivers_input() {
+        const CHILD: &str = "TOWER_TEST_LOCAL_TERMINAL_CHILD";
+        const INPUT: &[u8] = b"terminal-round-trip\n";
+        if std::env::var_os(CHILD).is_some() {
+            let stdin = io::stdin();
+            let flags = fcntl(&stdin, FcntlArg::F_GETFL).unwrap();
+            let terminal = LocalTerminal::open().unwrap();
+            assert_eq!(fcntl(&stdin, FcntlArg::F_GETFL).unwrap(), flags);
+            terminal.write(b"TERMINAL READY\n").await.unwrap();
+            let mut received = Vec::new();
+            while received.len() < INPUT.len() {
+                let mut buf = [0; 64];
+                let n = terminal.read(&mut buf).await.unwrap();
+                assert_ne!(n, 0);
+                received.extend_from_slice(&buf[..n]);
+            }
+            assert_eq!(received, INPUT);
+            terminal.write(b"TERMINAL RECEIVED\n").await.unwrap();
+            drop(terminal);
+            assert_eq!(fcntl(&stdin, FcntlArg::F_GETFL).unwrap(), flags);
+            return;
+        }
+        let mut child = PtyProcess::spawn(
+            &[
+                std::env::current_exe()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                "--exact".into(),
+                "pty::tests::local_terminal_keeps_stdio_blocking_and_delivers_input".into(),
+                "--nocapture".into(),
+            ],
+            &BTreeMap::from([(CHILD.into(), "1".into())]),
+            &std::env::current_dir().unwrap(),
+            24,
+            80,
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut output = String::new();
+            let mut sent = false;
+            loop {
+                let mut buf = [0; 1024];
+                let n = child.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                output.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if !sent && output.contains("TERMINAL READY") {
+                    let mut remaining = INPUT;
+                    while !remaining.is_empty() {
+                        let n = child.write(remaining).await.unwrap();
+                        assert_ne!(n, 0);
+                        remaining = &remaining[n..];
+                    }
+                    sent = true;
+                }
+            }
+            assert!(output.contains("TERMINAL RECEIVED"), "{output}");
+            loop {
+                if let Some(code) = child.poll_exit().unwrap() {
+                    assert_eq!(code, 0, "{output}");
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
 }

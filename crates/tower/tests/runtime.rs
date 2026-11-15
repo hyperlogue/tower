@@ -52,15 +52,23 @@ async fn login_prompt_hides_input_and_cancels_before_starting_a_daemon() {
                 .await
                 .unwrap()
                 .unwrap();
-            assert!(n > 0);
+            assert!(
+                n > 0,
+                "login exited before prompting: {}",
+                String::from_utf8_lossy(&output)
+            );
             output.extend_from_slice(&buffer[..n]);
         }
         assert_eq!(pty.write(input).await.unwrap(), input.len());
         loop {
             match tokio::time::timeout(Duration::from_secs(10), pty.read(&mut buffer))
                 .await
-                .unwrap()
-            {
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "login did not exit after input {input:?}: {}",
+                        String::from_utf8_lossy(&output)
+                    )
+                }) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => output.extend_from_slice(&buffer[..n]),
             }
