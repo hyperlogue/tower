@@ -161,6 +161,10 @@ async fn maintain(service: ServiceWorker) {
             )
         {
             eprintln!("tower: registry maintenance failed");
+            // A failed expiry can leave the same deadline in the past. Keep
+            // the pending work, but do not retry it in a tight loop.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
         }
         (managed, due) = (false, false);
         let (deadline, processes) = match service.execute(|s| s.maintenance_plan()).await {
@@ -406,5 +410,64 @@ async fn serve_connection(
             shutdown.notify_one();
             return Ok(());
         }
+    }
+}
+
+#[cfg(test)]
+mod maintenance_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn failed_maintenance_does_not_spin_on_an_overdue_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        let paths = Paths {
+            run: state.join("run"),
+            socket: state.join("run/towerd.sock"),
+            database: state.join("tower.db"),
+            tokens: state.join("tokens"),
+            logs: state.join("logs"),
+            config_home: dir.path().join("config"),
+            home: dir.path().join("home"),
+            state,
+        };
+        paths.prepare().unwrap();
+        let config = paths.config_home.join("tower");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("config.toml"), "[scan]\nenabled=false\n").unwrap();
+        let database = Arc::new(tower_store::Database::open(&paths.database).unwrap());
+        let store = Arc::new(tower_store::Store::new(database.clone()));
+        let service =
+            Service::new(paths, store, "test", tower_sessions::Backends::default()).unwrap();
+        database.lock().unwrap().execute(
+            "INSERT INTO vcs_operations(id,actor,state,prepared,record) VALUES('expired','human','prepared','{}','{\"expires_at\":0}')", [],
+        ).unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let count = attempts.clone();
+        database
+            .lock()
+            .unwrap()
+            .authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+                if matches!(context.action, rusqlite::hooks::AuthAction::Delete { .. }) {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    rusqlite::hooks::Authorization::Deny
+                } else {
+                    rusqlite::hooks::Authorization::Allow
+                }
+            }))
+            .unwrap();
+        let worker = ServiceWorker::new(service);
+        let task = tokio::spawn(maintain(worker.clone()));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        task.abort();
+        let _ = task.await;
+        worker.execute(|_| ()).await.unwrap();
+        let attempts = attempts.load(Ordering::SeqCst);
+        assert!(attempts > 0, "maintenance never ran");
+        assert!(
+            attempts <= 2,
+            "failed maintenance retried {attempts} times in 150ms"
+        );
     }
 }
