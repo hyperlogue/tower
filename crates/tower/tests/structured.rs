@@ -1,3 +1,5 @@
+#[path = "support/cleanup.rs"]
+mod cleanup;
 #[path = "support/structured.rs"]
 mod fixture;
 #[path = "support/force_resume.rs"]
@@ -25,6 +27,9 @@ impl Fixture {
             .prefix("tw-acp-")
             .tempdir_in("/tmp")
             .unwrap();
+        let config = root.path().join("config/tower");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("config.toml"), "[scan]\nenabled=false\n").unwrap();
         std::fs::create_dir(root.path().join("bin")).unwrap();
         let node = tower_pal::find_program("node", &tower_pal::environment())
             .expect("Node is required for protocol fixtures");
@@ -99,6 +104,7 @@ impl Drop for Fixture {
                 .stderr(Stdio::null())
                 .status();
         }
+        cleanup::preserve_if_running(&mut self.root, "state");
     }
 }
 struct Call {

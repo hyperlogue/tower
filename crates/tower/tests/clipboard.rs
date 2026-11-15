@@ -1,3 +1,5 @@
+#[path = "support/cleanup.rs"]
+mod cleanup;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
@@ -21,6 +23,9 @@ impl Fixture {
             .tempdir_in("/tmp")
             .unwrap();
         let path = root.path();
+        let config = path.join("c/tower");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("config.toml"), "[scan]\nenabled=false\n").unwrap();
         std::fs::create_dir(path.join("bin")).unwrap();
         let node = tower_pal::find_program("node", &tower_pal::environment())
             .expect("Node is required for clipboard fixtures");
@@ -192,6 +197,7 @@ impl Drop for Fixture {
                 .stderr(Stdio::null())
                 .status();
         }
+        cleanup::preserve_if_running(&mut self.root, "s");
     }
 }
 struct Provider {

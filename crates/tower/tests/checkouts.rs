@@ -1,3 +1,5 @@
+#[path = "support/cleanup.rs"]
+mod cleanup;
 use serde_json::{Value, json};
 use std::{
     path::{Path, PathBuf},
@@ -13,6 +15,9 @@ impl Fixture {
             .prefix("tw-vcs-")
             .tempdir_in("/tmp")
             .unwrap();
+        let config = root.path().join("config/tower");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("config.toml"), "[scan]\nenabled=false\n").unwrap();
         Self { root }
     }
     fn command(&self, args: &[&str]) -> Command {
@@ -103,6 +108,7 @@ impl Drop for Fixture {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
+        cleanup::preserve_if_running(&mut self.root, "state");
     }
 }
 #[test]

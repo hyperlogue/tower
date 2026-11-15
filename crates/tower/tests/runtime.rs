@@ -1,4 +1,7 @@
 //! Exercise the installed CLI boundary with isolated state and real daemons.
+#[path = "support/cleanup.rs"]
+mod cleanup;
+
 use serde_json::{Value, json};
 use std::{
     path::PathBuf,
@@ -287,7 +290,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        Self {
+        let fixture = Self {
             // Keep the socket below the macOS Unix path limit.
             dir: tempfile::Builder::new()
                 .prefix("tw-")
@@ -295,7 +298,11 @@ impl Fixture {
                 .unwrap(),
             child: None,
             binary: env!("CARGO_BIN_EXE_tower-cli").into(),
-        }
+        };
+        let config = fixture.dir.path().join("config/tower");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("config.toml"), "[scan]\nenabled=false\n").unwrap();
+        fixture
     }
     fn standalone() -> Self {
         let mut f = Self::new();
@@ -395,6 +402,7 @@ impl Drop for Fixture {
             let _ = tower_pool_proto::write_sync(&mut stream, &tower_pool_proto::Request::Shutdown);
             let _ = tower_pool_proto::read_sync(&mut stream);
         }
+        cleanup::preserve_if_running(&mut self.dir, "state");
     }
 }
 fn wait_for(mut ready: impl FnMut() -> bool) {
@@ -1085,7 +1093,7 @@ fn loopback_http_requires_token_and_rejects_wrong_authority_and_origin() {
     std::fs::create_dir_all(&config).unwrap();
     std::fs::write(
         config.join("config.toml"),
-        format!("[http]\nenabled=true\nport={port}\n"),
+        format!("[scan]\nenabled=false\n[http]\nenabled=true\nport={port}\n"),
     )
     .unwrap();
     let token = f.run(&["token", "issue", "reader", "--scope", "read,subscribe"])["token"]
@@ -1163,7 +1171,7 @@ async fn allgather_status_policy_and_offline_mode_are_separate() {
     std::fs::create_dir_all(&config).unwrap();
     std::fs::write(
         config.join("config.toml"),
-        format!("[allgather]\nurl='ws://127.0.0.1:{port}/tower'\npolicy_id='test-policy'\n"),
+        format!("[scan]\nenabled=false\n[allgather]\nurl='ws://127.0.0.1:{port}/tower'\npolicy_id='test-policy'\n"),
     )
     .unwrap();
     let registered = f.run(&[

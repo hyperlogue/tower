@@ -1,3 +1,5 @@
+#[path = "support/cleanup.rs"]
+mod cleanup;
 use serde_json::{Value, json};
 use std::{
     process::{Command, Stdio},
@@ -118,6 +120,7 @@ impl Drop for Fixture {
                 .stderr(Stdio::null())
                 .status();
         }
+        cleanup::preserve_if_running(&mut self.root, "s");
     }
 }
 const FAKE: &str = r#"#!/bin/sh
