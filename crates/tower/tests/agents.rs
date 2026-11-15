@@ -1274,7 +1274,9 @@ fn unmanaged_codex_rollouts_are_discovered_from_their_writer() {
         .spawn()
         .unwrap();
     let until = Instant::now() + Duration::from_secs(5);
-    while !tower_pal::open_files(child.id()).is_ok_and(|files| files.contains(&rollout)) {
+    while !rollout.canonicalize().is_ok_and(|path| {
+        tower_pal::open_files(child.id()).is_ok_and(|files| files.contains(&path))
+    }) {
         assert!(Instant::now() < until, "fixture never opened its rollout");
         thread::sleep(Duration::from_millis(20));
     }
