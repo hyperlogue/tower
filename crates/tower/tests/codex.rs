@@ -1,3 +1,6 @@
+#[path = "support/cleanup.rs"]
+mod cleanup;
+
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -134,6 +137,7 @@ impl Drop for Fixture {
             let _ = tower_pool_proto::write_sync(&mut s, &tower_pool_proto::Request::Shutdown);
             let _ = tower_pool_proto::read_sync(&mut s);
         }
+        cleanup::finish(&mut self.root, "state", None);
     }
 }
 async fn written(pty: &PtyProcess, mut bytes: &[u8]) {

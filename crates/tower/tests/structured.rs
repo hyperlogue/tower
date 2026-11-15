@@ -104,7 +104,7 @@ impl Drop for Fixture {
                 .stderr(Stdio::null())
                 .status();
         }
-        cleanup::preserve_if_running(&mut self.root, "state");
+        cleanup::finish(&mut self.root, "state", None);
     }
 }
 struct Call {

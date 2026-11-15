@@ -197,7 +197,7 @@ impl Drop for Fixture {
                 .stderr(Stdio::null())
                 .status();
         }
-        cleanup::preserve_if_running(&mut self.root, "s");
+        cleanup::finish(&mut self.root, "s", None);
     }
 }
 struct Provider {

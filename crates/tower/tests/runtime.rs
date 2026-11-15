@@ -387,10 +387,6 @@ impl Drop for Fixture {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
-        if let Some(child) = &mut self.child {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
         let deadline = Instant::now() + Duration::from_secs(2);
         while self.socket().exists() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
@@ -402,7 +398,7 @@ impl Drop for Fixture {
             let _ = tower_pool_proto::write_sync(&mut stream, &tower_pool_proto::Request::Shutdown);
             let _ = tower_pool_proto::read_sync(&mut stream);
         }
-        cleanup::preserve_if_running(&mut self.dir, "state");
+        cleanup::finish(&mut self.dir, "state", self.child.as_mut());
     }
 }
 fn wait_for(mut ready: impl FnMut() -> bool) {

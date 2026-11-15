@@ -108,7 +108,7 @@ impl Drop for Fixture {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
-        cleanup::preserve_if_running(&mut self.root, "state");
+        cleanup::finish(&mut self.root, "state", None);
     }
 }
 #[test]

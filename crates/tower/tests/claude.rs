@@ -1,3 +1,6 @@
+#[path = "support/cleanup.rs"]
+mod cleanup;
+
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -50,6 +53,7 @@ impl Drop for Fixture {
                 .stderr(Stdio::null())
                 .status();
         }
+        cleanup::finish(&mut self.root, "s", None);
     }
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1,3 +1,6 @@
+#[path = "support/cleanup.rs"]
+mod cleanup;
+
 use std::{
     collections::BTreeMap,
     io::{Read, Write},
@@ -141,8 +144,7 @@ impl Drop for Pool {
         while self.child.try_wait().ok().flatten().is_none() && Instant::now() < end {
             thread::sleep(Duration::from_millis(10));
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        cleanup::finish(&mut self.dir, "", Some(&mut self.child));
     }
 }
 fn wait(mut f: impl FnMut() -> bool) {
