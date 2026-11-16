@@ -1,18 +1,14 @@
 mod backend;
-mod controls;
 mod engine;
-mod force;
 mod journal;
-mod requests;
+mod proxy;
 mod runtime;
 mod terminal;
 mod terminal_backend;
-mod wire;
 pub use backend::Backend;
+pub(crate) use journal::{Binding, Journal, Limits};
 pub use runtime::Runtime;
 pub use terminal_backend::TerminalBackend;
-pub mod bridge;
-pub(crate) use journal::{Binding, Journal, Limits};
 use tower_protocol::RpcError;
 
 pub type Result<T> = std::result::Result<T, RpcError>;
@@ -39,15 +35,6 @@ fn parse_time(value: &str) -> Result<u64> {
         .map_err(|_| error("invalid_params", "Expected an ISO timestamp with timezone"))?;
     u64::try_from(parsed.unix_timestamp_nanos() / 1_000_000)
         .map_err(|_| error("invalid_params", "Invalid timestamp"))
-}
-fn format_time(millis: u64) -> String {
-    time::OffsetDateTime::from_unix_timestamp_nanos(i128::from(millis) * 1_000_000)
-        .ok()
-        .and_then(|t| {
-            t.format(&time::format_description::well_known::Rfc3339)
-                .ok()
-        })
-        .unwrap_or_default()
 }
 fn random_id(prefix: &str) -> Result<String> {
     let mut bytes = [0u8; 16];

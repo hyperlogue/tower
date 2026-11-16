@@ -1,4 +1,3 @@
-mod force;
 use crate::{Result, error, identifier, internal, millis, parse_time, random_id, timestamp};
 use hmac::{Hmac, KeyInit, Mac};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -39,21 +38,6 @@ pub struct Journal {
     limits: Limits,
 }
 impl Journal {
-    pub fn bulk_capacity(&self, binding: &Binding, bytes: usize) -> Result<bool> {
-        let conn = self.lock()?;
-        let used:i64=conn.query_row("SELECT spool_bytes FROM runtimes WHERE namespace=?1 AND runtime_id=?2 AND generation=?3",params![binding.namespace(),binding.runtime_id,binding.generation],|r|r.get(0)).map_err(internal)?;
-        let host: i64 = conn
-            .query_row(
-                "SELECT spool_bytes FROM runtime_counters WHERE id=1",
-                [],
-                |r| r.get(0),
-            )
-            .map_err(internal)?;
-        Ok(
-            (used as u64).saturating_add(bytes as u64) <= self.limits.runtime_spool_bytes
-                && (host as u64).saturating_add(bytes as u64) <= self.limits.host_spool_bytes,
-        )
-    }
     #[cfg(test)]
     pub fn open(path: &std::path::Path, limits: Limits) -> Result<Self> {
         Self::new(Arc::new(Database::open(path).map_err(internal)?), limits)
@@ -134,9 +118,20 @@ impl Journal {
         mac.update(&serde_json::to_vec(&value).map_err(internal)?);
         Ok(mac.finalize().into_bytes().to_vec())
     }
+    pub fn validate_new(&self, binding: &Binding, command: &ExecutionCommand) -> Result<()> {
+        validate(binding, command)?;
+        let active: bool = self.lock()?.query_row("SELECT EXISTS(SELECT 1 FROM runtimes WHERE namespace=?1 AND logical_session=?2 AND fenced=0 AND runtime_id!=?3)",params![binding.namespace(),binding.session_id,binding.runtime_id],|r|r.get(0)).map_err(internal)?;
+        if active {
+            return Err(error(
+                "runtime_conflict",
+                "Close the existing connection before opening its replacement",
+            ));
+        }
+        Ok(())
+    }
     pub fn admit(&self, binding: &Binding, command: &ExecutionCommand) -> Result<ExecutionReceipt> {
         validate(binding, command)?;
-        tower_sessions::execution::force_resume(command)?;
+
         let fingerprint = self.fingerprint(command)?;
         let namespace = binding.namespace();
         let mut conn = self.lock()?;
@@ -174,17 +169,6 @@ impl Journal {
             ));
         }
         let runtime:Option<(String,String,bool)>=tx.query_row("SELECT generation,binding,fenced FROM runtimes WHERE namespace=?1 AND runtime_id=?2",params![namespace,binding.runtime_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(internal)?;
-        let targets = if runtime.is_none() {
-            force::validate_new(&tx, binding, command)?
-        } else {
-            if tower_sessions::execution::force_resume(command)?.is_some() {
-                return Err(error(
-                    "runtime_conflict",
-                    "Force resume requires a new runtime and generation",
-                ));
-            }
-            None
-        };
         if let Some((generation, stored, fenced)) = runtime {
             let current: Binding = serde_json::from_str(&stored).map_err(internal)?;
             if generation != binding.generation
@@ -248,9 +232,6 @@ impl Journal {
             }
         }
         tx.execute("INSERT INTO commands(namespace,command_id,runtime_id,generation,fingerprint,kind,payload,expires_at,receipt,receipt_revision,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,1,?10)",params![namespace,command.command_id,command.runtime_id,command.generation,fingerprint,command.kind,payload,parse_time(&command.expires_at)? as i64,serde_json::to_string(&receipt).map_err(internal)?,millis() as i64]).map_err(internal)?;
-        if let Some(targets) = targets {
-            force::record(&tx, binding, command, &targets)?;
-        }
         tx.commit().map_err(internal)?;
         Ok(receipt)
     }
@@ -413,38 +394,6 @@ impl Journal {
         .collect()
     }
     /// Admitted commands that never reached the native session, oldest first.
-    pub fn pending_commands(&self, binding: &Binding) -> Result<Vec<ExecutionCommand>> {
-        let conn = self.lock()?;
-        let mut q = conn.prepare("SELECT command_id,kind,payload,expires_at FROM commands WHERE namespace=?1 AND runtime_id=?2 AND generation=?3 AND json_extract(receipt,'$.dispatch.state')='not_started' ORDER BY created_at,rowid").map_err(internal)?;
-        q.query_map(
-            params![binding.namespace(), binding.runtime_id, binding.generation],
-            |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                    r.get::<_, i64>(3)?,
-                ))
-            },
-        )
-        .map_err(internal)?
-        .map(|r| {
-            let (command_id, kind, payload, expires) = r.map_err(internal)?;
-            Ok(ExecutionCommand {
-                command_id,
-                session_id: binding.session_id.clone(),
-                runtime_id: binding.runtime_id.clone(),
-                generation: binding.generation.clone(),
-                kind,
-                payload: match payload {
-                    Some(body) => serde_json::from_str(&body).map_err(internal)?,
-                    None => serde_json::from_value(serde_json::Value::Null).map_err(internal)?,
-                },
-                expires_at: crate::format_time(expires as u64),
-            })
-        })
-        .collect()
-    }
     pub fn metadata(&self, binding: &Binding) -> Result<serde_json::Value> {
         let json:String=self.lock()?.query_row("SELECT metadata FROM runtimes WHERE namespace=?1 AND runtime_id=?2 AND generation=?3",params![binding.namespace(),binding.runtime_id,binding.generation],|r|r.get(0)).map_err(internal)?;
         serde_json::from_str(&json).map_err(internal)
@@ -527,17 +476,11 @@ impl Journal {
         if receipt.dispatch.state != "not_started" {
             return Ok(false);
         }
-        force::before_dispatch(&tx, binding, command_id)?;
         if expires <= millis() as i64 {
             return Err(error("command_expired", "Command expired before dispatch"));
         }
         receipt.receipt_revision += 1;
         receipt.dispatch.state = "in_flight".into();
-        tx.execute(
-            "UPDATE force_resumes SET phase='dispatched' WHERE namespace=?1 AND command_id=?2",
-            params![binding.namespace(), command_id],
-        )
-        .map_err(internal)?;
         save_receipt(&tx, &binding.namespace(), &receipt)?;
         tx.execute(
             "UPDATE commands SET payload=NULL WHERE namespace=?1 AND command_id=?2",
@@ -675,10 +618,6 @@ impl Journal {
     pub fn batch(&self, binding: &Binding) -> Result<Option<RuntimeEvents>> {
         let conn = self.lock()?;
         // A ready event must not overtake a target's confirmed loss report.
-        let cleanup_unacked: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM force_resumes f JOIN commands c USING(namespace,command_id) JOIN json_each(f.targets) target LEFT JOIN runtimes old ON old.namespace=f.namespace AND old.runtime_id=json_extract(target.value,'$.runtime_id') AND old.generation=json_extract(target.value,'$.generation') WHERE c.namespace=?1 AND c.runtime_id=?2 AND c.generation=?3 AND (old.runtime_id IS NULL OR old.termination!='confirmed' OR old.loss_ack<coalesce(json_extract(old.loss,'$.report_revision'),1)))",params![binding.namespace(),binding.runtime_id,binding.generation],|r|r.get(0)).map_err(internal)?;
-        if cleanup_unacked {
-            return Ok(None);
-        }
         let mut query=conn.prepare("SELECT body FROM events WHERE namespace=?1 AND runtime_id=?2 AND generation=?3 ORDER BY sequence LIMIT 200").map_err(internal)?;
         let mut events = Vec::new();
         let mut bytes = 0usize;
@@ -716,14 +655,6 @@ impl Journal {
             last_event_key: key,
             coverage,
         })
-    }
-    pub fn latest_event_sequence(&self, binding: &Binding) -> Result<u64> {
-        let sequence: i64 = self.lock()?.query_row(
-            "SELECT next_sequence-1 FROM runtimes WHERE namespace=?1 AND runtime_id=?2 AND generation=?3",
-            params![binding.namespace(), binding.runtime_id, binding.generation],
-            |r| r.get(0),
-        ).map_err(internal)?;
-        u64::try_from(sequence).map_err(internal)
     }
     pub fn acknowledge_events(&self, binding: &Binding, cursor: &RuntimeCursor) -> Result<()> {
         if cursor.runtime_id != binding.runtime_id
@@ -1103,40 +1034,6 @@ mod tests {
         assert!(j.batch(&b).unwrap().is_none());
     }
     #[test]
-    fn bulk_capacity_does_not_consume_control_capacity_or_allocate_a_sequence() {
-        let root = tempfile::tempdir().unwrap();
-        let j = Journal::open(
-            &root.path().join("tower.db"),
-            Limits {
-                runtime_spool_bytes: 3,
-                host_spool_bytes: 3,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let b = binding();
-        j.admit(&b, &command("launch", "launch", json!({})))
-            .unwrap();
-        assert_eq!(
-            j.append(&b, "text", Value::String("bulk".into()), None, false)
-                .err()
-                .unwrap()
-                .data
-                .code,
-            "spool_capacity"
-        );
-        let stopped = j
-            .append(
-                &b,
-                "turn_end",
-                serde_json::from_value(json!({"stop_reason":"cancelled"})).unwrap(),
-                None,
-                true,
-            )
-            .unwrap();
-        assert_eq!(stopped.sequence, 1);
-    }
-    #[test]
     fn receipt_capacity_and_uncertain_overlap_fail_before_acceptance() {
         let root = tempfile::tempdir().unwrap();
         let j = Journal::open(
@@ -1158,22 +1055,6 @@ mod tests {
                 .code,
             "runtime_capacity"
         );
-    }
-    #[test]
-    fn takeover_payload_is_rejected_without_admission() {
-        let root = tempfile::tempdir().unwrap();
-        let j = Journal::open(&root.path().join("tower.db"), Limits::default()).unwrap();
-        let b = binding();
-        let c = command(
-            "resume",
-            "legacy",
-            json!({"takeover":{"owner_action_id":"old-action"}}),
-        );
-        assert_eq!(
-            j.admit(&b, &c).unwrap_err().data.code,
-            "unsupported_control"
-        );
-        assert!(j.bindings(None).unwrap().is_empty());
     }
     #[test]
     fn expired_full_receipts_compact_without_losing_deduplication_or_outcome() {

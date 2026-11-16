@@ -1,4 +1,4 @@
-use crate::{RequestId, Value};
+use crate::Value;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -79,11 +79,6 @@ pub struct ExecutionReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<ExecutionError>,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RuntimeIdentity {
-    pub runtime_id: String,
-    pub generation: String,
-}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RuntimeLoss {
     pub runtime_id: String,
@@ -121,16 +116,4 @@ pub struct RuntimeCursor {
     pub cursor: u64,
     pub last_event_key: Option<String>,
     pub coverage: String,
-}
-#[derive(Clone, Serialize, Deserialize)]
-pub struct RuntimeRequest {
-    pub runtime_id: String,
-    pub generation: String,
-    pub owner_id: String,
-    pub source_request_id: String,
-    pub request_revision: u64,
-    pub native_request_id: RequestId,
-    pub kind: String,
-    pub state: String,
-    pub payload: Value,
 }

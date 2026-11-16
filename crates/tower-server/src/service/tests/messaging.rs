@@ -404,7 +404,6 @@ fn old_allgather_connections_cannot_act_after_enrollment_rotation() {
             crate::allgather::ExecutionProtocols {
                 managed: true,
                 terminal: false,
-                force_resume: false
             }
         )
         .unwrap_err()
@@ -419,7 +418,6 @@ fn old_allgather_connections_cannot_act_after_enrollment_rotation() {
         crate::allgather::ExecutionProtocols {
             managed: true,
             terminal: false,
-            force_resume: false,
         },
     )
     .unwrap();
@@ -538,7 +536,6 @@ fn allgather_cannot_administer_local_state_even_with_admin_scope() {
                     crate::allgather::ExecutionProtocols {
                         managed: true,
                         terminal: false,
-                        force_resume: false
                     }
                 )
                 .unwrap_err()

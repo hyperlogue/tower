@@ -172,7 +172,7 @@ async fn terminal_launch_attaches_and_recovers_without_replay_or_structured_cont
             ),
         )
         .await;
-    assert_eq!(structured["error"]["data"]["code"], "unsupported_control");
+    assert_eq!(structured["error"]["data"]["code"], "acp_required");
     let mut altered = launch_command.clone();
     altered["payload"]["cwd"] = json!("/tmp");
     assert_eq!(

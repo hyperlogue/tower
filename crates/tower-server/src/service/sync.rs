@@ -134,6 +134,12 @@ impl Service {
         let actor = self.remote_actor(epoch)?;
         if matches!(
             request.method.as_str(),
+            "acp.open" | "acp.send" | "acp.close"
+        ) {
+            return self.acp_dispatch(request, epoch, protocols);
+        }
+        if matches!(
+            request.method.as_str(),
             "command.execute" | "command.status"
         ) {
             return self.execution_dispatch(request, epoch, protocols);
@@ -239,16 +245,7 @@ impl Service {
             "checkout-sync.v1".into(),
         ];
         if !harness_controls.is_empty() {
-            capabilities.extend(
-                [
-                    "managed-acp.v1",
-                    "command-receipts.v1",
-                    "session-stream.v1",
-                    "session-resume.v1",
-                    "session-force-resume.v1",
-                ]
-                .map(str::to_owned),
-            );
+            capabilities.push("acp-proxy.v1".into());
         }
         if !terminal_controls.is_empty() {
             for capability in [

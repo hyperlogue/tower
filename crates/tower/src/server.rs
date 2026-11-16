@@ -17,8 +17,6 @@ enum Command {
         #[arg(long)]
         detach: bool,
     },
-    #[command(name = "__acp", hide = true)]
-    Acp { harness: String },
 }
 fn runtime() -> std::io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_multi_thread()
@@ -51,10 +49,6 @@ fn execute(command: Command) -> Result<()> {
                                 terminal,
                                 execution.clone(),
                             )),
-                            Arc::new(tower_runtime::Backend::new(
-                                execution.clone(),
-                                "codex-app-server",
-                            )),
                             Arc::new(tower_runtime::Backend::new(execution.clone(), "acp")),
                         ],
                     )?
@@ -63,7 +57,6 @@ fn execute(command: Command) -> Result<()> {
                 },
             ))?;
         }
-        Command::Acp { harness } => runtime()?.block_on(tower_runtime::bridge::run(&harness))?,
     }
     Ok(())
 }

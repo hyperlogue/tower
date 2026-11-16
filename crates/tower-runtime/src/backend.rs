@@ -23,10 +23,10 @@ fn decode<T: serde::de::DeserializeOwned>(v: &Value) -> Result<T> {
 fn public(v: impl serde::Serialize) -> Result<Value> {
     serde_json::from_value(serde_json::to_value(v).map_err(internal)?).map_err(internal)
 }
-pub fn capabilities(active: bool, resume: bool) -> Capabilities {
+pub fn capabilities(active: bool, _resume: bool) -> Capabilities {
     let mut caps = Capabilities::unavailable("structured_control_required");
     caps.kill = active;
-    caps.resume = resume;
+    caps.resume = false;
     caps
 }
 pub(crate) fn observation(v: &RuntimeView) -> Result<Observation> {
@@ -61,14 +61,12 @@ pub(crate) fn observation(v: &RuntimeView) -> Result<Observation> {
         pid_start_time: m["pid_start_time"].as_u64(),
         caps: capabilities(
             !v.fenced,
-            native.is_some()
-                && (!v.fenced || v.termination == "confirmed")
-                && (v.binding.protocol != "codex-app-server" || m["native_resumable"] == true),
+            native.is_some() && (!v.fenced || v.termination == "confirmed"),
         ),
         terminal: None,
         recovery_pending: false,
         metadata: SessionMetadata {
-            shared_process: Some(v.binding.protocol == "codex-app-server"),
+            shared_process: Some(false),
             native_session_id: native,
             display_name: tower_protocol::Patch::Missing,
             cwd: Some(v.binding.cwd.clone()),
@@ -97,27 +95,15 @@ impl ManagedBackend for Backend {
                 harness: h.clone(),
                 label: h.clone(),
                 protocol: c.protocol,
-                executable: match h.as_str() {
-                    "claude-code" => "claude",
-                    "antigravity" => "agy",
-                    _ => "codex",
-                }
-                .into(),
+                executable: h.clone(),
                 available: true,
-                modes: if h == "codex" {
-                    vec!["app-server".into()]
-                } else {
-                    vec![]
-                },
+                modes: vec![],
                 resume: true,
             })
             .collect()
     }
     fn prepare(&self, id: &str, p: &SessionOpenParams) -> Result<PreparedSession> {
-        if !p.args.is_empty()
-            || p.resume.is_some()
-            || p.mode.as_deref().is_some_and(|v| v != "app-server")
-        {
+        if !p.args.is_empty() || p.resume.is_some() || p.mode.is_some() {
             return Err(error(
                 "unsupported",
                 "Structured runtimes use native configuration and known managed history",
@@ -210,44 +196,17 @@ impl ManagedBackend for Backend {
     }
     fn prepare_resume(
         &self,
-        s: &ManagedSession,
-        mode: Option<&str>,
-        args: Option<&[String]>,
+        _s: &ManagedSession,
+        _mode: Option<&str>,
+        _args: Option<&[String]>,
     ) -> Result<PreparedSession> {
-        let old: Binding = decode(&s.binding)?;
-        if old.origin != "local" {
-            return Err(error("denied", "Resume this execution through Allgather"));
-        }
-        if args.is_some() || mode.is_some_and(|v| v != "app-server") {
-            return Err(error(
-                "unsupported",
-                "Structured resume does not accept native arguments",
-            ));
-        }
-        let m: serde_json::Value = decode(&self.view(&old)?.metadata)?;
-        let native = m[if old.protocol == "acp" {
-            "acp_session_id"
-        } else {
-            "native_session_id"
-        }]
-        .as_str()
-        .ok_or_else(|| error("resume_unavailable", "Native history identity unavailable"))?;
-        let mut b = old;
-        b.runtime_id = random_id("runtime_")?;
-        b.generation = random_id("generation_")?;
-        b.owner_id = random_id("owner_")?;
-        b.resume_session_id = Some(native.into());
-        self.prepared(b)
+        Err(error(
+            "acp_required",
+            "Open an ACP connection and send session/load",
+        ))
     }
 }
 impl Backend {
-    fn view(&self, b: &Binding) -> Result<RuntimeView> {
-        self.runtime
-            .list(Some(&b.namespace()))?
-            .into_iter()
-            .find(|v| v.binding.runtime_id == b.runtime_id)
-            .ok_or_else(|| error("not_found", "Runtime disappeared"))
-    }
     fn observed(&self, view: &RuntimeView) -> Result<Observation> {
         let mut observed = observation(view)?;
         observed.metadata.cwd = Some(

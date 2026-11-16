@@ -24,8 +24,6 @@ rusqlite.workspace = true
 sha2.workspace = true
 getrandom.workspace = true
 hmac = "0.13"
-jsonschema = { version = "0.60", default-features = false }
-url = "2"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 
 [dev-dependencies]

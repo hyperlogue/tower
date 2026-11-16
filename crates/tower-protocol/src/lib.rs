@@ -1,5 +1,7 @@
 //! Extensible public wire types. This crate deliberately depends only on serde.
 
+pub mod acp;
+pub use acp::AcpFrame;
 pub mod metrics;
 pub use metrics::{DiskMetrics, HostMetrics, MemoryMetrics};
 mod vcs;
@@ -23,6 +25,14 @@ pub use value::{Number, Value};
 
 pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 4 };
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
+pub const MAX_ACP_ENVELOPE_BYTES: usize = 2 * MAX_FRAME_BYTES + 4096;
+pub fn frame_limit(method: &str) -> usize {
+    if matches!(method, "acp.send" | "acp.frame") {
+        MAX_ACP_ENVELOPE_BYTES
+    } else {
+        MAX_FRAME_BYTES
+    }
+}
 pub const MAX_RESPONSE_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

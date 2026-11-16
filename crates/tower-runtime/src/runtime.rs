@@ -1,5 +1,5 @@
 use crate::{Binding, Journal, Limits, Result, engine, error, internal};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex, MutexGuard, OnceLock},
@@ -43,32 +43,14 @@ impl Authority {
         })
         .await
     }
-    pub(crate) async fn check_target(
-        &self,
-        b: &Binding,
-        c: &ExecutionCommand,
-        target: &Binding,
-    ) -> Result<()> {
-        self.check(b, c).await?;
-        let authorize = self
-            .0
-            .get()
-            .ok_or_else(|| error("authority_unavailable", "Tower authorization is not ready"))?;
-        authorize(Authorization {
-            binding: b.clone(),
-            command_id: c.command_id.clone(),
-            kind: c.kind.clone(),
-            cleanup: false,
-            target: Some(target.clone()),
-        })
-        .await
-    }
 }
 
 /// Owns managed runtimes inside the server: their durable journal, the
 /// engine task of each live generation, and recovery after a restart.
 pub struct Runtime {
     paths: tower_pal::Paths,
+    acp: crate::proxy::Configuration,
+    proxies: Mutex<BTreeMap<String, Arc<crate::proxy::Proxy>>>,
     journal: Arc<Journal>,
     owners: Mutex<BTreeMap<String, Arc<engine::Handle>>>,
     terminal: Arc<dyn ManagedBackend>,
@@ -91,6 +73,7 @@ impl Runtime {
         #[serde(default)]
         struct Configuration {
             runtime: Limits,
+            acp: crate::proxy::Configuration,
         }
         let configuration: Configuration =
             tower_pal::read_config(&paths.config_home.join("tower/config.toml"))
@@ -120,6 +103,8 @@ impl Runtime {
         }));
         let runtime = Arc::new(Self {
             paths,
+            acp: configuration.acp,
+            proxies: Mutex::new(BTreeMap::new()),
             journal,
             owners: Mutex::new(BTreeMap::new()),
             terminal,
@@ -130,15 +115,7 @@ impl Runtime {
         for binding in live {
             let (handle, normal, control) = engine::channels();
             runtime.owners()?.insert(key(&binding), handle.clone());
-            if let Some(command) = runtime.journal.force_command(&binding)? {
-                handle
-                    .normal
-                    .try_send(command.clone())
-                    .map_err(|_| error("runtime_capacity", "Recovery queue is full"))?;
-                runtime.spawn_force(binding, command, handle, normal, control, true)?;
-            } else {
-                runtime.spawn(binding, handle, normal, control, engine::Start::Continue);
-            }
+            runtime.spawn(binding, handle, normal, control, engine::Start::Continue);
         }
         let weak = Arc::downgrade(&runtime);
         runtime.tasks.spawn(async move {
@@ -147,6 +124,9 @@ impl Runtime {
             loop {
                 maintenance.tick().await;
                 let Some(runtime) = weak.upgrade() else { break };
+                if let Ok(mut proxies) = runtime.proxies.lock() {
+                    proxies.retain(|_, proxy| !proxy.retired());
+                }
                 if runtime.journal.compact().is_err() {
                     eprintln!("tower: runtime journal compaction failed");
                 }
@@ -203,93 +183,27 @@ impl Runtime {
             .map_err(|_| error("runtime_capacity", "Runtime queue is full"))?;
         owners.insert(key(&b), handle.clone());
         drop(owners);
-        if tower_sessions::execution::force_resume(&c)?.is_some() {
-            if let Err(error) =
-                self.spawn_force(b.clone(), c.clone(), handle, normal, control, false)
-            {
-                self.journal.force_failed(&b, &c, &error.data.code)?;
-                return self.journal.status(
-                    &b.namespace(),
-                    &ExecutionStatus {
-                        command_id: c.command_id,
-                        runtime_id: b.runtime_id.clone(),
-                        generation: b.generation.clone(),
-                    },
-                );
-            }
-        } else {
-            self.spawn(b, handle, normal, control, engine::Start::Launch);
-        }
+        self.spawn(b, handle, normal, control, engine::Start::Launch);
         Ok(receipt)
-    }
-    fn spawn_force(
-        &self,
-        b: Binding,
-        c: ExecutionCommand,
-        handle: Arc<engine::Handle>,
-        normal: tokio::sync::mpsc::Receiver<ExecutionCommand>,
-        control: tokio::sync::mpsc::Receiver<engine::Control>,
-        recover: bool,
-    ) -> Result<()> {
-        let targets = self
-            .journal
-            .force_targets(&b, &c.command_id)?
-            .into_iter()
-            .map(|target| Ok((target.clone(), self.owner(&target)?)))
-            .collect::<Result<Vec<_>>>()?;
-        for (_, owner) in &targets {
-            if let Some(owner) = owner {
-                owner.requests.retire_all()?;
-            }
-        }
-        let failed = (b.clone(), c.clone(), self.journal.clone());
-        let task = self.tasks.spawn(
-            crate::force::Work {
-                ctx: self.context(),
-                binding: b,
-                command: c,
-                targets,
-            }
-            .run(handle, normal, control, recover),
-        );
-        self.tasks.spawn(async move {
-            if task.await.is_err() {
-                let _ = failed
-                    .2
-                    .force_failed(&failed.0, &failed.1, "cleanup_unconfirmed");
-            }
-        });
-        Ok(())
     }
     fn spawn(
         &self,
         b: Binding,
-        handle: Arc<engine::Handle>,
+        _handle: Arc<engine::Handle>,
         normal: tokio::sync::mpsc::Receiver<ExecutionCommand>,
         control: tokio::sync::mpsc::Receiver<engine::Control>,
         start: engine::Start,
     ) {
         let failed = (b.clone(), self.journal.clone());
-        let task = if b.protocol == "terminal" {
-            self.tasks.spawn(crate::terminal::run(
-                self.context(),
-                b,
-                self.terminal.clone(),
-                self.terminal_changes.clone(),
-                normal,
-                control,
-                start == engine::Start::Continue,
-            ))
-        } else {
-            self.tasks.spawn(engine::run(
-                self.context(),
-                b,
-                handle,
-                normal,
-                control,
-                start,
-            ))
-        };
+        let task = self.tasks.spawn(crate::terminal::run(
+            self.context(),
+            b,
+            self.terminal.clone(),
+            self.terminal_changes.clone(),
+            normal,
+            control,
+            start == engine::Start::Continue,
+        ));
         self.tasks.spawn(async move {
             if task.await.is_err() {
                 let (binding, journal) = failed;
@@ -302,29 +216,23 @@ impl ExecutionHost for Runtime {
     fn bind(&self, authorize: Authorize) {
         let _ = self.authority.0.set(authorize);
     }
-    /// Suspends structured sessions so that the next server continues them.
+    /// Closes ACP connections before shutdown; clients explicitly reconnect.
     /// Terminal sessions live in the pool and need nothing.
     fn shutdown(&self) -> tower_sessions::execution::Future<()> {
-        let owners: Vec<_> = (|| -> Result<Vec<_>> {
-            let owners = self.owners()?;
-            Ok(self
-                .journal
-                .bindings(None)?
-                .iter()
-                .filter(|b| b.protocol != "terminal")
-                .filter_map(|b| owners.get(&key(b)).cloned())
-                .collect())
-        })()
-        .unwrap_or_default();
+        let proxies: Vec<_> = self
+            .proxies
+            .lock()
+            .map(|proxies| proxies.values().cloned().collect())
+            .unwrap_or_default();
         Box::pin(async move {
-            for h in &owners {
-                let _ = h.control.try_send(engine::Control::Suspend);
+            for proxy in &proxies {
+                proxy.stop();
             }
             let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
-            while owners.iter().any(|h| !h.normal.is_closed())
+            while proxies.iter().any(|proxy| !proxy.closed())
                 && tokio::time::Instant::now() < deadline
             {
-                tokio::time::sleep(Duration::from_millis(50)).await;
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
         })
     }
@@ -332,46 +240,74 @@ impl ExecutionHost for Runtime {
         self.journal.validate_new(b, c)
     }
     fn controls(&self) -> BTreeMap<String, HarnessControls> {
-        let env = tower_pal::environment();
-        let mut out = BTreeMap::new();
-        for (harness, bin, protocol, permissions, configure, cancel) in [
-            ("codex", "codex", "codex-app-server", true, true, "turn"),
-            ("claude-code", "claude", "acp", true, false, "turn"),
-            ("antigravity", "agy", "acp", false, false, "runtime"),
-        ] {
-            if tower_pal::find_program(bin, &env).is_some() {
-                let mut capabilities = vec!["prompt".into(), "resume".into()];
-                if permissions {
-                    capabilities.push("permission_reply".into());
-                    capabilities.push("elicitation_reply".into());
-                }
-                if configure {
-                    capabilities.push("configure".into());
-                }
-                out.insert(
-                    harness.into(),
-                    HarnessControls {
-                        protocol: protocol.into(),
-                        capabilities,
-                        cancel_mode: Some(cancel.into()),
-                    },
-                );
-            }
+        self.acp.available()
+    }
+    fn acp_send(
+        &self,
+        ns: &str,
+        runtime: &str,
+        generation: &str,
+        sequence: u64,
+        frame: &str,
+    ) -> Result<()> {
+        let b = self.journal.binding(ns, runtime, generation)?;
+        if self.journal.state(&b)?.1 {
+            return Err(error("acp_closed", "ACP connection is closed"));
         }
-        out
+        self.proxies
+            .lock()
+            .map_err(internal)?
+            .get(&key(&b))
+            .ok_or_else(|| error("acp_closed", "ACP connection is unavailable"))?
+            .send(sequence, frame)
+    }
+    fn acp_ack(&self, ns: &str, runtime: &str, generation: &str, sequence: u64) -> Result<()> {
+        let b = self.journal.binding(ns, runtime, generation)?;
+        self.proxies
+            .lock()
+            .map_err(internal)?
+            .get(&key(&b))
+            .ok_or_else(|| error("acp_closed", "ACP connection is unavailable"))?
+            .acknowledge(sequence)
     }
     fn execute(&self, b: &Binding, c: &ExecutionCommand) -> Result<ExecutionReceipt> {
-        tower_sessions::execution::force_resume(c)?;
-        let terminal = b.protocol == "terminal";
-        let structured = b.protocol
-            == if b.harness == "codex" {
-                "codex-app-server"
-            } else {
-                "acp"
+        if b.protocol == "acp" {
+            if c.kind != "launch" {
+                return Err(error(
+                    "acp_required",
+                    "Exchange native ACP frames through acp.send",
+                ));
             }
-            && matches!(b.harness.as_str(), "codex" | "claude-code" | "antigravity");
-        if !(terminal || structured) || !std::path::Path::new(&b.cwd).is_absolute() {
-            return Err(error("invalid_params", "Unsupported runtime binding"));
+            let argv = self
+                .acp
+                .agents
+                .get(&b.harness)
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| error("unsupported", "Configure an ACP agent command"))?
+                .clone();
+            let mut proxies = self.proxies.lock().map_err(internal)?;
+            if self
+                .journal
+                .binding(&b.namespace(), &b.runtime_id, &b.generation)
+                .is_ok()
+                && !proxies.contains_key(&key(b))
+            {
+                return Err(error(
+                    "acp_closed",
+                    "Open a new ACP connection and load the native session",
+                ));
+            }
+            let receipt = self.journal.admit(b, c)?;
+            proxies
+                .entry(key(b))
+                .or_insert_with(|| crate::proxy::spawn(self.context(), b.clone(), c.clone(), argv));
+            return Ok(receipt);
+        }
+        if b.protocol != "terminal" {
+            return Err(error(
+                "acp_required",
+                "Legacy managed runtimes were removed; configure an ACP adapter",
+            ));
         }
         let prior = self.journal.status(
             &b.namespace(),
@@ -384,7 +320,7 @@ impl ExecutionHost for Runtime {
         if prior.state != "missing" {
             return self.journal.admit(b, c);
         }
-        if terminal {
+        {
             crate::terminal::validate(b, c)?;
             if c.kind == "launch"
                 && !self
@@ -405,17 +341,13 @@ impl ExecutionHost for Runtime {
             }
             return self.spawn_owner(b.clone(), c.clone());
         };
-        if terminal && c.kind != "cancel" {
+        if c.kind != "cancel" {
             return Err(error(
                 "runtime_conflict",
                 "A terminal runtime already has a launch",
             ));
         }
-        if c.kind == "reply" {
-            let p = serde_json::to_value(&c.payload).map_err(internal)?;
-            handle.requests.validate_reply(&p)?;
-        }
-        if matches!(c.kind.as_str(), "cancel" | "reply") {
+        if c.kind == "cancel" {
             let permit = handle
                 .control
                 .clone()
@@ -446,26 +378,37 @@ impl ExecutionHost for Runtime {
             return Err(error("invalid_params", "Connection identity required"));
         }
         let receipts = self.journal.receipt_updates(namespace)?;
-        let losses = self.journal.losses(namespace)?;
-        let mut budget = tower_protocol::MAX_FRAME_BYTES.saturating_sub(
-            serde_json::to_vec(&receipts).map_err(internal)?.len()
-                + serde_json::to_vec(&losses).map_err(internal)?.len()
-                + 4096,
-        );
-        let mut requests = Vec::new();
-        let owners = self.owners()?;
-        for binding in self.journal.bindings(Some(namespace))? {
-            if let Some(h) = owners.get(&key(&binding)) {
-                let committed = self.journal.cursor(&binding)?.cursor;
-                requests.extend(h.requests.updates(connection, committed, &mut budget)?);
+        let mut acp_frames = Vec::new();
+        let proxies = self.proxies.lock().map_err(internal)?;
+        for b in self.journal.bindings(Some(namespace))? {
+            if let Some(proxy) = proxies.get(&key(&b))
+                && let Some((sequence, frame)) = proxy.peek()?
+            {
+                acp_frames.push(tower_protocol::AcpFrame {
+                    runtime_id: b.runtime_id,
+                    generation: b.generation,
+                    sequence,
+                    frame,
+                });
             }
         }
+        let losses = self
+            .journal
+            .losses(namespace)?
+            .into_iter()
+            .filter(|loss| {
+                !acp_frames
+                    .iter()
+                    .any(|frame| frame.runtime_id == loss.runtime_id)
+            })
+            .collect();
         Ok(RuntimeUpdates {
             receipts,
             losses,
-            requests,
+            acp_frames,
         })
     }
+
     fn batch(&self, b: &Binding) -> Result<Option<RuntimeEvents>> {
         self.journal.batch(b)
     }
@@ -473,37 +416,17 @@ impl ExecutionHost for Runtime {
         self.journal.cursor(b)
     }
     fn reannounce(&self, b: &Binding) -> Result<()> {
-        let (state, fenced, _) = self.journal.state(b)?;
+        let (_state, fenced, _) = self.journal.state(b)?;
         if fenced || self.owner(b)?.is_none() {
             return Ok(());
         }
         let m = self.journal.metadata(b)?;
-        let payload = if b.protocol == "terminal" {
-            if m.pointer("/observation/terminal/running") != Some(&Value::Bool(true)) {
-                return Ok(());
-            }
-            crate::terminal::state_payload(b, &m, "running", false)
-        } else {
-            let id = if b.protocol == "acp" {
-                "acp_session_id"
-            } else {
-                "native_session_id"
-            };
-            if !m[id].as_str().is_some_and(|s| !s.is_empty()) {
-                return Ok(());
-            }
-            let mut payload = json!({"state":match state.as_str(){"working"=>"running","waiting_approval"|"waiting_input"=>"waiting",s=>s},"owner_id":b.owner_id,"tower_session_id":b.tower_session_id});
-            if m["native_session_id"]
-                .as_str()
-                .is_some_and(|s| !s.is_empty())
-            {
-                payload["native_session_id"] = m["native_session_id"].clone();
-            }
-            if b.protocol == "acp" {
-                payload["acp_session_id"] = m["acp_session_id"].clone();
-            }
-            payload
-        };
+        if b.protocol != "terminal"
+            || m.pointer("/observation/terminal/running") != Some(&Value::Bool(true))
+        {
+            return Ok(());
+        }
+        let payload = crate::terminal::state_payload(b, &m, "running", false);
         self.journal.append(
             b,
             "runtime_state",
@@ -520,18 +443,13 @@ impl ExecutionHost for Runtime {
         }
         let v = serde_json::to_value(v).map_err(internal)?;
         match kind {
-            "request" => {
-                let owners = self.owners()?;
-                for binding in self.journal.bindings(Some(ns))? {
-                    if let Some(h) = owners.get(&key(&binding)) {
-                        h.requests.acknowledge(
-                            v["source_request_id"].as_str().unwrap_or(""),
-                            v["request_revision"].as_u64().unwrap_or(0),
-                            v["connection"].as_str().unwrap_or(""),
-                            v["peer_state"].as_str().unwrap_or(""),
-                        )?;
-                    }
-                }
+            "acp" => {
+                self.acp_ack(
+                    ns,
+                    v["runtime_id"].as_str().unwrap_or(""),
+                    v["generation"].as_str().unwrap_or(""),
+                    v["sequence"].as_u64().unwrap_or(0),
+                )?;
             }
             "receipt" => {
                 let sent = v["receipt_revision"].as_u64().unwrap_or(0);
@@ -587,6 +505,9 @@ impl ExecutionHost for Runtime {
             "history_conflict"
         };
         self.journal.fence(b, reason, "unknown")?;
+        if let Some(proxy) = self.proxies.lock().map_err(internal)?.get(&key(b)) {
+            proxy.stop();
+        }
         if let Some(h) = self.owner(b)? {
             h.control
                 .try_send(engine::Control::Stop(reason.into()))
@@ -595,13 +516,22 @@ impl ExecutionHost for Runtime {
         Ok(())
     }
     fn stop(&self, b: &Binding) -> Result<()> {
-        match self.owner(b)? {
-            Some(h) => h
-                .control
-                .try_send(engine::Control::Stop("local_stop".into()))
-                .map_err(|_| error("control_capacity", "Cannot enqueue runtime stop"))?,
-            None => {
-                self.journal.fence(b, "local_stop", "unknown")?;
+        let (_, fenced, termination) = self.journal.state(b)?;
+        if fenced && termination == "confirmed" {
+            return Ok(());
+        }
+        let proxy = self.proxies.lock().map_err(internal)?.get(&key(b)).cloned();
+        if let Some(proxy) = proxy {
+            proxy.stop();
+        } else {
+            match self.owner(b)? {
+                Some(h) => h
+                    .control
+                    .try_send(engine::Control::Stop("local_stop".into()))
+                    .map_err(|_| error("control_capacity", "Cannot enqueue runtime stop"))?,
+                None => {
+                    self.journal.fence(b, "local_stop", "unknown")?;
+                }
             }
         }
         for _ in 0..400 {
@@ -619,36 +549,15 @@ impl ExecutionHost for Runtime {
 }
 
 /// Settles generations left by a previous server and returns the live ones
-/// to continue: terminal generations whose pool sessions may still run, and
-/// structured generations whose native session can be reopened.
-async fn recover(paths: &tower_pal::Paths, journal: &Journal) -> Result<Vec<Binding>> {
+/// to continue: terminal generations whose pool sessions may still run.
+async fn recover(_paths: &tower_pal::Paths, journal: &Journal) -> Result<Vec<Binding>> {
     let boot = tower_pal::boot_id().map_err(internal)?;
     let mut live = Vec::new();
-    let mut processes = Vec::new();
     for binding in journal.bindings(None)? {
-        let (_, fenced, termination) = journal.state(&binding)?;
-        if fenced {
-            if termination == "confirmed" {
-                engine::cleanup_environment(paths, &binding);
-            }
-            continue;
-        }
-        if journal.force_command(&binding)?.is_some() {
-            live.push(binding);
+        if journal.state(&binding)?.1 {
             continue;
         }
         let m = journal.metadata(&binding)?;
-        if journal.force_phase(&binding)?.as_deref() == Some("dispatched")
-            && !m[if binding.protocol == "acp" {
-                "acp_session_id"
-            } else {
-                "native_session_id"
-            }]
-            .is_string()
-        {
-            journal.fence(&binding, "dispatch_unknown", "unknown")?;
-            continue;
-        }
         let rebooted = m["boot_id"].as_str().is_some_and(|old| old != boot);
         if binding.protocol == "terminal" {
             if rebooted {
@@ -658,175 +567,36 @@ async fn recover(paths: &tower_pal::Paths, journal: &Journal) -> Result<Vec<Bind
             }
             continue;
         }
-        // A previous server that crashed can leave its ACP agent running.
-        let process = (binding.protocol == "acp" && !rebooted)
-            .then(|| {
-                Some(tower_pal::ProcessIdentity {
-                    pid: m["pid"].as_u64().and_then(|v| u32::try_from(v).ok())?,
-                    parent: 0,
-                    start_time: m["pid_start_time"].as_u64()?,
+        let process = if binding.protocol == "acp" && !rebooted {
+            m["pid"]
+                .as_u64()
+                .zip(m["pid_start_time"].as_u64())
+                .and_then(|(pid, start_time)| {
+                    u32::try_from(pid)
+                        .ok()
+                        .map(|pid| tower_pal::ProcessIdentity {
+                            pid,
+                            parent: 0,
+                            start_time,
+                        })
                 })
-            })
-            .flatten();
-        if let Some(identity) = process {
-            let _ = tower_pal::kill_protocol_group(identity);
-        }
-        processes.push((binding, process));
-    }
-    for _ in 0..40 {
-        if processes.iter().all(|(_, process)| {
-            process.is_none_or(|i| tower_pal::protocol_group_terminated(i).unwrap_or(false))
-        }) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    for (binding, process) in processes {
-        if process.is_some_and(|i| !tower_pal::protocol_group_terminated(i).unwrap_or(false)) {
-            journal.fence(&binding, "owner_restarted", "unknown")?;
         } else {
-            live.push(binding);
+            None
+        };
+        if let Some(process) = process {
+            let _ = tower_pal::kill_protocol_group(process);
         }
+        let confirmed = rebooted
+            || process.is_some_and(|p| tower_pal::protocol_group_terminated(p).unwrap_or(false));
+        journal.fence(
+            &binding,
+            if m["transport"] == "acp-proxy.v1" {
+                "acp_connection_lost"
+            } else {
+                "acp_migration_required"
+            },
+            if confirmed { "confirmed" } else { "unknown" },
+        )?;
     }
     Ok(live)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    struct NoTerminal;
-    impl ManagedBackend for NoTerminal {
-        fn protocol(&self) -> &str {
-            "terminal"
-        }
-        fn prepare(
-            &self,
-            _: &str,
-            _: &tower_protocol::SessionOpenParams,
-        ) -> Result<tower_sessions::PreparedSession> {
-            Err(error("unsupported", "No terminal backend"))
-        }
-        fn start(
-            &self,
-            _: &ManagedSession,
-            _: &tower_protocol::Secret,
-        ) -> Result<tower_sessions::Observation> {
-            Err(error("unsupported", "No terminal backend"))
-        }
-        fn observe(&self, _: &[ManagedSession]) -> Result<Vec<tower_sessions::Observation>> {
-            Ok(Vec::new())
-        }
-        fn stop(&self, _: &ManagedSession) -> Result<tower_sessions::Observation> {
-            Err(error("unsupported", "No terminal backend"))
-        }
-    }
-    fn host(path: &std::path::Path) -> Runtime {
-        Runtime {
-            paths: tower_pal::Paths {
-                state: path.into(),
-                run: path.join("run"),
-                socket: path.join("towerd.sock"),
-                database: path.join("tower.db"),
-                tokens: path.join("tokens"),
-                logs: path.join("logs"),
-                config_home: path.join("config"),
-                home: path.into(),
-            },
-            journal: Arc::new(Journal::open(&path.join("tower.db"), Limits::default()).unwrap()),
-            owners: Mutex::new(BTreeMap::new()),
-            terminal: Arc::new(NoTerminal),
-            terminal_changes: tokio::sync::watch::channel(0).1,
-            authority: Authority::default(),
-            tasks: tokio::runtime::Handle::current(),
-        }
-    }
-    fn binding() -> Binding {
-        Binding {
-            origin: "https://allgather.example".into(),
-            machine_id: "machine".into(),
-            session_id: "session".into(),
-            runtime_id: "runtime".into(),
-            generation: "generation".into(),
-            tower_session_id: "tower-session".into(),
-            owner_id: "owner".into(),
-            protocol: "codex-app-server".into(),
-            harness: "codex".into(),
-            cwd: "/work/project".into(),
-            resume_session_id: None,
-        }
-    }
-    fn launch(b: &Binding) -> ExecutionCommand {
-        ExecutionCommand {
-            command_id: "command".into(),
-            session_id: b.session_id.clone(),
-            runtime_id: b.runtime_id.clone(),
-            generation: b.generation.clone(),
-            kind: "launch".into(),
-            payload: serde_json::from_value(json!({})).unwrap(),
-            expires_at: "2099-01-01T00:00:00Z".into(),
-        }
-    }
-
-    #[tokio::test]
-    async fn stop_after_the_owner_ended_settles_instead_of_failing() {
-        let root = tempfile::tempdir().unwrap();
-        let host = host(root.path());
-        let b = binding();
-        host.journal.admit(&b, &launch(&b)).unwrap();
-        let (handle, normal, control) = engine::channels();
-        host.owners.lock().unwrap().insert(key(&b), handle);
-        drop((normal, control));
-        host.journal
-            .fence(&b, "native_exited", "confirmed")
-            .unwrap();
-        host.stop(&b).unwrap();
-        let mut prompt = launch(&b);
-        prompt.command_id = "prompt".into();
-        prompt.kind = "prompt".into();
-        let error = host.execute(&b, &prompt).unwrap_err();
-        assert_eq!(error.data.code, "runtime_lost");
-    }
-
-    #[tokio::test]
-    async fn receipt_ack_keeps_unsent_evidence_and_fences_unrecoverable_history() {
-        let root = tempfile::tempdir().unwrap();
-        let host = host(root.path());
-        let b = binding();
-        let c = launch(&b);
-        let first = host.journal.admit(&b, &c).unwrap();
-        host.journal.begin_dispatch(&b, &c.command_id).unwrap();
-        let latest = host
-            .journal
-            .finish_dispatch(&b, &c.command_id, true, None, None)
-            .unwrap();
-        let ack = |sent, reported| {
-            host.acknowledge(
-                &b.namespace(),
-                "receipt",
-                serde_json::from_value(json!({
-                    "command_id":c.command_id, "runtime_id":b.runtime_id, "generation":b.generation,
-                    "receipt_revision":sent, "reported_revision":reported
-                }))
-                .unwrap(),
-            )
-        };
-        ack(first.receipt_revision, latest.receipt_revision).unwrap();
-        let updates = host.journal.receipt_updates(&b.namespace()).unwrap();
-        assert_eq!(updates, vec![latest.clone()]);
-        ack(latest.receipt_revision, latest.receipt_revision).unwrap();
-        assert!(
-            host.journal
-                .receipt_updates(&b.namespace())
-                .unwrap()
-                .is_empty()
-        );
-        let error = ack(latest.receipt_revision, latest.receipt_revision + 1).unwrap_err();
-        assert_eq!(error.data.code, "receipt_history_lost");
-        assert!(host.journal.state(&b).unwrap().1);
-        assert_eq!(
-            host.journal.losses(&b.namespace()).unwrap()[0].reason,
-            "receipt_history_lost"
-        );
-    }
 }

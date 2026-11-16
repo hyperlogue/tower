@@ -887,6 +887,12 @@ impl Service {
         actor: Actor,
         peer: Peer,
     ) -> std::result::Result<Value, RpcError> {
+        if matches!(
+            request.method.as_str(),
+            "acp.open" | "acp.send" | "acp.poll" | "acp.ack" | "acp.close"
+        ) {
+            return self.local_acp_dispatch(request, actor, peer);
+        }
         let now = now_ms();
         if matches!(
             request.method.as_str(),

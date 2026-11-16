@@ -37,7 +37,7 @@ AI coding agents thrive in terminal environments (TUIs), but connecting them to 
 
 - **Universal Harness Support**: Managed launchers for Claude Code, Codex, Reasonix, Kimi Code, Grok Build, OpenCode, Pi, Antigravity, and omp.
 - **Headless & Shared Attachment**: Run agents headless in the background, stream ANSI snapshots over JSON-RPC/HTTP to your webapp, or attach multiple concurrent operators with zero disruption (`Ctrl-Space`, `Ctrl-Q`).
-- **Structured Runtimes & ACP Bridges**: Native ACP streaming for Claude Code and Antigravity, plus shared daemon app-server connectivity for Codex, capturing clean events, form requests, and permission prompts.
+- **Transparent ACP Proxy**: Run ACP agents over stdio or through Allgather. Tower forwards native protocol frames, observes session status, and owns process lifecycle; the client handles transcripts, permissions, and forms.
 - **Real-Time Observability**: Loopback HTTP and SSE stream state deltas, tool activity, and instant `needs_attention` flags (waiting for input, approval required, or unexpected exit).
 - **Enterprise Governance**: Granular message routing rules, private UDS tokens, and audited approval flows for sensitive tools.
 - **Isolated Worktree Lifecycle**: Two-phase (prepare/execute) Git worktree operations prevent repository corruption, with forwarded SSH-agent support.
@@ -96,6 +96,40 @@ tower-cli launch codex --mode native --cwd "$PWD"
 # Attach to an existing session (detach with Ctrl-Space, then Ctrl-Q)
 tower-cli attach SESSION_ID
 ```
+
+### Native ACP clients
+
+Install an ACP-speaking agent executable independently of Tower. The default
+commands are `claude-agent-acp` for `claude-code` and `codex-acp` for `codex`.
+Configure an ACP client to launch Tower as its stdio agent endpoint:
+
+```sh
+tower-cli acp claude-code --cwd "$PWD"
+tower-cli acp codex --cwd "$PWD"
+```
+
+Override or add agent commands in `$XDG_CONFIG_HOME/tower/config.toml`
+(default `~/.config/tower/config.toml`):
+
+```toml
+[acp.agents]
+claude-code = ["claude-agent-acp"]
+codex = ["codex-acp"]
+custom-agent = ["my-acp-agent", "--stdio"]
+```
+
+Only installed commands are advertised. The ACP client sends `initialize`,
+`session/new` or `session/load`, prompts, configuration changes, and replies.
+Tower forwards their JSON unchanged and does not validate form schemas or answer
+agent requests. Closing the client connection stops its agent process group.
+
+This replaces the old managed ACP and Codex app-server control protocols.
+Upgrade Tower and Allgather together; older structured clients are rejected.
+Existing history is retained, but old executions cannot continue through the new
+protocol. Start a new ACP session after upgrading. A later proxy restart closes
+that connection; explicitly resume with `session/load` when the agent supports
+it. Prompts are never replayed automatically. Terminal sessions and messaging
+continue to use their existing interfaces.
 
 ### 2. Session Observability & Snapshots
 
@@ -203,7 +237,7 @@ cargo test --workspace --locked
 - **`tower-terminal`**: Terminal backend adapter and PTY attach client.
 - **`tower-launcher`**: Per-session agent supervisor and the API for programs that embed it.
 - **`tower-agents`**: Launchers, hooks, and adapters for nine harnesses.
-- **`tower-runtime`**: Structured ACP and app-server runtimes and event journals.
+- **`tower-runtime`**: ACP process proxy, terminal lifecycle, and execution journal.
 - **`tower-vcs`**: Git repository and worktree lifecycle management.
 - **`tower-store`**: SQLite state persistence, policy snapshots, and sync state.
 - **`tower-pal`**: Platform abstractions for terminal, IPC, and processes.

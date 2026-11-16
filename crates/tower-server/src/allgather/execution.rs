@@ -10,7 +10,7 @@ enum Item {
     Events(RuntimeBinding, RuntimeEvents),
     Receipt(ExecutionReceipt),
     Loss(RuntimeBinding, RuntimeLoss),
-    Request(RuntimeBinding, String, u64, bool),
+    Acp(RuntimeBinding, u64),
 }
 struct Pending {
     key: String,
@@ -56,7 +56,7 @@ impl Publisher {
             .ok_or_else(|| invalid("Runtime RPC identity exhausted"))?;
         let id = format!("runtime/{}", self.counter);
         let frame = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
-        if serde_json::to_vec(&frame)?.len() > tower_protocol::MAX_FRAME_BYTES {
+        if serde_json::to_vec(&frame)?.len() > tower_protocol::frame_limit(method) {
             return Err(invalid("Runtime publication exceeds frame limit"));
         }
         self.pending.insert(
@@ -101,7 +101,8 @@ impl Publisher {
         let mut frames = Vec::new();
         for receipt in updates.receipts {
             if !views.iter().any(|v| {
-                v.binding.runtime_id == receipt.runtime_id
+                v.binding.protocol == "terminal"
+                    && v.binding.runtime_id == receipt.runtime_id
                     && v.binding.generation == receipt.generation
             }) {
                 continue;
@@ -127,28 +128,25 @@ impl Publisher {
                 )?;
             }
         }
-        for request in updates.requests {
-            let id = request.source_request_id.clone();
-            let revision = request.request_revision;
-            let Some(view) = views.iter().find(|v| {
-                v.binding.runtime_id == request.runtime_id
-                    && v.binding.generation == request.generation
-            }) else {
-                continue;
-            };
-            let live = request.state == "pending";
-            if live && (!self.ready.contains(&key(&view.binding)) || view.fenced) {
-                continue;
+        for frame in updates.acp_frames {
+            if let Some(view) = views.iter().find(|v| {
+                v.binding.protocol == "acp"
+                    && v.binding.runtime_id == frame.runtime_id
+                    && v.binding.generation == frame.generation
+            }) {
+                self.insert(
+                    "acp.frame",
+                    serde_json::to_value(&frame)?,
+                    format!("acp/{}", frame.runtime_id),
+                    Item::Acp(view.binding.clone(), frame.sequence),
+                    &mut frames,
+                )?;
             }
-            self.insert(
-                "session.request",
-                serde_json::to_value(request)?,
-                format!("request/{id}"),
-                Item::Request(view.binding.clone(), id, revision, live),
-                &mut frames,
-            )?;
         }
         for v in views {
+            if v.binding.protocol != "terminal" {
+                continue;
+            }
             let b = v.binding;
             let k = key(&b);
             if self.fenced.contains(&k) {
@@ -197,36 +195,6 @@ impl Publisher {
                 .pointer("/error/data/code")
                 .and_then(Value::as_str)
                 .unwrap_or("runtime_sync_failed");
-            if let Item::Request(binding, id, revision, live) = &p.item
-                && matches!(
-                    code,
-                    "stale_request"
-                        | "unsupported_control"
-                        | "control_scope_required"
-                        | "request_conflict"
-                        | "invalid_control"
-                        | "unsupported_schema"
-                        | "request_too_large"
-                        | "runtime_fenced"
-                        | "runtime_conflict"
-                )
-            {
-                let ack = public(
-                    json!({"source_request_id":id,"request_revision":revision,"connection":self.connection}),
-                )?;
-                worker
-                    .execute(move |s| s.execution_ack("request".into(), ack, epoch))
-                    .await??;
-                if *live {
-                    let b = binding.clone();
-                    let reason = code.to_owned();
-                    self.fenced.insert(key(&b));
-                    worker
-                        .execute(move |s| s.execution_fence(b, reason, epoch))
-                        .await??;
-                }
-                return Ok(true);
-            }
             if matches!(
                 code,
                 "sequence_conflict"
@@ -374,21 +342,16 @@ impl Publisher {
                     .execute(move |s| s.execution_ack("loss".into(), value, epoch))
                     .await??;
             }
-            Item::Request(_, id, revision, _) => {
-                if r["source_request_id"] != id
-                    || (r["request_revision"] != revision
-                        && !matches!(
-                            r["state"].as_str(),
-                            Some("answered" | "cancelled" | "stale")
-                        ))
+            Item::Acp(b, sequence) => {
+                if r["runtime_id"] != b.runtime_id
+                    || r["generation"] != b.generation
+                    || r["sequence"] != sequence
                 {
-                    return Err(invalid("Private request acknowledgement changed identity"));
+                    return Err(invalid("ACP acknowledgement changed identity"));
                 }
-                let ack = public(
-                    json!({"source_request_id":id,"request_revision":revision,"connection":self.connection,"peer_state":r["state"]}),
-                )?;
+                let ack = public(r.clone())?;
                 worker
-                    .execute(move |s| s.execution_ack("request".into(), ack, epoch))
+                    .execute(move |s| s.execution_ack("acp".into(), ack, epoch))
                     .await??;
             }
         }

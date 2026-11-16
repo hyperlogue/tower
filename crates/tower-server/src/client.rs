@@ -173,7 +173,8 @@ impl Client {
             610
         } else if method == "vcs.prepare" || method == "vcs.execute" {
             210
-        } else if method == "message.send"
+        } else if method == "acp.close"
+            || method == "message.send"
             || method == "pool.upgrade"
             || method.starts_with("allgather.enrollment.")
         {

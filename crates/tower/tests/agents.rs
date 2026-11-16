@@ -913,14 +913,7 @@ fn terminal_launch_starts_by_default_and_defer_is_explicit() {
     assert!(row["pid"].is_null());
     assert!(!f.root.path().join("opencode.starts").exists());
     let unsupported = f
-        .command(&[
-            "launch",
-            "codex",
-            "--protocol",
-            "codex-app-server",
-            "--term",
-            "xterm",
-        ])
+        .command(&["launch", "codex", "--protocol", "acp", "--term", "xterm"])
         .output()
         .unwrap();
     assert!(!unsupported.status.success());

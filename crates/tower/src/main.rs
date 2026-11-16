@@ -4,6 +4,7 @@ use std::process::ExitCode;
 use tower_pal::Paths;
 use tower_protocol::*;
 use tower_server::client::Client;
+mod acp;
 mod attach;
 mod clipboard;
 mod hooks;
@@ -24,6 +25,12 @@ struct Cli {
 }
 #[derive(Subcommand)]
 enum Command {
+    /// Proxy a native ACP client on stdin/stdout through the Tower daemon.
+    Acp {
+        harness: String,
+        #[arg(long, default_value = ".")]
+        cwd: String,
+    },
     #[command(name = "__session-mcp", hide = true)]
     SessionMcp {
         context: std::path::PathBuf,
@@ -589,6 +596,9 @@ fn execute(mut cli: Cli) -> Result<()> {
     result
 }
 async fn run(cli: Cli, paths: Paths) -> Result<()> {
+    if let Command::Acp { harness, cwd } = &cli.command {
+        return acp::run(&paths, context()?, !cli.no_start, harness, cwd).await;
+    }
     if let Command::Login {
         pairing_code: Some(code),
         ..
@@ -621,6 +631,7 @@ async fn run(cli: Cli, paths: Paths) -> Result<()> {
         Err(e) => return Err(e.into()),
     };
     match cli.command {
+        Command::Acp { .. } => unreachable!(),
         Command::Login {
             url,
             pairing_code,

@@ -16,7 +16,6 @@ use tower_protocol::{AllgatherHelloAck, PolicyPush, Request, Response, ResponseB
 pub(crate) struct ExecutionProtocols {
     pub managed: bool,
     pub terminal: bool,
-    pub force_resume: bool,
 }
 impl ExecutionProtocols {
     pub(crate) fn allows(self, protocol: &str) -> bool {
@@ -275,7 +274,10 @@ pub(super) fn start(
 }
 fn encode<T: Serialize>(value: &T) -> Result<String> {
     let text = serde_json::to_string(value)?;
-    if text.len() > tower_protocol::MAX_FRAME_BYTES {
+    if text.len() > tower_protocol::MAX_FRAME_BYTES && {
+        let value: serde_json::Value = serde_json::from_str(&text)?;
+        text.len() > tower_protocol::frame_limit(value["method"].as_str().unwrap_or(""))
+    } {
         return Err(tower_protocol::RpcError::application(
             "sync_frame_too_large",
             "Sync frame exceeds 1 MiB; no partial frame was sent",
@@ -346,9 +348,9 @@ async fn connection(
             .map_err(|_| Error::Other("Invalid access key".into()))?,
     );
     let limits = WebSocketConfig::default()
-        .max_message_size(Some(tower_protocol::MAX_FRAME_BYTES))
-        .max_frame_size(Some(tower_protocol::MAX_FRAME_BYTES))
-        .max_write_buffer_size(tower_protocol::MAX_FRAME_BYTES + 1024);
+        .max_message_size(Some(tower_protocol::MAX_ACP_ENVELOPE_BYTES))
+        .max_frame_size(Some(tower_protocol::MAX_ACP_ENVELOPE_BYTES))
+        .max_write_buffer_size(tower_protocol::MAX_ACP_ENVELOPE_BYTES + 1024);
     let (mut socket, _) = tokio::time::timeout(
         Duration::from_secs(10),
         tokio_tungstenite::connect_async_with_config(request, Some(limits), false),
@@ -409,11 +411,9 @@ async fn connection(
         .capabilities
         .iter()
         .any(|c| c == "session-status-delta.v1");
-    let managed_enabled = ["managed-acp.v1", "command-receipts.v1", "session-stream.v1"]
-        .iter()
-        .all(|c| {
-            hello.capabilities.iter().any(|v| v == c) && ack.capabilities.iter().any(|v| v == c)
-        });
+    let managed_enabled = hello.capabilities.iter().any(|c| c == "acp-proxy.v1")
+        && ack.capabilities.iter().any(|c| c == "acp-proxy.v1")
+        && config.permits_scope("acp:control");
     let terminal_enabled = [
         "terminal-launch.v1",
         "command-receipts.v1",
@@ -424,13 +424,6 @@ async fn connection(
     let protocols = ExecutionProtocols {
         managed: managed_enabled,
         terminal: terminal_enabled,
-        force_resume: managed_enabled
-            && ["session-resume.v1", "session-force-resume.v1"]
-                .iter()
-                .all(|c| {
-                    hello.capabilities.iter().any(|v| v == c)
-                        && ack.capabilities.iter().any(|v| v == c)
-                }),
     };
     let mut catalog = catalog::Sync::new(&hello.capabilities, &ack.capabilities);
     if catalog.enabled() {

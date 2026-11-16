@@ -574,7 +574,7 @@ async fn rpc_bounds_errors_notifications_and_version_negotiation() {
         incompatible["error"]["data"]["code"],
         "protocol_incompatible"
     );
-    let large = vec![b'x'; tower_protocol::MAX_FRAME_BYTES + 1];
+    let large = vec![b'x'; tower_protocol::MAX_ACP_ENVELOPE_BYTES + 1];
     // Either the write or the next read observes the close, depending on buffering.
     let _ = stream.get_mut().write_all(&large).await;
     let mut byte = [0];

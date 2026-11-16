@@ -7,7 +7,19 @@ use tower_protocol::{MAX_FRAME_BYTES, MAX_RESPONSE_BYTES};
 pub(crate) async fn read_frame<R: AsyncBufRead + Unpin>(
     reader: &mut R,
 ) -> io::Result<Option<Vec<u8>>> {
-    read_bounded(reader, MAX_FRAME_BYTES).await
+    let frame = read_bounded(reader, tower_protocol::MAX_ACP_ENVELOPE_BYTES).await?;
+    if let Some(bytes) = &frame
+        && bytes.len() > MAX_FRAME_BYTES
+    {
+        let value: serde_json::Value = serde_json::from_slice(bytes).map_err(io::Error::other)?;
+        if bytes.len() > tower_protocol::frame_limit(value["method"].as_str().unwrap_or("")) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "RPC frame exceeds limit",
+            ));
+        }
+    }
+    Ok(frame)
 }
 pub(crate) async fn read_response<R: AsyncBufRead + Unpin>(
     reader: &mut R,

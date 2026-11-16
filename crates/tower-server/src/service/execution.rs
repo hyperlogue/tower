@@ -185,109 +185,77 @@ impl Service {
         epoch: u64,
         protocols: crate::allgather::ExecutionProtocols,
     ) -> std::result::Result<Value, RpcError> {
+        self.execution_dispatch_inner(request, epoch, protocols, false)
+    }
+    fn execution_dispatch_inner(
+        &self,
+        request: &Request,
+        epoch: u64,
+        protocols: crate::allgather::ExecutionProtocols,
+        proxy: bool,
+    ) -> std::result::Result<Value, RpcError> {
         if !self.allgather_config.managed {
             return Err(app("unsupported", "Managed execution is disabled"));
         }
         let actor = self.remote_actor(epoch)?;
         let host = self.execution_host()?;
         let namespace = self.execution_namespace()?;
+        let views = host.list(Some(&namespace))?;
         if request.method == "command.status" {
             require(&actor, "read")?;
             let p: ExecutionStatus = params(&request.params)?;
-            if let Some(view) = host
-                .list(Some(&namespace))?
+            if views
                 .iter()
-                .find(|v| v.binding.runtime_id == p.runtime_id)
-                && !protocols.allows(&view.binding.protocol)
+                .any(|v| v.binding.runtime_id == p.runtime_id && v.binding.protocol != "terminal")
             {
                 return Err(app(
-                    "unsupported_control",
-                    "Runtime protocol was not negotiated",
+                    "acp_required",
+                    "Managed commands were removed; use ACP",
                 ));
             }
             return value(host.status(&namespace, &p)?);
         }
         let c: ExecutionCommand = params(&request.params)?;
-        let force = tower_sessions::execution::force_resume(&c)?;
-        if force.is_some() && !protocols.force_resume {
-            return Err(app(
-                "unsupported_control",
-                "Force resume was not negotiated",
-            ));
-        }
-        host.status(
-            &namespace,
-            &ExecutionStatus {
-                command_id: c.command_id.clone(),
-                runtime_id: c.runtime_id.clone(),
-                generation: c.generation.clone(),
-            },
-        )?;
         let payload: serde_json::Value =
             serde_json::to_value(&c.payload).map_err(|_| invalid("Invalid command payload"))?;
-        let cleanup = c.kind == "cancel"
-            || (c.kind == "reply"
-                && (payload
-                    .pointer("/response/outcome/optionId")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("reject_once")
-                    || payload
-                        .pointer("/response/outcome/outcome")
-                        .and_then(serde_json::Value::as_str)
-                        == Some("cancelled")
-                    || matches!(
-                        payload
-                            .pointer("/response/action")
-                            .and_then(serde_json::Value::as_str),
-                        Some("decline" | "cancel")
-                    )));
-        let views = host.list(Some(&namespace))?;
-        let mut binding = views
+        let binding = views
             .iter()
             .find(|v| v.binding.runtime_id == c.runtime_id)
             .map(|v| v.binding.clone());
-        if binding.is_none() {
-            for s in self.store.managed_sessions().map_err(storage)? {
-                if matches!(s.protocol.as_str(), "acp" | "codex-app-server" | "terminal")
-                    && let Some(b) = RuntimeBinding::from_session(&s)?
-                    && b.namespace() == namespace
-                    && b.runtime_id == c.runtime_id
-                {
-                    binding = Some(b);
-                    break;
-                }
-            }
-        }
-        let terminal = binding
+        let protocol = binding
             .as_ref()
-            .map_or(payload["protocol"] == "terminal", |b| {
-                b.protocol == "terminal"
-            });
-        if !protocols.allows(if terminal { "terminal" } else { "acp" }) {
+            .map(|b| b.protocol.as_str())
+            .or(payload["protocol"].as_str())
+            .unwrap_or("");
+        if proxy {
+            if protocol != "acp" || c.kind != "launch" {
+                return Err(app(
+                    "acp_required",
+                    "Open an ACP connection and exchange native frames",
+                ));
+            }
+            require(&actor, "acp:control")?;
+        } else {
+            if protocol != "terminal" {
+                return Err(app(
+                    "acp_required",
+                    "Managed commands were removed; use acp.open and acp.send",
+                ));
+            }
+            require(&actor, "terminal:control")?;
+            validate_terminal_command(&c)?;
+        }
+        if !protocols.allows(protocol) {
             return Err(app(
                 "unsupported_control",
                 "Runtime protocol was not negotiated",
             ));
         }
-        require(
-            &actor,
-            if terminal {
-                "terminal:control"
-            } else {
-                "acp:control"
-            },
-        )?;
-        if terminal {
-            validate_terminal_command(&c)?;
-        }
         if let Some(b) = &binding {
             if b.generation != c.generation || b.session_id != c.session_id {
-                return Err(app(
-                    "runtime_conflict",
-                    "Command execution identity changed",
-                ));
+                return Err(app("runtime_conflict", "Execution identity changed"));
             }
-            let status = host.status(
+            let retained = host.status(
                 &namespace,
                 &ExecutionStatus {
                     command_id: c.command_id.clone(),
@@ -295,39 +263,34 @@ impl Service {
                     generation: c.generation.clone(),
                 },
             )?;
-            if status.state != "missing" {
+            if retained.state != "missing" {
                 return value(host.execute(b, &c)?);
             }
         }
+        let cleanup = !proxy && c.kind == "cancel";
         if !cleanup && !self.policy_ready() {
-            return Err(app(
-                "denied",
-                "Managed commands require a current control connection and applied policy",
-            ));
+            return Err(app("denied", "Execution requires current applied policy"));
         }
-        let new_generation = binding.is_none();
+        let fresh = binding.is_none();
         let b = if let Some(b) = binding {
             b
         } else {
-            if !matches!(c.kind.as_str(), "launch" | "resume") {
-                return Err(app("not_found", "Managed runtime is unknown"));
+            if c.kind != "launch" {
+                return Err(app("not_found", "Execution is unknown"));
             }
             let harness = payload["harness"]
                 .as_str()
                 .ok_or_else(|| invalid("Harness is required"))?;
-            let protocol = payload["protocol"]
-                .as_str()
-                .ok_or_else(|| invalid("Managed protocol is required"))?;
-            let controls = if protocol == "terminal" {
-                self.terminal_controls()
-            } else {
+            let controls = if proxy {
                 host.controls()
+            } else {
+                self.terminal_controls()
             };
             if controls
                 .get(harness)
-                .is_none_or(|profile| profile.protocol != protocol)
+                .is_none_or(|control| control.protocol != protocol)
             {
-                return Err(app("unsupported", "Harness adapter is unavailable"));
+                return Err(app("unsupported", "Configured agent is unavailable"));
             }
             let cwd = self
                 .paths
@@ -346,69 +309,20 @@ impl Service {
                 .iter()
                 .rev()
                 .find(|v| v.binding.session_id == c.session_id);
-            let resume = payload["resume_session_id"].as_str().map(str::to_owned);
-            if c.kind == "resume"
-                && resume.as_ref().is_none_or(|s| {
-                    s.is_empty() || s.len() > 160 || s.chars().any(char::is_control)
-                })
-            {
-                return Err(invalid("Resume requires a known native session identity"));
-            }
-            let id = if c.kind == "resume" {
-                let previous = views
-                    .iter()
-                    .rev()
-                    .find(|v| {
-                        v.binding.session_id == c.session_id
-                            && serde_json::to_value(&v.metadata).ok().is_some_and(|m| {
-                                m[if protocol == "acp" {
-                                    "acp_session_id"
-                                } else {
-                                    "native_session_id"
-                                }]
-                                .as_str()
-                                    == resume.as_deref()
-                            })
-                    })
-                    .ok_or_else(|| {
-                        app(
-                            "resume_unavailable",
-                            "No prior execution is bound to this logical session",
-                        )
-                    })?;
-                let metadata: serde_json::Value = serde_json::to_value(&previous.metadata)
-                    .map_err(|_| invalid("Invalid native metadata"))?;
-                if protocol == "codex-app-server" && metadata["native_resumable"] != true {
-                    return Err(app(
-                        "resume_unavailable",
-                        "Codex has not confirmed resumable conversation history; the old execution was not stopped",
-                    ));
-                }
-                if previous.binding.harness != harness
-                    || previous.binding.protocol != protocol
-                    || (force.is_none()
-                        && (!previous.fenced || previous.termination != "confirmed"))
-                    || resume.as_deref()
-                        != metadata[if protocol == "acp" {
-                            "acp_session_id"
-                        } else {
-                            "native_session_id"
-                        }]
-                        .as_str()
+            let id = if let Some(previous) = previous {
+                if !proxy
+                    || !previous.fenced
+                    || previous.termination != "confirmed"
+                    || previous.binding.harness != harness
+                    || previous.binding.protocol != "acp"
                 {
                     return Err(app(
-                        "resume_unavailable",
-                        "Stop the previous execution or use force resume; native history must match this session",
+                        "runtime_conflict",
+                        "Close the previous connection before replacing it",
                     ));
                 }
                 previous.binding.tower_session_id.clone()
             } else {
-                if previous.is_some() || resume.is_some() {
-                    return Err(app(
-                        "runtime_conflict",
-                        "Use resume for an existing logical session",
-                    ));
-                }
                 format!(
                     "{}-{}",
                     self.store.host().map_err(storage)?.node_name,
@@ -418,8 +332,8 @@ impl Service {
                     )
                 )
             };
-            let (origin, machine_id): (String, String) = serde_json::from_str(&namespace)
-                .map_err(|_| invalid("Invalid enrollment namespace"))?;
+            let (origin, machine_id) =
+                serde_json::from_str(&namespace).map_err(|_| invalid("Invalid namespace"))?;
             RuntimeBinding {
                 origin,
                 machine_id,
@@ -437,10 +351,186 @@ impl Service {
                 protocol: protocol.into(),
                 harness: harness.into(),
                 cwd,
-                resume_session_id: resume,
+                resume_session_id: None,
             }
         };
         if !cleanup {
+            let cwd = self
+                .paths
+                .display_cwd(&b.cwd)
+                .map_err(|_| invalid("Invalid directory"))?;
+            self.session_policy(
+                &actor,
+                crate::policy::Subject {
+                    id: &b.tower_session_id,
+                    harness: Some(&b.harness),
+                    cwd: Some(&cwd),
+                },
+            )?;
+        }
+        if fresh {
+            host.validate_new(&b, &c)?;
+        } else {
+            let current = self
+                .store
+                .managed_session(&b.tower_session_id)
+                .map_err(storage)?;
+            let current = RuntimeBinding::from_session(&current)?
+                .ok_or_else(|| app("runtime_fenced", "Execution has no owner"))?;
+            if current.namespace() != b.namespace()
+                || current.runtime_id != b.runtime_id
+                || current.generation != b.generation
+            {
+                return Err(app("runtime_fenced", "Execution owner changed"));
+            }
+        }
+        self.reserve_execution(&b)?;
+        let receipt = host.execute(&b, &c)?;
+        self.publish()?;
+        value(receipt)
+    }
+    pub(super) fn local_acp_dispatch(
+        &self,
+        request: &Request,
+        actor: Actor,
+        peer: Peer,
+    ) -> std::result::Result<Value, RpcError> {
+        require(&actor, "acp:control")?;
+        let mut p: serde_json::Value =
+            serde_json::to_value(&request.params).map_err(|_| invalid("Invalid ACP request"))?;
+        if request.method == "acp.open" {
+            p["protocol"] = serde_json::json!("acp");
+            let mut launch = request.clone();
+            launch.method = "session.open".into();
+            launch.params = value(p)?;
+            let opened = self.dispatch_actor(&launch, actor, peer)?;
+            let opened: serde_json::Value =
+                serde_json::to_value(opened).map_err(|_| invalid("Invalid session"))?;
+            let session = self
+                .store
+                .managed_session(
+                    opened["id"]
+                        .as_str()
+                        .ok_or_else(|| invalid("Missing session identity"))?,
+                )
+                .map_err(storage)?;
+            let b = RuntimeBinding::from_session(&session)?
+                .ok_or_else(|| invalid("Missing ACP binding"))?;
+            return value(
+                serde_json::json!({"runtime_id":b.runtime_id,"generation":b.generation,"tower_session_id":b.tower_session_id,"owner_id":b.owner_id}),
+            );
+        }
+        let namespace =
+            serde_json::to_string(&("local", "local")).map_err(|_| invalid("Invalid namespace"))?;
+        let host = self.execution_host()?;
+        let view = host
+            .list(Some(&namespace))?
+            .into_iter()
+            .find(|v| {
+                v.binding.runtime_id == p["runtime_id"] && v.binding.generation == p["generation"]
+            })
+            .ok_or_else(|| app("not_found", "ACP connection is unavailable"))?;
+        let b = &view.binding;
+        if b.protocol != "acp" {
+            return Err(app("acp_required", "This is not an ACP proxy"));
+        }
+        let cwd = self
+            .paths
+            .display_cwd(&b.cwd)
+            .map_err(|_| invalid("Invalid directory"))?;
+        self.session_policy(
+            &actor,
+            crate::policy::Subject {
+                id: &b.tower_session_id,
+                harness: Some(&b.harness),
+                cwd: Some(&cwd),
+            },
+        )?;
+        let sequence = p["sequence"].as_u64().unwrap_or(0);
+        match request.method.as_str() {
+            "acp.send" => {
+                host.acp_send(
+                    &namespace,
+                    &b.runtime_id,
+                    &b.generation,
+                    sequence,
+                    p["frame"]
+                        .as_str()
+                        .ok_or_else(|| invalid("ACP frame required"))?,
+                )?;
+                value(serde_json::json!({"sequence":sequence}))
+            }
+            "acp.ack" => {
+                host.acp_ack(&namespace, &b.runtime_id, &b.generation, sequence)?;
+                value(serde_json::json!({"sequence":sequence}))
+            }
+            "acp.poll" => {
+                let frames = host
+                    .updates(&namespace, "local-acp")?
+                    .acp_frames
+                    .into_iter()
+                    .filter(|f| f.runtime_id == b.runtime_id)
+                    .collect::<Vec<_>>();
+                value(serde_json::json!({"frames":frames,"closed":view.fenced,"state":view.state}))
+            }
+            "acp.close" => {
+                host.stop(b)?;
+                value(serde_json::json!({"closed":true}))
+            }
+            _ => Err(app("unsupported", "Unknown ACP operation")),
+        }
+    }
+    pub(super) fn acp_dispatch(
+        &self,
+        request: &Request,
+        epoch: u64,
+        protocols: crate::allgather::ExecutionProtocols,
+    ) -> std::result::Result<Value, RpcError> {
+        let actor = self.remote_actor(epoch)?;
+        require(&actor, "acp:control")?;
+        if !protocols.managed || !self.allgather_config.managed {
+            return Err(app("acp_required", "Negotiate acp-proxy.v1"));
+        }
+        let p: serde_json::Value =
+            serde_json::to_value(&request.params).map_err(|_| invalid("Invalid ACP request"))?;
+        let namespace = self.execution_namespace()?;
+        let host = self.execution_host()?;
+        if request.method == "acp.open" {
+            let mut launch = request.clone();
+            launch.method = "command.execute".into();
+            launch.params = value(serde_json::json!({
+                "command_id":p["command_id"],"session_id":p["session_id"],"runtime_id":p["runtime_id"],
+                "generation":p["generation"],"kind":"launch","expires_at":p["expires_at"],
+                "payload":{"harness":p["harness"],"protocol":"acp","cwd":p["cwd"],"generation":p["generation"]}
+            }))?;
+            self.execution_dispatch_inner(&launch, epoch, protocols, true)?;
+        }
+        let b = host
+            .list(Some(&namespace))?
+            .into_iter()
+            .find(|v| {
+                v.binding.runtime_id == p["runtime_id"] && v.binding.generation == p["generation"]
+            })
+            .map(|v| v.binding)
+            .ok_or_else(|| app("not_found", "ACP connection is unavailable"))?;
+        if b.protocol != "acp" {
+            return Err(app("acp_required", "This is not an ACP proxy connection"));
+        }
+        let current = self
+            .store
+            .managed_session(&b.tower_session_id)
+            .map_err(storage)?;
+        let current = RuntimeBinding::from_session(&current)?
+            .ok_or_else(|| app("runtime_fenced", "ACP owner changed"))?;
+        if request.method != "acp.close"
+            && (current.runtime_id != b.runtime_id || current.generation != b.generation)
+        {
+            return Err(app("runtime_fenced", "ACP owner changed"));
+        }
+        if request.method != "acp.close" {
+            if !self.policy_ready() {
+                return Err(app("denied", "ACP forwarding requires current policy"));
+            }
             let cwd = self
                 .paths
                 .display_cwd(&b.cwd)
@@ -454,93 +544,31 @@ impl Service {
                 },
             )?;
         }
-        if !new_generation {
-            let current = self
-                .store
-                .managed_session(&b.tower_session_id)
-                .map_err(storage)?;
-            let current = RuntimeBinding::from_session(&current)?
-                .ok_or_else(|| app("runtime_conflict", "Session has no execution owner"))?;
-            if current.namespace() != b.namespace()
-                || current.runtime_id != b.runtime_id
-                || current.generation != b.generation
-            {
-                return Err(app(
-                    "runtime_fenced",
-                    "This execution is no longer the current session owner",
-                ));
+        match request.method.as_str() {
+            "acp.open" => value(
+                serde_json::json!({"runtime_id":b.runtime_id,"generation":b.generation,"tower_session_id":b.tower_session_id,"owner_id":b.owner_id}),
+            ),
+            "acp.send" => {
+                let sequence = p["sequence"]
+                    .as_u64()
+                    .ok_or_else(|| invalid("ACP sequence required"))?;
+                host.acp_send(
+                    &namespace,
+                    &b.runtime_id,
+                    &b.generation,
+                    sequence,
+                    p["frame"]
+                        .as_str()
+                        .ok_or_else(|| invalid("ACP frame must be a string"))?,
+                )?;
+                value(serde_json::json!({"sequence":sequence}))
             }
+            "acp.close" => {
+                host.stop(&b)?;
+                value(serde_json::json!({"closed":true}))
+            }
+            _ => Err(app("unsupported", "Unknown ACP transport operation")),
         }
-        if new_generation {
-            host.validate_new(&b, &c)?;
-            if let Some(targets) = &force {
-                for target in targets {
-                    let old = views
-                        .iter()
-                        .find(|v| {
-                            v.binding.runtime_id == target.runtime_id
-                                && v.binding.generation == target.generation
-                        })
-                        .ok_or_else(|| {
-                            app("cleanup_target_conflict", "Cleanup target unavailable")
-                        })?;
-                    let cwd = self
-                        .paths
-                        .display_cwd(&old.binding.cwd)
-                        .map_err(|_| invalid("Invalid cleanup directory"))?;
-                    self.session_policy(
-                        &actor,
-                        crate::policy::Subject {
-                            id: &old.binding.tower_session_id,
-                            harness: Some(&old.binding.harness),
-                            cwd: Some(&cwd),
-                        },
-                    )?;
-                }
-            }
-        }
-        let previous = if new_generation && force.is_some() {
-            Some(
-                self.store
-                    .managed_session(&b.tower_session_id)
-                    .map_err(storage)?,
-            )
-        } else {
-            None
-        };
-        self.reserve_execution(&b)?;
-        let receipt = match host.execute(&b, &c) {
-            Ok(receipt) => receipt,
-            Err(error) => {
-                if let Some(previous) = previous
-                    && host
-                        .status(
-                            &namespace,
-                            &ExecutionStatus {
-                                command_id: c.command_id.clone(),
-                                runtime_id: c.runtime_id.clone(),
-                                generation: c.generation.clone(),
-                            },
-                        )
-                        .is_ok_and(|r| r.state == "missing")
-                {
-                    self.store
-                        .replace_managed(
-                            &previous,
-                            if b.harness == "codex" {
-                                Some("app-server")
-                            } else {
-                                None
-                            },
-                            now_ms(),
-                        )
-                        .map_err(storage)?;
-                }
-                return Err(error);
-            }
-        };
-        self.publish()?;
-        value(receipt)
     }
     fn reserve_execution(&self, b: &RuntimeBinding) -> std::result::Result<(), RpcError> {
         let session = ManagedSession {
@@ -565,7 +593,7 @@ impl Service {
                     self.store
                         .replace_managed(
                             &session,
-                            if b.harness == "codex" {
+                            if b.protocol == "terminal" && b.harness == "codex" {
                                 Some("app-server")
                             } else {
                                 None
@@ -594,7 +622,7 @@ impl Service {
                     display_name: None,
                     node: host.node_name,
                     harness: b.harness.clone(),
-                    mode: if b.harness == "codex" {
+                    mode: if b.protocol == "terminal" && b.harness == "codex" {
                         Some("app-server".into())
                     } else {
                         None

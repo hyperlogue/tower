@@ -176,7 +176,6 @@ async fn cancel_pending(
 ) -> Result<bool> {
     while let Ok(stop) = control.try_recv() {
         let reason = match stop {
-            engine::Control::Suspend => continue,
             engine::Control::Command(c) => {
                 if let Err(e) = authority.check(b, &c).await {
                     journal.finish_dispatch(
@@ -466,8 +465,7 @@ async fn run_inner(
                     engine::Control::Command(command) => (Some(command), "stop_runtime".to_owned()),
                     engine::Control::Stop(reason) => (None, reason),
                     // Terminal sessions live in the pool across server restarts.
-                    engine::Control::Suspend => continue,
-                };
+                        };
                 if let Some(c) = &command {
                     if let Err(e) = ctx.authority.check(b, c).await {
                         journal.finish_dispatch(b, &c.command_id, false, None, Some(failure(&e.data.code, "dispatch", false)))?;
