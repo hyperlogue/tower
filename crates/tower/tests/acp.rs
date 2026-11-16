@@ -62,11 +62,7 @@ impl Fixture {
     async fn status(&self, id: &str, wanted: &str) {
         tokio::time::timeout(Duration::from_secs(45), async {
             loop {
-                let rows = self.rpc("agent.list", json!({}));
-                if rows.as_array().is_some_and(|rows| {
-                    rows.iter()
-                        .any(|row| row["id"] == id && row["status"] == wanted)
-                }) {
+                if self.rpc("agent.get", json!({"id":id}))["status"] == wanted {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -240,4 +236,113 @@ async fn an_open_connection_can_be_closed_without_initializing_an_agent_session(
     let opened = f.rpc("acp.open", json!({"harness":"fixture","cwd":f.root.path()}));
     assert_eq!(f.rpc("acp.close", opened.clone())["closed"], true);
     assert_eq!(f.rpc("acp.close", opened)["closed"], true);
+}
+
+#[tokio::test]
+async fn stdio_backpressure_preserves_a_burst_of_frames_in_order() {
+    let f = Fixture::new();
+    let mut command = f.command(&["acp", "fixture"]);
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    let mut child = tokio::process::Command::from(command)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap());
+    let frames: Vec<_> = (0..80)
+        .map(|n| {
+            json!({"method":"vendor/slow","params":{"n":n,"text":"x".repeat(32_000)}}).to_string()
+        })
+        .collect();
+    let (input, ()) = tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::join!(
+            async {
+                for frame in &frames {
+                    input
+                        .write_all(format!("{frame}\n").as_bytes())
+                        .await
+                        .unwrap();
+                }
+                input
+            },
+            async {
+                for expected in &frames {
+                    assert_eq!(&line(&mut output).await, expected);
+                }
+            }
+        )
+    })
+    .await
+    .expect("forwarding a burst to a slow reader");
+    drop(input);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .unwrap()
+            .unwrap()
+            .success()
+    );
+}
+
+#[tokio::test]
+async fn terminating_the_stdio_endpoint_stops_its_agent() {
+    for force in [false, true] {
+        let f = Fixture::new();
+        let mut command = f.command(&["acp", "fixture"]);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        let mut child = tokio::process::Command::from(command)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut input = child.stdin.take().unwrap();
+        let mut output = BufReader::new(child.stdout.take().unwrap());
+        input
+            .write_all(b"{\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        line(&mut output).await;
+        let rows = f.rpc("agent.list", json!({}));
+        let id = rows[0]["id"].as_str().unwrap();
+        f.status(id, "idle").await;
+        let agent = f.rpc("agent.get", json!({"id":id}));
+        let pid = agent["pid"].as_u64().unwrap() as u32;
+        let start = agent["pid_start_time"].as_u64().unwrap();
+        let endpoint = tower_pal::process_identity(child.id().unwrap()).unwrap();
+        if force {
+            tower_pal::force_terminate_process(endpoint.pid, endpoint.start_time).unwrap();
+        } else {
+            tower_pal::terminate_process(endpoint.pid, endpoint.start_time).unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(10), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), f.status(id, "exited"))
+            .await
+            .expect("disconnected endpoint must stop its agent");
+        assert!(!tower_pal::process_identity(pid).is_ok_and(|p| p.start_time == start));
+    }
+}
+
+#[tokio::test]
+async fn socket_disconnect_closes_an_uninitialized_connection_after_policy_changes() {
+    let f = Fixture::new();
+    f.rpc("daemon.info", json!({}));
+    let paths = tower_pal::Paths::rooted(f.root.path().join("state/tower")).unwrap();
+    let mut owner = tower_server::client::Client::connect(&paths, Default::default(), false)
+        .await
+        .unwrap();
+    let params = json!({"harness":"fixture","cwd":f.root.path()});
+    let opened = serde_json::to_value(owner.call("acp.connect", &params).await.unwrap()).unwrap();
+    let id = opened["tower_session_id"].as_str().unwrap();
+    assert!(owner.call("acp.connect", &params).await.is_err());
+    f.rpc("rules.replace", json!({"rules":[{"id":"deny","kind":"session","from":"*","to":"*","action":"deny","created_by":"fixture","created_at":1}]}));
+    drop(owner);
+    f.status(id, "exited").await;
 }

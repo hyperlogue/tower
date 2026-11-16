@@ -2,6 +2,7 @@ import readline from 'node:readline';
 const send = v => process.stdout.write(JSON.stringify({jsonrpc:'2.0',...v})+'\n');
 let active;
 readline.createInterface({input:process.stdin}).on('line',line=>{
+  if(line.includes('"method":"vendor/slow"')){Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,50);process.stdout.write(line+'\n');return;}
   if(line.includes('"method":"vendor/exit"')){process.stdout.write(line+'\n',()=>process.exit(0));return;}
   if(line.includes('"method":"vendor/future"')){process.stdout.write(line+'\n');return;}
   const v=JSON.parse(line);

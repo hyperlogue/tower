@@ -170,10 +170,10 @@ impl Proxy {
                 "ACP input sequence is not the next frame",
             ));
         }
-        input
-            .sender
-            .try_send(frame.into())
-            .map_err(|_| error("acp_backpressure", "ACP input is full or closed"))?;
+        input.sender.try_send(frame.into()).map_err(|e| match e {
+            mpsc::error::TrySendError::Full(_) => error("acp_backpressure", "ACP input is full"),
+            mpsc::error::TrySendError::Closed(_) => error("acp_closed", "ACP input is closed"),
+        })?;
         input.sequence = sequence;
         input.last = Some(frame.into());
         Ok(())

@@ -262,6 +262,7 @@ async fn serve_connection(
         }
     }
     let _reader = ReaderGuard(reader);
+    let mut acp = None;
     let mut clipboard = clipboard::Connection::new(service.clipboard());
     let mut events = service.events();
     let mut subscription: Option<(
@@ -364,7 +365,25 @@ async fn serve_connection(
             true
         };
         let id = request.id.clone();
-        let result = if let Some(result) = clipboard.request(&request, peer, &service).await {
+        let result = if request.method == "acp.connect" {
+            if acp.is_some() {
+                Err(RpcError::application(
+                    "runtime_conflict",
+                    "This socket already owns an ACP connection",
+                ))
+            } else {
+                match service
+                    .execute(move |s| s.connect_acp(request, peer))
+                    .await?
+                {
+                    Ok((result, connection)) => {
+                        acp = Some(connection);
+                        Ok(result)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+        } else if let Some(result) = clipboard.request(&request, peer, &service).await {
             result
         } else if unsubscribe_valid {
             service.request(request, peer).await

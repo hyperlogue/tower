@@ -3,7 +3,51 @@ use tower_sessions::{
     ManagedSession,
     execution::{ExecutionHost, RuntimeBinding, RuntimeUpdates, RuntimeView},
 };
+
+pub(crate) struct AcpConnection {
+    host: Arc<dyn ExecutionHost>,
+    binding: RuntimeBinding,
+}
+impl Drop for AcpConnection {
+    fn drop(&mut self) {
+        let host = self.host.clone();
+        let binding = self.binding.clone();
+        // Cleanup must survive socket errors and revoked caller credentials.
+        tokio::task::spawn_blocking(move || {
+            if host.stop(&binding).is_err() {
+                eprintln!("tower: disconnected ACP process termination was not confirmed");
+            }
+        });
+    }
+}
+
 impl Service {
+    pub(crate) fn connect_acp(
+        &self,
+        mut request: Request,
+        peer: Peer,
+    ) -> std::result::Result<(Value, AcpConnection), RpcError> {
+        request.method = "acp.open".into();
+        let result = self.dispatch(&request, peer)?;
+        let opened = serde_json::to_value(&result).map_err(|_| invalid("Invalid ACP binding"))?;
+        let session = self
+            .store
+            .managed_session(
+                opened["tower_session_id"]
+                    .as_str()
+                    .ok_or_else(|| invalid("Missing ACP identity"))?,
+            )
+            .map_err(storage)?;
+        let binding = RuntimeBinding::from_session(&session)?
+            .ok_or_else(|| invalid("Missing ACP binding"))?;
+        let host = self
+            .backends
+            .execution()
+            .cloned()
+            .ok_or_else(|| app("unsupported", "ACP proxy unavailable"))?;
+        Ok((result, AcpConnection { host, binding }))
+    }
+
     fn execution_host(&self) -> std::result::Result<&dyn ExecutionHost, RpcError> {
         self.backends
             .execution()

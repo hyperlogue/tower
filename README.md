@@ -121,7 +121,10 @@ custom-agent = ["my-acp-agent", "--stdio"]
 Only installed commands are advertised. The ACP client sends `initialize`,
 `session/new` or `session/load`, prompts, configuration changes, and replies.
 Tower forwards their JSON unchanged and does not validate form schemas or answer
-agent requests. Closing the client connection stops its agent process group.
+agent requests. Closing or terminating `tower-cli acp` stops its agent process
+group. The stdio endpoint uses the local socket's `acp.connect` operation, which
+owns the agent until that socket disconnects. Direct RPC clients can instead use
+`acp.open` and close the agent explicitly with `acp.close`.
 
 This replaces the old managed ACP and Codex app-server control protocols.
 Upgrade Tower and Allgather together; older structured clients are rejected.
