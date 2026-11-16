@@ -80,15 +80,13 @@ impl Runtime {
                 .map_err(|_| error("invalid_config", "Invalid runtime limits"))?
                 .unwrap_or_default();
         let limits = configuration.runtime;
-        if limits.runtime_spool_bytes == 0
-            || limits.host_spool_bytes < limits.runtime_spool_bytes
-            || limits.control_reserve_bytes < 65536
+        if limits.control_reserve_bytes < 65536
             || limits.receipt_count == 0
             || limits.receipt_retention_days == 0
         {
             return Err(error(
                 "invalid_config",
-                "Runtime limits must reserve bulk and control capacity",
+                "Runtime limits must reserve lifecycle and receipt capacity",
             ));
         }
         let journal = Arc::new(Journal::new(database, limits)?);
@@ -428,13 +426,8 @@ impl ExecutionHost for Runtime {
             return Ok(());
         }
         let payload = crate::terminal::state_payload(b, &m, "running", false);
-        self.journal.append(
-            b,
-            "runtime_state",
-            serde_json::from_value(payload).map_err(internal)?,
-            None,
-            true,
-        )?;
+        self.journal
+            .append_state(b, serde_json::from_value(payload).map_err(internal)?)?;
         Ok(())
     }
     fn acknowledge(&self, ns: &str, kind: &str, v: tower_protocol::Value) -> Result<()> {

@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const REGISTRY: &str = include_str!("schema.sql");
 const RUNTIME: &str = include_str!("runtime.sql");
 
@@ -87,13 +87,7 @@ impl Database {
                 }
                 tx.execute_batch(RUNTIME)?;
                 if import {
-                    for table in [
-                        "runtimes",
-                        "commands",
-                        "events",
-                        "journal_identity",
-                        "force_resumes",
-                    ] {
+                    for table in ["runtimes", "commands", "events", "journal_identity"] {
                         let columns = tx
                             .prepare_cached(&format!("PRAGMA main.table_info({table})"))?
                             .query_map([], |row| row.get::<_, String>(1))?
@@ -118,6 +112,12 @@ impl Database {
                 if import {
                     conn.execute_batch("DETACH DATABASE previous")?;
                 }
+            }
+            2 => {
+                let tx = conn.transaction()?;
+                tx.execute_batch("DROP TABLE force_resumes; DROP INDEX pending_payloads;")?;
+                tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                tx.commit()?;
             }
             SCHEMA_VERSION => {}
             _ => return Err(Error::Schema),

@@ -15,7 +15,7 @@
 
 AI coding agents thrive in terminal environments (TUIs), but connecting them to modern web applications, dashboards, and orchestrators traditionally requires brittle terminal scraping, orphaned processes, and zero observability.
 
-**Tower** bridges this gap. Built in pure Rust (edition 2024) with a custom zero-dependency terminal emulator and multiplexer, Tower serves as the headless control plane between your frontends and local agent harnesses. It provides real-time session streaming, structured interaction protocols, granular human-in-the-loop approvals, Git worktree isolation, and crash resilience.
+**Tower** bridges this gap. Built in pure Rust (edition 2024) with a custom zero-dependency terminal emulator and multiplexer, Tower serves as the headless control plane between your frontends and local agent harnesses. It provides real-time session streaming, native ACP forwarding, message approvals, Git worktree isolation, and crash resilience.
 
 ```
 ┌────────────────────────────────────────────────────────┐
@@ -39,7 +39,7 @@ AI coding agents thrive in terminal environments (TUIs), but connecting them to 
 - **Headless & Shared Attachment**: Run agents headless in the background, stream ANSI snapshots over JSON-RPC/HTTP to your webapp, or attach multiple concurrent operators with zero disruption (`Ctrl-Space`, `Ctrl-Q`).
 - **Transparent ACP Proxy**: Run ACP agents over stdio or through Allgather. Tower forwards native protocol frames, observes session status, and owns process lifecycle; the client handles transcripts, permissions, and forms.
 - **Real-Time Observability**: Loopback HTTP and SSE stream state deltas, tool activity, and instant `needs_attention` flags (waiting for input, approval required, or unexpected exit).
-- **Enterprise Governance**: Granular message routing rules, private UDS tokens, and audited approval flows for sensitive tools.
+- **Enterprise Governance**: Granular message routing rules, private UDS tokens, and audited message approvals.
 - **Isolated Worktree Lifecycle**: Two-phase (prepare/execute) Git worktree operations prevent repository corruption, with forwarded SSH-agent support.
 - **Zero-Downtime Daemon Upgrades**: Hot-upgrade the multiplexer (`tower-cli pool upgrade`) without terminating active sessions or dropping model conversations.
 - **Fleet Sync**: Optional Allgather pairing for remote status projection and centralized policy enforcement.
@@ -151,7 +151,7 @@ tower-cli host metrics
 # Clear resolved attention flags
 tower-cli attention clear SESSION_ID
 
-# Stream real-time agent lifecycle and transcript events
+# Stream real-time agent lifecycle and messaging events
 tower-cli events
 ```
 
@@ -160,10 +160,10 @@ tower-cli events
 Route messages and resolve permission boundaries safely:
 
 ```sh
-# Inject prompts or messages into an active agent session
+# Send a message to an active terminal agent session
 tower-cli send SESSION_ID "Investigate and fix the failing test suite."
 
-# Inspect and resolve pending tool approvals
+# Inspect and resolve pending message approvals
 tower-cli approval status APPROVAL_ID
 tower-cli approve APPROVAL_ID
 tower-cli approve APPROVAL_ID --deny

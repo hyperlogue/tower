@@ -123,7 +123,7 @@ fn record(
     };
     let payload = state_payload(b, &metadata, state, terminated);
     if !fenced && old["lifecycle"] != payload {
-        journal.append(b, "runtime_state", public(&payload)?, None, true)?;
+        journal.append_state(b, public(&payload)?)?;
         metadata["lifecycle"] = payload;
     }
     if metadata != old || (!fenced && previous != state) {
@@ -397,7 +397,7 @@ async fn run_inner(
         };
         let mut metadata = json!({"terminal_session":native,"launch_command_id":command.command_id,"boot_id":tower_pal::boot_id().map_err(internal)?});
         let payload = state_payload(b, &metadata, "starting", false);
-        journal.append(b, "runtime_state", public(&payload)?, None, true)?;
+        journal.append_state(b, public(&payload)?)?;
         metadata["lifecycle"] = payload;
         journal.update_metadata(b, "starting", &metadata)?;
         if let Err(e) = ctx.authority.check(b, &command).await {
@@ -464,8 +464,7 @@ async fn run_inner(
                 let (command, reason) = match command {
                     engine::Control::Command(command) => (Some(command), "stop_runtime".to_owned()),
                     engine::Control::Stop(reason) => (None, reason),
-                    // Terminal sessions live in the pool across server restarts.
-                        };
+                };
                 if let Some(c) = &command {
                     if let Err(e) = ctx.authority.check(b, c).await {
                         journal.finish_dispatch(b, &c.command_id, false, None, Some(failure(&e.data.code, "dispatch", false)))?;

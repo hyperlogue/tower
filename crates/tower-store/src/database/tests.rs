@@ -1,6 +1,8 @@
 use super::*;
 use rusqlite::types::Value;
 
+const FORCE_RESUMES: &str = "CREATE TABLE force_resumes(namespace TEXT NOT NULL,command_id TEXT NOT NULL,targets TEXT NOT NULL,phase TEXT NOT NULL,PRIMARY KEY(namespace,command_id),FOREIGN KEY(namespace,command_id) REFERENCES commands(namespace,command_id)); CREATE INDEX pending_payloads ON commands(namespace,runtime_id) WHERE payload IS NOT NULL;";
+
 fn legacy(root: &Path) -> (Connection, Connection) {
     let registry = Connection::open(root.join("tower.db")).unwrap();
     registry.execute_batch(REGISTRY).unwrap();
@@ -13,6 +15,7 @@ fn legacy(root: &Path) -> (Connection, Connection) {
     runtime
         .execute_batch(&RUNTIME.replace("runtime_counters", "counters"))
         .unwrap();
+    runtime.execute_batch(FORCE_RESUMES).unwrap();
     runtime.execute_batch(r#"PRAGMA user_version=3;
 INSERT INTO journal_identity VALUES('journal_fixture');
 INSERT INTO runtimes(namespace,runtime_id,generation,logical_session,tower_id,owner_id,binding,state,fenced,termination,next_sequence,ack_sequence,ack_key,spool_bytes,loss,loss_ack) VALUES('pair','runtime','generation','session','tower','owner','{}','lost',1,'unknown',9,7,'event-seven',123,'{"loss_id":"stable-loss","report_revision":2}',1);
@@ -48,14 +51,8 @@ fn upgrade_preserves_both_stores_and_does_not_reimport_on_reopen() {
         for (table, expected) in tables.iter().zip(&expected) {
             assert_eq!(rows(&conn, table, "*"), *expected);
         }
-        assert_eq!(
-            rows(&conn, "force_resumes", "*"),
-            rows(
-                &runtime,
-                "force_resumes",
-                "namespace,command_id,targets,phase"
-            )
-        );
+        assert!(!conn.table_exists(None, "force_resumes").unwrap());
+        assert_eq!(rows(&runtime, "force_resumes", "*").len(), 1);
         assert_eq!(
             rows(&conn, "runtime_counters", "*"),
             rows(&runtime, "counters", "*")
@@ -165,4 +162,39 @@ fn registry_only_upgrade_initializes_an_empty_journal_without_resetting_rules() 
         .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
         .unwrap();
     assert!(Database::open(&path).is_err());
+}
+
+#[test]
+fn unified_upgrade_drops_retired_cleanup_state_and_preserves_history() {
+    let root = tempfile::tempdir().unwrap();
+    let (_registry, _runtime) = legacy(root.path());
+    let path = root.path().join("tower.db");
+    let db = Database::open(&path).unwrap();
+    let tables = [
+        "runtimes",
+        "commands",
+        "events",
+        "journal_identity",
+        "runtime_counters",
+    ];
+    let expected: Vec<_> = {
+        let conn = db.lock().unwrap();
+        conn.execute_batch(FORCE_RESUMES).unwrap();
+        conn.execute_batch("INSERT INTO force_resumes VALUES('pair','command','[\"old\"]','cleaning'); PRAGMA user_version=2;").unwrap();
+        tables.iter().map(|table| rows(&conn, table, "*")).collect()
+    };
+    drop(db);
+    for _ in 0..2 {
+        let db = Database::open(&path).unwrap();
+        let conn = db.lock().unwrap();
+        assert!(!conn.table_exists(None, "force_resumes").unwrap());
+        assert_eq!(
+            conn.pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        for (table, expected) in tables.iter().zip(&expected) {
+            assert_eq!(rows(&conn, table, "*"), *expected);
+        }
+    }
 }

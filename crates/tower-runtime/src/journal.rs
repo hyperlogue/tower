@@ -15,8 +15,6 @@ pub use tower_sessions::execution::RuntimeBinding as Binding;
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Limits {
-    pub runtime_spool_bytes: u64,
-    pub host_spool_bytes: u64,
     pub control_reserve_bytes: u64,
     pub receipt_count: u64,
     pub receipt_retention_days: u64,
@@ -24,8 +22,6 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            runtime_spool_bytes: 64 * 1024 * 1024,
-            host_spool_bytes: 256 * 1024 * 1024,
             control_reserve_bytes: 1024 * 1024,
             receipt_count: 1_000_000,
             receipt_retention_days: 30,
@@ -184,7 +180,7 @@ impl Journal {
                 ));
             }
         } else {
-            if !matches!(command.kind.as_str(), "launch" | "resume") {
+            if command.kind != "launch" {
                 return Err(error("not_found", "Runtime has not been created"));
             }
             tx.execute("INSERT INTO runtimes(namespace,runtime_id,generation,logical_session,tower_id,owner_id,binding,state) VALUES(?1,?2,?3,?4,?5,?6,?7,'starting')",params![namespace,binding.runtime_id,binding.generation,binding.session_id,binding.tower_session_id,binding.owner_id,serde_json::to_string(binding).map_err(internal)?]).map_err(internal)?;
@@ -213,25 +209,7 @@ impl Journal {
             result: None,
             error: None,
         };
-        let payload = if command.kind == "reply" {
-            None
-        } else {
-            Some(serde_json::to_string(&command.payload).map_err(internal)?)
-        };
-        if let Some(body) = &payload {
-            let host:i64=tx.query_row("SELECT coalesce(sum(length(CAST(payload AS BLOB))),0)+(SELECT spool_bytes FROM runtime_counters WHERE id=1) FROM commands WHERE payload IS NOT NULL",[],|r|r.get(0)).map_err(internal)?;
-            let runtime:i64=tx.query_row("SELECT coalesce(sum(length(CAST(payload AS BLOB))),0)+(SELECT spool_bytes FROM runtimes WHERE namespace=?1 AND runtime_id=?2) FROM commands WHERE namespace=?1 AND runtime_id=?2 AND payload IS NOT NULL",params![namespace,binding.runtime_id],|r|r.get(0)).map_err(internal)?;
-            if (host as u64).saturating_add(body.len() as u64) > self.limits.host_spool_bytes
-                || (runtime as u64).saturating_add(body.len() as u64)
-                    > self.limits.runtime_spool_bytes
-            {
-                return Err(error(
-                    "runtime_capacity",
-                    "Pending input and transcript storage have reached their limit",
-                ));
-            }
-        }
-        tx.execute("INSERT INTO commands(namespace,command_id,runtime_id,generation,fingerprint,kind,payload,expires_at,receipt,receipt_revision,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,1,?10)",params![namespace,command.command_id,command.runtime_id,command.generation,fingerprint,command.kind,payload,parse_time(&command.expires_at)? as i64,serde_json::to_string(&receipt).map_err(internal)?,millis() as i64]).map_err(internal)?;
+        tx.execute("INSERT INTO commands(namespace,command_id,runtime_id,generation,fingerprint,kind,expires_at,receipt,receipt_revision,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,1,?9)",params![namespace,command.command_id,command.runtime_id,command.generation,fingerprint,command.kind,parse_time(&command.expires_at)? as i64,serde_json::to_string(&receipt).map_err(internal)?,millis() as i64]).map_err(internal)?;
         tx.commit().map_err(internal)?;
         Ok(receipt)
     }
@@ -295,10 +273,10 @@ fn validate(binding: &Binding, command: &ExecutionCommand) -> Result<()> {
         ));
     }
     if !matches!(
-        command.kind.as_str(),
-        "launch" | "resume" | "prompt" | "cancel" | "reply" | "configure"
+        (binding.protocol.as_str(), command.kind.as_str()),
+        ("acp", "launch") | ("terminal", "launch" | "cancel")
     ) {
-        return Err(error("unsupported", "Unknown managed command"));
+        return Err(error("unsupported", "Unsupported runtime command"));
     }
     if serde_json::to_vec(command).map_err(internal)?.len() > tower_protocol::MAX_FRAME_BYTES {
         return Err(error(
@@ -393,7 +371,6 @@ impl Journal {
         })
         .collect()
     }
-    /// Admitted commands that never reached the native session, oldest first.
     pub fn metadata(&self, binding: &Binding) -> Result<serde_json::Value> {
         let json:String=self.lock()?.query_row("SELECT metadata FROM runtimes WHERE namespace=?1 AND runtime_id=?2 AND generation=?3",params![binding.namespace(),binding.runtime_id,binding.generation],|r|r.get(0)).map_err(internal)?;
         serde_json::from_str(&json).map_err(internal)
@@ -526,98 +503,64 @@ impl Journal {
         }
         Ok(())
     }
-    pub fn append(
-        &self,
-        binding: &Binding,
-        kind: &str,
-        payload: Value,
-        command_id: Option<String>,
-        control: bool,
-    ) -> Result<RuntimeEvent> {
-        if kind.is_empty() || kind.len() > 300 || kind.chars().any(char::is_control) {
-            return Err(error("invalid_event", "Invalid event kind"));
-        }
-        if matches!(kind, "permission_request" | "elicitation_request") {
-            let Value::Object(fields) = &payload else {
-                return Err(error(
-                    "private_payload",
-                    "Private requests need redacted transcript markers",
-                ));
-            };
-            if fields.get("redacted") != Some(&Value::Bool(true))
-                || fields.keys().any(|k| {
-                    !matches!(
-                        k.as_str(),
-                        "redacted" | "kind" | "mode" | "source_request_id" | "request_revision"
-                    )
-                })
-            {
-                return Err(error(
-                    "private_payload",
-                    "Private control payload cannot enter the transcript spool",
-                ));
-            }
+    pub fn append_state(&self, binding: &Binding, payload: Value) -> Result<RuntimeEvent> {
+        if binding.protocol != "terminal" {
+            return Err(error(
+                "unsupported",
+                "Only terminal lifecycle events are journaled",
+            ));
         }
         let mut conn = self.lock()?;
         let tx = conn.transaction().map_err(internal)?;
-        let (sequence,used,controls):(i64,i64,i64)=tx.query_row("SELECT next_sequence,spool_bytes,control_bytes FROM runtimes WHERE namespace=?1 AND runtime_id=?2 AND generation=?3",params![binding.namespace(),binding.runtime_id,binding.generation],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).map_err(internal)?;
+        let sequence: i64 = tx.query_row(
+            "SELECT next_sequence FROM runtimes WHERE namespace=?1 AND runtime_id=?2 AND generation=?3",
+            params![binding.namespace(), binding.runtime_id, binding.generation],
+            |r| r.get(0),
+        ).map_err(internal)?;
         if sequence <= 0 || sequence == i64::MAX {
             return Err(error("runtime_capacity", "Event sequence exhausted"));
         }
         let event = RuntimeEvent {
             sequence: sequence as u64,
             key: random_id("event_")?,
-            kind: kind.into(),
+            kind: "runtime_state".into(),
             payload,
             at: Some(timestamp()),
-            command_id,
+            command_id: None,
         };
         let body = serde_json::to_string(&event).map_err(internal)?;
         let bytes = body.len() as i64;
         if bytes as usize > tower_protocol::MAX_FRAME_BYTES - 4096 {
             return Err(error(
                 "event_too_large",
-                "Event must be chunked or staged as an asset",
+                "Runtime state exceeds the frame limit",
             ));
         }
-        let (host, host_control): (i64, i64) = tx
+        let used: i64 = tx
             .query_row(
-                "SELECT spool_bytes,control_bytes FROM runtime_counters WHERE id=1",
+                "SELECT control_bytes FROM runtime_counters WHERE id=1",
                 [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| r.get(0),
             )
             .map_err(internal)?;
-        if if control {
-            host_control as u64 + bytes as u64 > self.limits.control_reserve_bytes
-        } else {
-            used as u64 + bytes as u64 > self.limits.runtime_spool_bytes
-                || host as u64 + bytes as u64 > self.limits.host_spool_bytes
-        } {
+        if (used as u64).saturating_add(bytes as u64) > self.limits.control_reserve_bytes {
             return Err(error(
-                if control {
-                    "control_capacity"
-                } else {
-                    "spool_capacity"
-                },
+                "control_capacity",
                 "Durable event capacity exhausted before sequence allocation",
             ));
         }
-        tx.execute("INSERT INTO events(namespace,runtime_id,generation,sequence,event_key,body,bytes,control) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![binding.namespace(),binding.runtime_id,binding.generation,sequence,event.key,body,bytes,control]).map_err(internal)?;
-        tx.execute("UPDATE runtimes SET next_sequence=next_sequence+1,spool_bytes=?1,control_bytes=?2 WHERE namespace=?3 AND runtime_id=?4",params![used+if control{0}else{bytes},controls+if control{bytes}else{0},binding.namespace(),binding.runtime_id]).map_err(internal)?;
-        tx.execute("UPDATE runtime_counters SET spool_bytes=spool_bytes+?1,control_bytes=control_bytes+?2 WHERE id=1",params![if control{0}else{bytes},if control{bytes}else{0}]).map_err(internal)?;
-        if kind == "gap" {
-            tx.execute(
-                "UPDATE runtimes SET coverage='partial' WHERE namespace=?1 AND runtime_id=?2",
-                params![binding.namespace(), binding.runtime_id],
-            )
-            .map_err(internal)?;
-        }
+        tx.execute("INSERT INTO events(namespace,runtime_id,generation,sequence,event_key,body,bytes,control) VALUES(?1,?2,?3,?4,?5,?6,?7,1)",params![binding.namespace(),binding.runtime_id,binding.generation,sequence,event.key,body,bytes]).map_err(internal)?;
+        tx.execute("UPDATE runtimes SET next_sequence=next_sequence+1,control_bytes=control_bytes+?1 WHERE namespace=?2 AND runtime_id=?3",params![bytes,binding.namespace(),binding.runtime_id]).map_err(internal)?;
+        tx.execute(
+            "UPDATE runtime_counters SET control_bytes=control_bytes+?1 WHERE id=1",
+            [bytes],
+        )
+        .map_err(internal)?;
         tx.commit().map_err(internal)?;
         Ok(event)
     }
     pub fn batch(&self, binding: &Binding) -> Result<Option<RuntimeEvents>> {
         let conn = self.lock()?;
-        // A ready event must not overtake a target's confirmed loss report.
         let mut query=conn.prepare("SELECT body FROM events WHERE namespace=?1 AND runtime_id=?2 AND generation=?3 ORDER BY sequence LIMIT 200").map_err(internal)?;
         let mut events = Vec::new();
         let mut bytes = 0usize;
@@ -868,7 +811,7 @@ mod tests {
             generation: "generation".into(),
             tower_session_id: "tower-session".into(),
             owner_id: "owner".into(),
-            protocol: "codex-app-server".into(),
+            protocol: "terminal".into(),
             harness: "codex".into(),
             cwd: "/work/project".into(),
             resume_session_id: None,
@@ -946,23 +889,29 @@ mod tests {
         );
     }
     #[test]
-    fn private_replies_never_enter_durable_payloads_and_missing_keys_fail_closed() {
+    fn rejected_commands_never_enter_storage_and_missing_keys_fail_closed() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("tower.db");
         let j = Journal::open(&path, Limits::default()).unwrap();
         let b = binding();
         j.admit(&b, &command("launch", "launch", json!({})))
             .unwrap();
-        let secret = "PRIVATE-ELICITATION-URL-AND-REPLY-38294";
-        let reply = command("reply", "reply", json!({"response":{"secret":secret}}));
-        j.admit(&b, &reply).unwrap();
+        let secret = "PRIVATE-PROTOCOL-FRAME-38294";
+        for kind in ["prompt", "reply", "configure", "resume"] {
+            assert_eq!(
+                j.admit(&b, &command(kind, kind, json!({"secret":secret})))
+                    .unwrap_err()
+                    .data
+                    .code,
+                "unsupported"
+            );
+        }
+        let mut acp = b.clone();
+        acp.protocol = "acp".into();
         assert!(
-            j.append(
-                &b,
-                "elicitation_request",
-                serde_json::from_value(json!({"url":secret})).unwrap(),
-                None,
-                true
+            j.append_state(
+                &acp,
+                serde_json::from_value(json!({"secret":secret})).unwrap()
             )
             .is_err()
         );
@@ -984,21 +933,15 @@ mod tests {
         j.admit(&b, &command("launch", "launch", json!({})))
             .unwrap();
         let first = j
-            .append(
+            .append_state(
                 &b,
-                "agent_message_chunk",
-                serde_json::from_value(json!({"content":{"type":"text","text":"hello"}})).unwrap(),
-                None,
-                false,
+                serde_json::from_value(json!({"state":"running"})).unwrap(),
             )
             .unwrap();
         let second = j
-            .append(
+            .append_state(
                 &b,
-                "turn_end",
-                serde_json::from_value(json!({"stop_reason":"end_turn"})).unwrap(),
-                None,
-                true,
+                serde_json::from_value(json!({"state":"ended"})).unwrap(),
             )
             .unwrap();
         let before = serde_json::to_string(&j.batch(&b).unwrap()).unwrap();
@@ -1034,7 +977,7 @@ mod tests {
         assert!(j.batch(&b).unwrap().is_none());
     }
     #[test]
-    fn receipt_capacity_and_uncertain_overlap_fail_before_acceptance() {
+    fn receipt_capacity_fails_before_acceptance() {
         let root = tempfile::tempdir().unwrap();
         let j = Journal::open(
             &root.path().join("tower.db"),
@@ -1049,11 +992,111 @@ mod tests {
         j.admit(&b, &c).unwrap();
         assert!(j.admit(&b, &c).is_ok());
         assert_eq!(
-            j.admit(&b, &command("prompt", "two", json!({})))
+            j.admit(&b, &command("cancel", "two", json!({})))
                 .unwrap_err()
                 .data
                 .code,
             "runtime_capacity"
+        );
+    }
+    #[test]
+    fn lifecycle_capacity_does_not_allocate_an_event_sequence() {
+        let root = tempfile::tempdir().unwrap();
+        let journal = Journal::open(
+            &root.path().join("tower.db"),
+            Limits {
+                control_reserve_bytes: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let b = binding();
+        journal
+            .admit(&b, &command("launch", "launch", json!({})))
+            .unwrap();
+        assert_eq!(
+            journal
+                .append_state(
+                    &b,
+                    serde_json::from_value(json!({"state":"running"})).unwrap()
+                )
+                .err()
+                .unwrap()
+                .data
+                .code,
+            "control_capacity"
+        );
+        assert!(journal.batch(&b).unwrap().is_none());
+        assert_eq!(journal.cursor(&b).unwrap().cursor, 0);
+        assert_eq!(
+            journal
+                .lock()
+                .unwrap()
+                .query_row("SELECT next_sequence FROM runtimes", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+    #[test]
+    fn legacy_receipts_remain_readable_without_admitting_legacy_commands() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("tower.db");
+        let journal = Journal::open(&path, Limits::default()).unwrap();
+        let mut b = binding();
+        let c = command("launch", "historical", json!({}));
+        journal.admit(&b, &c).unwrap();
+        journal.begin_dispatch(&b, &c.command_id).unwrap();
+        let receipt = journal
+            .finish_dispatch(
+                &b,
+                &c.command_id,
+                true,
+                Some(ExecutionResult {
+                    acp_session_id: Some("acp-history".into()),
+                    native_session_id: Some("native-history".into()),
+                    ..Default::default()
+                }),
+                None,
+            )
+            .unwrap();
+        b.protocol = "codex-app-server".into();
+        b.resume_session_id = Some("native-history".into());
+        journal
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE runtimes SET binding=?1",
+                [serde_json::to_string(&b).unwrap()],
+            )
+            .unwrap();
+        journal
+            .lock()
+            .unwrap()
+            .execute("UPDATE commands SET kind='resume'", [])
+            .unwrap();
+        drop(journal);
+        let journal = Journal::open(&path, Limits::default()).unwrap();
+        assert_eq!(
+            journal.status(&b.namespace(), &status(&c)).unwrap(),
+            receipt
+        );
+        let recovered = journal.bindings(None).unwrap().remove(0);
+        assert_eq!(recovered.resume_session_id, b.resume_session_id);
+        journal
+            .fence(&recovered, "acp_migration_required", "unknown")
+            .unwrap();
+        assert_eq!(
+            journal.status(&b.namespace(), &status(&c)).unwrap(),
+            receipt
+        );
+        assert_eq!(
+            journal
+                .admit(&recovered, &command("resume", "new", json!({})))
+                .unwrap_err()
+                .data
+                .code,
+            "unsupported"
         );
     }
     #[test]
@@ -1125,12 +1168,9 @@ mod tests {
         let events = std::thread::spawn(move || {
             for i in 0..250 {
                 writer
-                    .append(
+                    .append_state(
                         &binding(),
-                        "agent_message_chunk",
-                        serde_json::from_value(json!({"text":i.to_string()})).unwrap(),
-                        None,
-                        false,
+                        serde_json::from_value(json!({"state":"running","revision":i})).unwrap(),
                     )
                     .unwrap();
             }
