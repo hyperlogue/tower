@@ -144,17 +144,12 @@ impl Server {
         .await
         .unwrap()
     }
-    async fn start_modes(f: &Fixture, _retire: bool, terminal: bool) -> Self {
+    async fn start(f: &Fixture) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let config = f.root.path().join("config/tower");
         std::fs::create_dir_all(&config).unwrap();
-        let scopes = if terminal {
-            "['read','terminal:control']"
-        } else {
-            "['read','send','acp:control']"
-        };
-        std::fs::write(config.join("config.toml"),format!("[allgather]\nurl='ws://127.0.0.1:{port}/tower'\nmanaged=true\nscopes={scopes}\n[scan]\nenabled=false\n")).unwrap();
+        std::fs::write(config.join("config.toml"),format!("[allgather]\nurl='ws://127.0.0.1:{port}/tower'\nmanaged=true\nscopes=['read','terminal:control']\n[scan]\nenabled=false\n")).unwrap();
         let (sender, mut receive) = mpsc::channel::<Call>(32);
         let frames = Arc::new(Mutex::new(Vec::new()));
         let observed = frames.clone();
@@ -185,27 +180,26 @@ impl Server {
                 socket.send(Message::Text(json!({"jsonrpc":"2.0","id":"hello","result":{"node_name":"fixture-machine","protocol_version":{"major":1,"minor":4},"capabilities":caps}}).to_string().into())).await.unwrap();
                 socket.send(Message::Text(json!({"jsonrpc":"2.0","method":"policy.push","params":{"policy_id":"tower","revision":1,"rules":[]}}).to_string().into())).await.unwrap();
                 let mut pending = BTreeMap::new();
-                let mut ready_owners = BTreeMap::new();
                 loop {
                     tokio::select! {
-                     call=receive.recv()=>{let Some(call)=call else{return};sequence+=1;let id=format!("call-{sequence}");pending.insert(id.clone(),call.reply);if socket.send(Message::Text(json!({"jsonrpc":"2.0","id":id,"method":call.method,"params":call.params}).to_string().into())).await.is_err(){break;}}
-                     message=socket.next()=>{
-                      let Some(Ok(message))=message else{break};let Message::Text(text)=message else{if matches!(message,Message::Close(_)){break;}continue};let v:Value=serde_json::from_str(&text).unwrap();
-                      observed.lock().unwrap().push(v.clone());
-                      if let Some(id)=v["id"].as_str()&&v.get("method").is_none(){if let Some(reply)=pending.remove(id){let _=reply.send(v);}continue;}
-                      let p=&v["params"];let runtime=p["runtime_id"].as_str().unwrap_or("").to_owned();
-                      let result=match v["method"].as_str(){
-                       Some("state.push")=>{socket.send(Message::Text(json!({"jsonrpc":"2.0","method":"sync.ack","params":{"cursor":p["seq"],"rejected":[]}}).to_string().into())).await.unwrap();continue;}
-                       Some("command.receipt")=>json!({"command_id":p["command_id"],"receipt_revision":p["receipt_revision"]}),
-                       Some("runtime.lost")=>{let mut result=p.clone();result["fenced"]=json!(true);result},
-                       Some("session.cursor")=>{let(c,key)=cursors.entry(runtime).or_default();json!({"runtime_id":p["runtime_id"],"generation":p["generation"],"source_key":p["source_key"],"cursor":c,"last_event_key":key,"coverage":"complete"})},
-                       Some("session.events")=>{let(c,key)=cursors.entry(runtime.clone()).or_default();for e in p["events"].as_array().unwrap(){let seq=e["sequence"].as_u64().unwrap();if seq<=*c{assert_eq!(retained.get(&(runtime.clone(),seq)),Some(e));}else{assert_eq!(seq,*c+1);retained.insert((runtime.clone(),seq),e.clone());*c=seq;*key=Some(e["key"].as_str().unwrap().into());}
-                        if e["kind"]=="runtime_state"&&matches!(e["payload"]["state"].as_str(),Some("idle"|"running"|"waiting")){ready_owners.insert(runtime.clone(),e["payload"]["owner_id"].clone());}}json!({"runtime_id":p["runtime_id"],"generation":p["generation"],"source_key":p["source_key"],"cursor":c})},
-                       _=>continue,
-                      };
-                      if let Some(id)=v.get("id")&& socket.send(Message::Text(json!({"jsonrpc":"2.0","id":id,"result":result}).to_string().into())).await.is_err(){break;}
-                     }
-                    }
+                                         call=receive.recv()=>{let Some(call)=call else{return};sequence+=1;let id=format!("call-{sequence}");pending.insert(id.clone(),call.reply);if socket.send(Message::Text(json!({"jsonrpc":"2.0","id":id,"method":call.method,"params":call.params}).to_string().into())).await.is_err(){break;}}
+                                         message=socket.next()=>{
+                                          let Some(Ok(message))=message else{break};let Message::Text(text)=message else{if matches!(message,Message::Close(_)){break;}continue};let v:Value=serde_json::from_str(&text).unwrap();
+                                          observed.lock().unwrap().push(v.clone());
+                                          if let Some(id)=v["id"].as_str()&&v.get("method").is_none(){if let Some(reply)=pending.remove(id){let _=reply.send(v);}continue;}
+                                          let p=&v["params"];let runtime=p["runtime_id"].as_str().unwrap_or("").to_owned();
+                                          let result=match v["method"].as_str(){
+                                           Some("state.push")=>{socket.send(Message::Text(json!({"jsonrpc":"2.0","method":"sync.ack","params":{"cursor":p["seq"],"rejected":[]}}).to_string().into())).await.unwrap();continue;}
+                                           Some("command.receipt")=>json!({"command_id":p["command_id"],"receipt_revision":p["receipt_revision"]}),
+                                           Some("runtime.lost")=>{let mut result=p.clone();result["fenced"]=json!(true);result},
+                                           Some("session.cursor")=>{let(c,key)=cursors.entry(runtime).or_default();json!({"runtime_id":p["runtime_id"],"generation":p["generation"],"source_key":p["source_key"],"cursor":c,"last_event_key":key,"coverage":"complete"})},
+                                           Some("session.events")=>{let(c,key)=cursors.entry(runtime.clone()).or_default();for e in p["events"].as_array().unwrap(){let seq=e["sequence"].as_u64().unwrap();if seq<=*c{assert_eq!(retained.get(&(runtime.clone(),seq)),Some(e));}else{assert_eq!(seq,*c+1);retained.insert((runtime.clone(),seq),e.clone());*c=seq;*key=Some(e["key"].as_str().unwrap().into());}
+                    }json!({"runtime_id":p["runtime_id"],"generation":p["generation"],"source_key":p["source_key"],"cursor":c})},
+                                           _=>continue,
+                                          };
+                                          if let Some(id)=v.get("id")&& socket.send(Message::Text(json!({"jsonrpc":"2.0","id":id,"result":result}).to_string().into())).await.is_err(){break;}
+                                         }
+                                        }
                 }
             }
         });

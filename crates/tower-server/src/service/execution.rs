@@ -76,11 +76,9 @@ impl Service {
     pub(crate) fn execution_updates(
         &self,
         epoch: u64,
-        connection: String,
     ) -> std::result::Result<RuntimeUpdates, RpcError> {
         self.remote_actor(epoch)?;
-        self.execution_host()?
-            .updates(&self.execution_namespace()?, &connection)
+        self.execution_host()?.updates(&self.execution_namespace()?)
     }
     pub(crate) fn execution_reannounce(
         &self,
@@ -479,7 +477,7 @@ impl Service {
             }
             "acp.poll" => {
                 let frames = host
-                    .updates(&namespace, "local-acp")?
+                    .updates(&namespace)?
                     .acp_frames
                     .into_iter()
                     .filter(|f| f.runtime_id == b.runtime_id)
@@ -501,7 +499,7 @@ impl Service {
     ) -> std::result::Result<Value, RpcError> {
         let actor = self.remote_actor(epoch)?;
         require(&actor, "acp:control")?;
-        if !protocols.managed || !self.allgather_config.managed {
+        if !protocols.acp || !self.allgather_config.managed {
             return Err(app("acp_required", "Negotiate acp-proxy.v1"));
         }
         let p: serde_json::Value =

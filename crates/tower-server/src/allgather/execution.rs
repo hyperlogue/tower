@@ -22,7 +22,6 @@ pub(super) struct Publisher {
     counter: u64,
     pending: BTreeMap<String, Pending>,
     reconciled: HashSet<String>,
-    connection: String,
     fenced: HashSet<String>,
 }
 fn key(b: &RuntimeBinding) -> String {
@@ -82,14 +81,8 @@ impl Publisher {
         {
             return Err(invalid("Runtime publication acknowledgement timed out"));
         }
-        if self.connection.is_empty() {
-            let mut bytes = [0u8; 16];
-            getrandom::fill(&mut bytes).map_err(|_| invalid("Random source unavailable"))?;
-            self.connection = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        }
-        let connection = self.connection.clone();
         let updates = worker
-            .execute(move |s| s.execution_updates(epoch, connection))
+            .execute(move |s| s.execution_updates(epoch))
             .await??;
         let views: Vec<_> = worker
             .execute(move |s| s.execution_views(epoch))

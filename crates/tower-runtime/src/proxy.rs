@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader},
     sync::{mpsc, watch},
 };
 use tower_protocol::ExecutionResult;
@@ -255,76 +255,135 @@ pub(crate) fn spawn(
                 _ = stopped.changed() => return Err(error("acp_closed", "ACP connection closed before launch")),
                 result = ctx.authority.check(&b, &command) => result?,
             }
-            if *stopped.borrow() { return Err(error("acp_closed", "ACP connection closed before launch")); }
+            if *stopped.borrow() {
+                return Err(error("acp_closed", "ACP connection closed before launch"));
+            }
             ctx.journal.begin_dispatch(&b, &command.command_id)?;
             let mut env = tower_pal::environment();
-            for key in ["TOWER_BEARER_TOKEN", "CLAUDE_CODE_SESSION_ID", "CODEX_THREAD_ID", "CODEX_SESSION_ID", "CLAUDECODE"] { env.remove(key); }
-            let token = tower_pal::read_private(&ctx.paths.token_path(&b.tower_session_id).map_err(internal)?).map_err(internal)?;
+            for key in [
+                "TOWER_BEARER_TOKEN",
+                "CLAUDE_CODE_SESSION_ID",
+                "CODEX_THREAD_ID",
+                "CODEX_SESSION_ID",
+                "CLAUDECODE",
+            ] {
+                env.remove(key);
+            }
+            let token_path = ctx.paths.token_path(&b.tower_session_id).map_err(internal)?;
+            let token = tower_pal::read_private(&token_path).map_err(internal)?;
             env.insert("TOWER_AGENT_ID".into(), b.tower_session_id.clone());
-            env.insert("TOWER_AGENT_TOKEN".into(), String::from_utf8(token).map_err(internal)?);
-            env.insert("TOWER_SOCKET".into(), ctx.paths.socket.to_string_lossy().into_owned());
-            let mut child = tower_pal::spawn_protocol(&argv, &env, std::path::Path::new(&b.cwd)).map_err(internal)?;
+            env.insert(
+                "TOWER_AGENT_TOKEN".into(),
+                String::from_utf8(token).map_err(internal)?,
+            );
+            env.insert(
+                "TOWER_SOCKET".into(),
+                ctx.paths.socket.to_string_lossy().into_owned(),
+            );
+            let mut child = tower_pal::spawn_protocol(&argv, &env, std::path::Path::new(&b.cwd))
+                .map_err(internal)?;
             launched = true;
-            let identity = tower_pal::process_identity(child.id().ok_or_else(|| error("acp_closed", "ACP process has no identity"))?).map_err(internal)?;
+            let pid = child.id().ok_or_else(|| error("acp_closed", "ACP process has no identity"))?;
+            let identity = tower_pal::process_identity(pid).map_err(internal)?;
             struct Group(tower_pal::ProcessIdentity);
-            impl Drop for Group { fn drop(&mut self) { let _ = tower_pal::kill_protocol_group(self.0); } }
+            impl Drop for Group {
+                fn drop(&mut self) {
+                    let _ = tower_pal::kill_protocol_group(self.0);
+                }
+            }
             let _group = Group(identity);
-            let mut metadata = json!({"pid":identity.pid,"pid_start_time":identity.start_time,"boot_id":tower_pal::boot_id().map_err(internal)?,"transport":"acp-proxy.v1"});
+            let mut metadata = json!({
+                "pid": identity.pid,
+                "pid_start_time": identity.start_time,
+                "boot_id": tower_pal::boot_id().map_err(internal)?,
+                "transport": "acp-proxy.v1",
+            });
             ctx.journal.update_metadata(&b, "starting", &metadata)?;
-            let receipt = ctx.journal.finish_dispatch(&b, &command.command_id, true, Some(ExecutionResult { tower_session_id:Some(b.tower_session_id.clone()),owner_id:Some(b.owner_id.clone()),..Default::default() }), None)?;
-            ctx.journal.acknowledge_receipt(&b.namespace(), &command.command_id, receipt.receipt_revision)?;
-            let mut stdin = child.stdin.take().ok_or_else(|| error("acp_closed", "ACP stdin missing"))?;
-            let mut stdout = BufReader::new(child.stdout.take().ok_or_else(|| error("acp_closed", "ACP stdout missing"))?);
+            let receipt = ctx.journal.finish_dispatch(
+                &b,
+                &command.command_id,
+                true,
+                Some(ExecutionResult {
+                    tower_session_id: Some(b.tower_session_id.clone()),
+                    owner_id: Some(b.owner_id.clone()),
+                    ..Default::default()
+                }),
+                None,
+            )?;
+            ctx.journal.acknowledge_receipt(
+                &b.namespace(), &command.command_id, receipt.receipt_revision,
+            )?;
+            let mut stdin = child.stdin.take()
+                .ok_or_else(|| error("acp_closed", "ACP stdin missing"))?;
+            let stdout = child.stdout.take()
+                .ok_or_else(|| error("acp_closed", "ACP stdout missing"))?;
+            let mut stdout = BufReader::new(stdout);
             let observer = Mutex::new(Observer::default());
             let observe = |frame: &str, client: bool| -> Result<()> {
-                if let Some((state, session)) = observer.lock().map_err(internal)?.observe(frame, client) {
+                let observed = observer.lock().map_err(internal)?.observe(frame, client);
+                if let Some((state, session)) = observed {
                     let mut m = metadata.clone();
-                    if let Some(id) = session { m["acp_session_id"] = json!(id); }
+                    if let Some(id) = session {
+                        m["acp_session_id"] = json!(id);
+                    }
                     ctx.journal.update_metadata(&b, state, &m)?;
+                }
+                Ok(())
+            };
+            let incoming = async {
+                while let Some(frame) = input.recv().await {
+                    ctx.authority.check(&b, &command).await?;
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        stdin.write_all(frame.as_bytes()).await?;
+                        stdin.write_all(b"\n").await?;
+                        stdin.flush().await
+                    })
+                    .await
+                    .map_err(|_| error("acp_closed", "ACP write timed out"))?
+                    .map_err(internal)?;
+                    let _ = observe(&frame, true);
+                }
+                Ok(())
+            };
+            let outgoing = async {
+                let mut sequence = 0;
+                while let Some(frame) = read_frame(&mut stdout).await? {
+                    let _ = observe(&frame, false);
+                    sequence += 1;
+                    output.send((sequence, frame)).await.map_err(internal)?;
+                    tower_store::touch();
                 }
                 Ok(())
             };
             let outcome: Result<()> = tokio::select! {
                 biased;
                 _ = stopped.changed() => Ok(()),
-                result = async {
-                    while let Some(frame) = input.recv().await {
-                        ctx.authority.check(&b, &command).await?;
-                        tokio::time::timeout(Duration::from_secs(5), async { stdin.write_all(frame.as_bytes()).await?; stdin.write_all(b"\n").await?; stdin.flush().await }).await.map_err(|_| error("acp_closed", "ACP write timed out"))?.map_err(internal)?;
-                        let _ = observe(&frame, true);
-                    }
-                    Ok(())
-                } => result,
-                result = async {
-                    let mut sequence = 0;
-                    loop {
-                        let mut bytes = Vec::new();
-                        loop {
-                            let available = stdout.fill_buf().await.map_err(internal)?;
-                            if available.is_empty() { return if bytes.is_empty() { Ok(()) } else { Err(error("acp_closed", "Truncated ACP frame")) }; }
-                            let n = available.iter().position(|b| *b == b'\n').map_or(available.len(), |n| n+1);
-                            if bytes.len() + n > FRAME_LIMIT + 1 { return Err(error("frame_too_large", "ACP output exceeds frame limit")); }
-                            let done = available[n-1] == b'\n';
-                            bytes.extend_from_slice(&available[..n]); stdout.consume(n);
-                            if done { bytes.pop(); break; }
-                        }
-                        let frame = String::from_utf8(bytes).map_err(internal)?;
-                        let _ = observe(&frame, false);
-                        sequence += 1;
-                        output.send((sequence, frame)).await.map_err(internal)?;
-                        tower_store::touch();
-                    }
-                } => result,
+                result = incoming => result,
+                result = outgoing => result,
             };
             let _ = tower_pal::kill_protocol_group(identity);
-            let _ = tokio::time::timeout(Duration::from_secs(5),child.wait()).await;
+            let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
             let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
-            while !tower_pal::protocol_group_terminated(identity).unwrap_or(false) && tokio::time::Instant::now() < deadline {
+            while !tower_pal::protocol_group_terminated(identity).unwrap_or(false)
+                && tokio::time::Instant::now() < deadline
+            {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             metadata = ctx.journal.metadata(&b).unwrap_or(metadata);
             let _ = ctx.journal.update_metadata(&b, "ended", &metadata);
-            ctx.journal.fence(&b, if outcome.is_ok() { "acp_closed" } else { "acp_transport_error" }, if tower_pal::protocol_group_terminated(identity).unwrap_or(false) { "confirmed" } else { "unknown" })?;
+            ctx.journal.fence(
+                &b,
+                if outcome.is_ok() {
+                    "acp_closed"
+                } else {
+                    "acp_transport_error"
+                },
+                if tower_pal::protocol_group_terminated(identity).unwrap_or(false) {
+                    "confirmed"
+                } else {
+                    "unknown"
+                },
+            )?;
             outcome
         }.await;
         if let Err(e) = result {
@@ -336,6 +395,34 @@ pub(crate) fn spawn(
         }
     });
     proxy
+}
+
+async fn read_frame(reader: &mut (impl AsyncBufRead + Unpin)) -> Result<Option<String>> {
+    let mut bytes = Vec::new();
+    loop {
+        let available = reader.fill_buf().await.map_err(internal)?;
+        if available.is_empty() {
+            return if bytes.is_empty() {
+                Ok(None)
+            } else {
+                Err(error("acp_closed", "Truncated ACP frame"))
+            };
+        }
+        let n = available
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(available.len(), |n| n + 1);
+        if bytes.len() + n > FRAME_LIMIT + 1 {
+            return Err(error("frame_too_large", "ACP output exceeds frame limit"));
+        }
+        let done = available[n - 1] == b'\n';
+        bytes.extend_from_slice(&available[..n]);
+        reader.consume(n);
+        if done {
+            bytes.pop();
+            return String::from_utf8(bytes).map(Some).map_err(internal);
+        }
+    }
 }
 
 #[cfg(test)]

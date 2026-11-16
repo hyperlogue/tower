@@ -20,13 +20,6 @@ pub fn spawn_protocol(argv: &[String], env: &Environment, cwd: &Path) -> io::Res
         .process_group(0)
         .spawn()
 }
-pub fn spawn_protocol_child(argv: &[String], env: &Environment, cwd: &Path) -> io::Result<Child> {
-    command(argv, env, cwd)?
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-}
 pub fn kill_protocol_group(identity: crate::ProcessIdentity) -> io::Result<()> {
     let current = crate::process_incarnation(identity.pid)?;
     if current.start_time != identity.start_time {

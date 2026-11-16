@@ -81,7 +81,7 @@ fn starts(f: &Fixture) -> usize {
 async fn terminal_launch_attaches_and_recovers_without_replay_or_structured_controls() {
     let f = Fixture::new();
     install_pi(&f);
-    let s = Server::start_modes(&f, false, true).await;
+    let s = Server::start(&f).await;
     let denied = command(
         "no-consent",
         "no-consent",
@@ -243,7 +243,7 @@ async fn terminal_launch_attaches_and_recovers_without_replay_or_structured_cont
 async fn terminal_pool_loss_fences_a_session_that_cannot_resume() {
     let f = Fixture::new();
     install_pi(&f);
-    let s = Server::start_modes(&f, false, true).await;
+    let s = Server::start(&f).await;
     consent(&f);
     let (launch_command, id) = launch(&f, &s, "pool-loss", "pi").await;
     // Lose the pool only once the agent inside it is running.
@@ -283,7 +283,7 @@ async fn terminal_pool_loss_fences_a_session_that_cannot_resume() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn terminal_codex_stop_preserves_the_other_shared_host_thread() {
     let f = Fixture::new();
-    let s = Server::start_modes(&f, false, true).await;
+    let s = Server::start(&f).await;
     consent(&f);
     let (_, first) = launch(&f, &s, "codex-first", "codex").await;
     let (_, second) = launch(&f, &s, "codex-second", "codex").await;
@@ -338,7 +338,7 @@ cat
     )
     .unwrap();
     tower_pal::make_executable(&script).unwrap();
-    let s = Server::start_modes(&f, false, true).await;
+    let s = Server::start(&f).await;
     consent(&f);
     let (_, id) = launch(&f, &s, "pool-upgrade", "opencode").await;
     let record = |f: &Fixture| f.rpc("agent.get", json!({"id":id}));

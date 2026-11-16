@@ -17,6 +17,7 @@ pub struct RuntimeBinding {
     pub protocol: String,
     pub harness: String,
     pub cwd: String,
+    // Retain this field when comparing and fencing persisted managed-runtime bindings.
     pub resume_session_id: Option<String>,
 }
 impl RuntimeBinding {
@@ -115,7 +116,7 @@ pub trait ExecutionHost: Send + Sync {
     ) -> Result<ExecutionReceipt>;
     fn status(&self, namespace: &str, command: &ExecutionStatus) -> Result<ExecutionReceipt>;
     fn list(&self, namespace: Option<&str>) -> Result<Vec<RuntimeView>>;
-    fn updates(&self, namespace: &str, connection: &str) -> Result<RuntimeUpdates>;
+    fn updates(&self, namespace: &str) -> Result<RuntimeUpdates>;
     fn batch(&self, binding: &RuntimeBinding) -> Result<Option<RuntimeEvents>>;
     fn cursor(&self, binding: &RuntimeBinding) -> Result<RuntimeCursor>;
     fn reannounce(&self, binding: &RuntimeBinding) -> Result<()>;

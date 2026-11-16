@@ -402,7 +402,7 @@ fn old_allgather_connections_cannot_act_after_enrollment_rotation() {
             &request,
             old,
             crate::allgather::ExecutionProtocols {
-                managed: true,
+                acp: true,
                 terminal: false,
             }
         )
@@ -416,7 +416,7 @@ fn old_allgather_connections_cannot_act_after_enrollment_rotation() {
         &request,
         new,
         crate::allgather::ExecutionProtocols {
-            managed: true,
+            acp: true,
             terminal: false,
         },
     )
@@ -534,7 +534,7 @@ fn allgather_cannot_administer_local_state_even_with_admin_scope() {
                     &request,
                     epoch,
                     crate::allgather::ExecutionProtocols {
-                        managed: true,
+                        acp: true,
                         terminal: false,
                     }
                 )

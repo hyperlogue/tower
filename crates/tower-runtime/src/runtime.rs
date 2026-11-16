@@ -372,10 +372,7 @@ impl ExecutionHost for Runtime {
     fn list(&self, namespace: Option<&str>) -> Result<Vec<RuntimeView>> {
         self.journal.views(namespace)
     }
-    fn updates(&self, namespace: &str, connection: &str) -> Result<RuntimeUpdates> {
-        if !crate::identifier(connection) {
-            return Err(error("invalid_params", "Connection identity required"));
-        }
+    fn updates(&self, namespace: &str) -> Result<RuntimeUpdates> {
         let receipts = self.journal.receipt_updates(namespace)?;
         let mut acp_frames = Vec::new();
         let proxies = self.proxies.lock().map_err(internal)?;

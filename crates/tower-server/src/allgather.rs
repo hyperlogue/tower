@@ -14,7 +14,7 @@ use tower_protocol::{AllgatherHelloAck, PolicyPush, Request, Response, ResponseB
 
 #[derive(Clone, Copy)]
 pub(crate) struct ExecutionProtocols {
-    pub managed: bool,
+    pub acp: bool,
     pub terminal: bool,
 }
 impl ExecutionProtocols {
@@ -22,7 +22,7 @@ impl ExecutionProtocols {
         if protocol == "terminal" {
             self.terminal
         } else {
-            self.managed
+            self.acp
         }
     }
 }
@@ -411,7 +411,7 @@ async fn connection(
         .capabilities
         .iter()
         .any(|c| c == "session-status-delta.v1");
-    let managed_enabled = hello.capabilities.iter().any(|c| c == "acp-proxy.v1")
+    let acp_enabled = hello.capabilities.iter().any(|c| c == "acp-proxy.v1")
         && ack.capabilities.iter().any(|c| c == "acp-proxy.v1")
         && config.permits_scope("acp:control");
     let terminal_enabled = [
@@ -422,7 +422,7 @@ async fn connection(
     .iter()
     .all(|c| hello.capabilities.iter().any(|v| v == c) && ack.capabilities.iter().any(|v| v == c));
     let protocols = ExecutionProtocols {
-        managed: managed_enabled,
+        acp: acp_enabled,
         terminal: terminal_enabled,
     };
     let mut catalog = catalog::Sync::new(&hello.capabilities, &ack.capabilities);
@@ -455,9 +455,9 @@ async fn connection(
             if let Some(frame) = catalog.prepare(&worker, epoch).await? {
                 write(&mut socket, &frame).await?;
             }
-            if managed_enabled || terminal_enabled {
+            if acp_enabled || terminal_enabled {
                 for frame in execution
-                    .prepare(&worker, epoch, [managed_enabled, terminal_enabled])
+                    .prepare(&worker, epoch, [acp_enabled, terminal_enabled])
                     .await?
                 {
                     write(&mut socket, &frame).await?;
@@ -493,7 +493,7 @@ async fn connection(
                         worker.execute(move|s|s.check_remote(epoch)).await??;
                         let frame:Value=serde_json::from_str(&text)?;
                         if frame.get("method").is_none() {
-                            if managed_enabled || terminal_enabled {execution.response(frame,&worker,epoch).await?;}
+                            if acp_enabled || terminal_enabled {execution.response(frame,&worker,epoch).await?;}
                             continue;
                         }
                         let mut request:Request=serde_json::from_value(frame)?;
@@ -560,7 +560,7 @@ async fn connection(
                             },
                             "sync.resync"=>{publisher.resync();pending_since=None;previous_cursor=None;reply(&mut socket,request.id,Ok(public(json!({"scheduled":true}))?)).await?;continue;}
                             "health"=>request.method="daemon.info".into(),
-                            "command.execute"|"command.status" if !managed_enabled && !terminal_enabled=>{reply(&mut socket,request.id,Err(tower_protocol::RpcError::application("unsupported","Managed execution was not negotiated"))).await?;continue;}
+                            "command.execute"|"command.status" if !acp_enabled && !terminal_enabled=>{reply(&mut socket,request.id,Err(tower_protocol::RpcError::application("unsupported","Managed execution was not negotiated"))).await?;continue;}
                             _=>{},
                         }
                         if replies.len()>=32 {
