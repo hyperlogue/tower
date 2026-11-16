@@ -233,3 +233,11 @@ async fn final_native_output_is_forwarded_before_process_exit_closes_the_proxy()
             .success()
     );
 }
+
+#[tokio::test]
+async fn an_open_connection_can_be_closed_without_initializing_an_agent_session() {
+    let f = Fixture::new();
+    let opened = f.rpc("acp.open", json!({"harness":"fixture","cwd":f.root.path()}));
+    assert_eq!(f.rpc("acp.close", opened.clone())["closed"], true);
+    assert_eq!(f.rpc("acp.close", opened)["closed"], true);
+}

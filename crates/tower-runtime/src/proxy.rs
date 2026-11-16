@@ -249,8 +249,13 @@ pub(crate) fn spawn(
         closed_at: Mutex::new(None),
     });
     tokio::spawn(async move {
+        let mut launched = false;
         let result: Result<()> = async {
-            ctx.authority.check(&b, &command).await?;
+            tokio::select! {
+                biased;
+                _ = stopped.changed() => return Err(error("acp_closed", "ACP connection closed before launch")),
+                result = ctx.authority.check(&b, &command) => result?,
+            }
             if *stopped.borrow() { return Err(error("acp_closed", "ACP connection closed before launch")); }
             ctx.journal.begin_dispatch(&b, &command.command_id)?;
             let mut env = tower_pal::environment();
@@ -260,6 +265,7 @@ pub(crate) fn spawn(
             env.insert("TOWER_AGENT_TOKEN".into(), String::from_utf8(token).map_err(internal)?);
             env.insert("TOWER_SOCKET".into(), ctx.paths.socket.to_string_lossy().into_owned());
             let mut child = tower_pal::spawn_protocol(&argv, &env, std::path::Path::new(&b.cwd)).map_err(internal)?;
+            launched = true;
             let identity = tower_pal::process_identity(child.id().ok_or_else(|| error("acp_closed", "ACP process has no identity"))?).map_err(internal)?;
             struct Group(tower_pal::ProcessIdentity);
             impl Drop for Group { fn drop(&mut self) { let _ = tower_pal::kill_protocol_group(self.0); } }
@@ -323,7 +329,11 @@ pub(crate) fn spawn(
             outcome
         }.await;
         if let Err(e) = result {
-            let _ = ctx.journal.fence(&b, &e.data.code, "unknown");
+            let _ = ctx.journal.fence(
+                &b,
+                &e.data.code,
+                if launched { "unknown" } else { "confirmed" },
+            );
         }
     });
     proxy
