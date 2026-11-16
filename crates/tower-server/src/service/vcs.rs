@@ -458,7 +458,7 @@ mod tests {
                         status: status.into(),
                         pid: None,
                         pid_start_time: None,
-                        caps: Capabilities::unavailable("structured_control_required"),
+                        caps: Capabilities::unavailable("protocol_control_required"),
                         terminal: None,
                         recovery_pending: false,
                         metadata: Default::default(),

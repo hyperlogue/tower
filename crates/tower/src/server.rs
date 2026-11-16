@@ -49,7 +49,7 @@ fn execute(command: Command) -> Result<()> {
                                 terminal,
                                 execution.clone(),
                             )),
-                            Arc::new(tower_runtime::Backend::new(execution.clone(), "acp")),
+                            Arc::new(tower_runtime::Backend::new(execution.clone())),
                         ],
                     )?
                     .with_execution(execution)

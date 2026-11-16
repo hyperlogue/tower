@@ -25,9 +25,6 @@ pub(crate) fn channels() -> (
     let (control, c) = mpsc::channel(16);
     (Arc::new(Handle { normal, control }), n, c)
 }
-pub(crate) fn cleanup_command(c: &ExecutionCommand) -> bool {
-    c.kind == "cancel"
-}
 #[derive(Clone)]
 pub(crate) struct Context {
     pub paths: tower_pal::Paths,

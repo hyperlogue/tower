@@ -26,7 +26,7 @@ impl Fixture {
             serde_json::to_string(&[node.to_string_lossy(), agent.to_string_lossy()]).unwrap();
         std::fs::write(
             config.join("config.toml"),
-            format!("[scan]\nenabled=false\n[acp.agents]\nfixture={argv}\n"),
+            format!("[scan]\nenabled=false\n[acp.agents]\nfixture={argv}\ncodex={argv}\n"),
         )
         .unwrap();
         Self { root }
@@ -345,4 +345,27 @@ async fn socket_disconnect_closes_an_uninitialized_connection_after_policy_chang
     f.rpc("rules.replace", json!({"rules":[{"id":"deny","kind":"session","from":"*","to":"*","action":"deny","created_by":"fixture","created_at":1}]}));
     drop(owner);
     f.status(id, "exited").await;
+}
+
+#[tokio::test]
+async fn acp_catalog_and_sessions_do_not_advertise_managed_codex_controls() {
+    let f = Fixture::new();
+    let harnesses = f.rpc("harness.list", json!({}));
+    let codex = harnesses
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["harness"] == "codex" && h["protocol"] == "acp")
+        .unwrap();
+    assert_eq!(codex["resume"], false);
+    assert_eq!(codex["modes"], json!([]));
+    assert_eq!(
+        codex["executable"],
+        json!(tower_pal::find_program("node", &tower_pal::environment()).unwrap())
+    );
+    let opened = f.rpc("acp.open", json!({"harness":"codex","cwd":f.root.path()}));
+    let record = f.rpc("agent.get", json!({"id":opened["tower_session_id"]}));
+    assert!(record["mode"].is_null());
+    assert_eq!(record["caps"]["resume"], false);
+    f.rpc("acp.close", opened);
 }

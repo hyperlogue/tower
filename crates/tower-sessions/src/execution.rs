@@ -67,10 +67,6 @@ pub use tower_protocol::HarnessControls;
 pub struct Authorization {
     pub binding: RuntimeBinding,
     pub command_id: String,
-    pub kind: String,
-    /// Cancelling or declining work, which needs no policy approval.
-    pub cleanup: bool,
-    pub target: Option<RuntimeBinding>,
 }
 pub type Future<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>;
 /// Checks current policy just before dispatch; supplied by the server.
@@ -78,7 +74,7 @@ pub type Authorize = std::sync::Arc<dyn Fn(Authorization) -> Future<Result<()>> 
 pub trait ExecutionHost: Send + Sync {
     /// Called once at startup, before any command is executed.
     fn bind(&self, _authorize: Authorize) {}
-    /// Suspends runtime owners before the server exits; native sessions may remain live.
+    /// Closes ACP processes before shutdown; pooled terminal sessions may remain live.
     fn shutdown(&self) -> Future<()> {
         Box::pin(async {})
     }

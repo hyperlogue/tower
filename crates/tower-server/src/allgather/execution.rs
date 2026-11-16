@@ -22,7 +22,6 @@ pub(super) struct Publisher {
     counter: u64,
     pending: BTreeMap<String, Pending>,
     reconciled: HashSet<String>,
-    ready: HashSet<String>,
     connection: String,
     fenced: HashSet<String>,
 }
@@ -263,48 +262,18 @@ impl Publisher {
                     .last()
                     .filter(|e| e.sequence == cursor)
                     .ok_or_else(|| invalid("Event ACK did not commit the complete batch"))?;
-                let ready = batch.events.iter().any(|event| {
-                    if event.kind != "runtime_state" {
-                        return false;
-                    }
-                    let Ok(p) = serde_json::to_value(&event.payload) else {
-                        return false;
-                    };
-                    p["owner_id"] == b.owner_id
-                        && p["tower_session_id"] == b.tower_session_id
-                        && matches!(p["state"].as_str(), Some("idle" | "running" | "waiting"))
-                        && (b.protocol == "terminal"
-                            || p[if b.protocol == "acp" {
-                                "acp_session_id"
-                            } else {
-                                "native_session_id"
-                            }]
-                            .as_str()
-                            .is_some_and(|id| !id.is_empty()))
-                });
-                let runtime_key = key(&b);
                 let ack = RuntimeCursor {
                     runtime_id: b.runtime_id,
                     generation: b.generation.clone(),
                     source_key: b.generation,
                     cursor,
                     last_event_key: Some(event.key.clone()),
-                    coverage: if b.protocol == "terminal"
-                        || batch.events.iter().any(|e| e.kind == "gap")
-                    {
-                        "partial"
-                    } else {
-                        "complete"
-                    }
-                    .into(),
+                    coverage: "partial".into(),
                 };
                 let value = public(serde_json::to_value(ack)?)?;
                 worker
                     .execute(move |s| s.execution_ack("events".into(), value, epoch))
                     .await??;
-                if ready {
-                    self.ready.insert(runtime_key);
-                }
             }
             Item::Receipt(receipt) => {
                 if r["command_id"] != receipt.command_id

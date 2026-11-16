@@ -30,23 +30,22 @@ impl Default for Configuration {
     }
 }
 impl Configuration {
-    pub fn available(&self) -> BTreeMap<String, tower_protocol::HarnessControls> {
+    pub fn harnesses(&self) -> Vec<tower_protocol::HarnessInfo> {
         let env = tower_pal::environment();
         self.agents
             .iter()
-            .filter(|(_, argv)| {
-                argv.first()
-                    .is_some_and(|bin| tower_pal::find_program(bin, &env).is_some())
-            })
-            .map(|(name, _)| {
-                (
-                    name.clone(),
-                    tower_protocol::HarnessControls {
-                        protocol: "acp".into(),
-                        capabilities: vec![],
-                        cancel_mode: Some("runtime".into()),
-                    },
-                )
+            .filter_map(|(name, argv)| {
+                let executable = argv.first()?;
+                tower_pal::find_program(executable, &env)?;
+                Some(tower_protocol::HarnessInfo {
+                    harness: name.clone(),
+                    label: name.clone(),
+                    protocol: "acp".into(),
+                    executable: executable.clone(),
+                    available: true,
+                    modes: vec![],
+                    resume: false,
+                })
             })
             .collect()
     }

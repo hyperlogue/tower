@@ -161,12 +161,6 @@ impl Service {
                 "Runtime binding is no longer current",
             ));
         }
-        let cleanup = stored.protocol != "terminal"
-            && p.cleanup
-            && matches!(p.kind.as_str(), "cancel" | "reply");
-        if cleanup {
-            return Ok(());
-        }
         let actor = if stored.origin == "local" {
             Actor::Human
         } else {
@@ -185,31 +179,6 @@ impl Service {
             }
             actor
         };
-        if let Some(target) = &p.target {
-            if target.namespace() != stored.namespace()
-                || target.session_id != stored.session_id
-                || target.tower_session_id != stored.tower_session_id
-                || target.protocol != stored.protocol
-                || target.harness != stored.harness
-            {
-                return Err(app(
-                    "cleanup_target_conflict",
-                    "Cleanup target does not belong to this execution",
-                ));
-            }
-            let cwd = self
-                .paths
-                .display_cwd(&target.cwd)
-                .map_err(|_| invalid("Invalid cleanup directory"))?;
-            self.session_policy(
-                &actor,
-                crate::policy::Subject {
-                    id: &target.tower_session_id,
-                    harness: Some(&target.harness),
-                    cwd: Some(&cwd),
-                },
-            )?;
-        }
         let cwd = self
             .paths
             .display_cwd(&stored.cwd)
@@ -658,7 +627,7 @@ impl Service {
                 tower_pal::write_private(&path, token.0.as_bytes())
                     .map_err(|_| app("internal_error", "Cannot persist session credential"))?;
                 let now = now_ms();
-                let mut caps = Capabilities::unavailable("structured_control_required");
+                let mut caps = Capabilities::unavailable("protocol_control_required");
                 caps.kill = true;
                 let record = AgentRecord {
                     checkout_id: None,

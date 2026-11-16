@@ -7,14 +7,10 @@ use tower_sessions::{
 };
 pub struct Backend {
     runtime: Arc<Runtime>,
-    protocol: String,
 }
 impl Backend {
-    pub fn new(runtime: Arc<Runtime>, protocol: &str) -> Self {
-        Self {
-            runtime,
-            protocol: protocol.into(),
-        }
+    pub fn new(runtime: Arc<Runtime>) -> Self {
+        Self { runtime }
     }
 }
 fn decode<T: serde::de::DeserializeOwned>(v: &Value) -> Result<T> {
@@ -23,10 +19,9 @@ fn decode<T: serde::de::DeserializeOwned>(v: &Value) -> Result<T> {
 fn public(v: impl serde::Serialize) -> Result<Value> {
     serde_json::from_value(serde_json::to_value(v).map_err(internal)?).map_err(internal)
 }
-pub fn capabilities(active: bool, _resume: bool) -> Capabilities {
-    let mut caps = Capabilities::unavailable("structured_control_required");
+fn capabilities(active: bool) -> Capabilities {
+    let mut caps = Capabilities::unavailable("protocol_control_required");
     caps.kill = active;
-    caps.resume = false;
     caps
 }
 pub(crate) fn observation(v: &RuntimeView) -> Result<Observation> {
@@ -59,10 +54,7 @@ pub(crate) fn observation(v: &RuntimeView) -> Result<Observation> {
         status: status.into(),
         pid: m["pid"].as_u64().and_then(|v| u32::try_from(v).ok()),
         pid_start_time: m["pid_start_time"].as_u64(),
-        caps: capabilities(
-            !v.fenced,
-            native.is_some() && (!v.fenced || v.termination == "confirmed"),
-        ),
+        caps: capabilities(!v.fenced),
         terminal: None,
         recovery_pending: false,
         metadata: SessionMetadata {
@@ -76,7 +68,7 @@ pub(crate) fn observation(v: &RuntimeView) -> Result<Observation> {
 }
 impl ManagedBackend for Backend {
     fn protocol(&self) -> &str {
-        &self.protocol
+        "acp"
     }
     fn watch(&self, wake: std::sync::Arc<dyn Fn() + Send + Sync>) {
         let mut runtimes = tower_store::table_changes("runtimes");
@@ -87,26 +79,14 @@ impl ManagedBackend for Backend {
         });
     }
     fn harnesses(&self) -> Vec<tower_protocol::HarnessInfo> {
-        self.runtime
-            .controls()
-            .into_iter()
-            .filter(|(_, c)| c.protocol == self.protocol)
-            .map(|(h, c)| tower_protocol::HarnessInfo {
-                harness: h.clone(),
-                label: h.clone(),
-                protocol: c.protocol,
-                executable: h.clone(),
-                available: true,
-                modes: vec![],
-                resume: true,
-            })
-            .collect()
+        self.runtime.harnesses()
     }
+
     fn prepare(&self, id: &str, p: &SessionOpenParams) -> Result<PreparedSession> {
         if !p.args.is_empty() || p.resume.is_some() || p.mode.is_some() {
             return Err(error(
                 "unsupported",
-                "Structured runtimes use native configuration and known managed history",
+                "Configure and load sessions through native ACP frames",
             ));
         }
         let harness = tower_agents::Harness::parse(&p.harness)
@@ -116,7 +96,7 @@ impl ManagedBackend for Backend {
             .runtime
             .controls()
             .get(harness)
-            .is_none_or(|c| c.protocol != self.protocol)
+            .is_none_or(|c| c.protocol != "acp")
         {
             return Err(error(
                 "unsupported",
@@ -131,7 +111,7 @@ impl ManagedBackend for Backend {
             generation: random_id("generation_")?,
             tower_session_id: id.into(),
             owner_id: random_id("owner_")?,
-            protocol: self.protocol.clone(),
+            protocol: "acp".into(),
             harness: harness.into(),
             cwd: std::fs::canonicalize(&p.cwd)
                 .map_err(|_| error("invalid_params", "Working directory must exist"))?
@@ -145,12 +125,8 @@ impl ManagedBackend for Backend {
         let b: Binding = decode(&s.binding)?;
         let c = crate::command(
             &b,
-            if b.resume_session_id.is_some() {
-                "resume"
-            } else {
-                "launch"
-            },
-            serde_json::json!({"harness":b.harness,"cwd":b.cwd,"protocol":b.protocol,"generation":b.generation,"resume_session_id":b.resume_session_id}),
+            "launch",
+            serde_json::json!({"harness":b.harness,"cwd":b.cwd,"protocol":b.protocol,"generation":b.generation}),
         )?;
         self.runtime.execute(&b, &c)?;
         Ok(Observation {
@@ -159,7 +135,7 @@ impl ManagedBackend for Backend {
             status: "starting".into(),
             pid: None,
             pid_start_time: None,
-            caps: capabilities(true, false),
+            caps: capabilities(true),
             terminal: None,
             recovery_pending: false,
             metadata: Default::default(),
@@ -224,12 +200,8 @@ impl Backend {
             native_session_id: None,
             binding: public(&b)?,
             launch: public(&b)?,
-            mode: if b.harness == "codex" {
-                Some("app-server".into())
-            } else {
-                None
-            },
-            caps: capabilities(true, false),
+            mode: None,
+            caps: capabilities(true),
             terminal: None,
         })
     }

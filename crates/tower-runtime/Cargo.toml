@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
-description = "Durable structured agent runtimes and native protocol adapters."
+description = "ACP process proxy, terminal lifecycle, and execution journal."
 
 [lints]
 workspace = true

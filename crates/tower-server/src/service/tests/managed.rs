@@ -2,7 +2,7 @@ use super::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tower_sessions::{Backends, ManagedBackend, ManagedSession, Observation, PreparedSession};
 
-struct StructuredBackend {
+struct TestBackend {
     protocol: String,
     store: Arc<Store>,
     states: Mutex<BTreeMap<String, String>>,
@@ -11,7 +11,7 @@ struct StructuredBackend {
     injected_id: Mutex<Option<String>>,
     pool_restarts: AtomicUsize,
 }
-impl StructuredBackend {
+impl TestBackend {
     fn new(protocol: &str, store: Arc<Store>) -> Self {
         Self {
             protocol: protocol.into(),
@@ -40,7 +40,7 @@ impl StructuredBackend {
         }
     }
 }
-impl ManagedBackend for StructuredBackend {
+impl ManagedBackend for TestBackend {
     fn protocol(&self) -> &str {
         &self.protocol
     }
@@ -56,7 +56,7 @@ impl ManagedBackend for StructuredBackend {
             binding: value(
                 serde_json::json!({"conversation":format!("remote:{id}"),"private":"backend-private-data"}),
             )?,
-            launch: value(serde_json::json!({"structured":true}))?,
+            launch: value(serde_json::json!({"prepared":true}))?,
             mode: None,
             caps: self.observation(id, "starting").caps,
             terminal: None,
@@ -113,7 +113,7 @@ impl ManagedBackend for StructuredBackend {
         (self.protocol == "terminal").then_some(self)
     }
 }
-impl tower_sessions::terminal::TerminalAccess for StructuredBackend {
+impl tower_sessions::terminal::TerminalAccess for TestBackend {
     fn attach_info(&self, _: &ManagedSession) -> tower_sessions::Result<AttachInfo> {
         Err(app("unsupported", "test backend"))
     }
@@ -135,7 +135,7 @@ fn install(service: &mut Service, default: &str, drivers: Vec<Arc<dyn ManagedBac
     service.backends = Backends::new(default, drivers).unwrap();
 }
 fn open(s: &Service, protocol: Option<&str>) -> String {
-    let mut p = serde_json::json!({"harness":"structured-agent","cwd":"~/work"});
+    let mut p = serde_json::json!({"harness":"test-agent","cwd":"~/work"});
     if let Some(protocol) = protocol {
         p["protocol"] = protocol.into();
     }
@@ -145,9 +145,9 @@ fn open(s: &Service, protocol: Option<&str>) -> String {
         .into()
 }
 #[test]
-fn managed_structured_session_needs_no_process_or_terminal_and_recovers_its_binding() {
+fn managed_session_needs_no_process_or_terminal_and_recovers_its_binding() {
     let (_dir, store, mut s) = setup();
-    let backend = Arc::new(StructuredBackend::new("acp", store.clone()));
+    let backend = Arc::new(TestBackend::new("acp", store.clone()));
     install(&mut s, "acp", vec![backend.clone()]);
     let id = open(&s, None);
     // Reads return what was last observed; the backend's change report,
@@ -215,8 +215,8 @@ fn managed_structured_session_needs_no_process_or_terminal_and_recovers_its_bind
 #[test]
 fn reconciliation_is_scoped_to_the_backend_and_missing_backends_do_not_become_terminals() {
     let (_dir, store, mut s) = setup();
-    let a = Arc::new(StructuredBackend::new("acp", store.clone()));
-    let b = Arc::new(StructuredBackend::new("custom", store.clone()));
+    let a = Arc::new(TestBackend::new("acp", store.clone()));
+    let b = Arc::new(TestBackend::new("custom", store.clone()));
     install(&mut s, "acp", vec![a.clone(), b.clone()]);
     let a_id = open(&s, None);
     let b_id = open(&s, Some("custom"));
@@ -301,7 +301,7 @@ fn unmanaged_protocol_metadata_does_not_grant_management_or_terminal_capabilitie
 #[test]
 fn management_does_not_override_a_backends_stop_capability() {
     let (_dir, store, mut service) = setup();
-    let backend = Arc::new(StructuredBackend::new("acp", store.clone()));
+    let backend = Arc::new(TestBackend::new("acp", store.clone()));
     install(&mut service, "acp", vec![backend.clone()]);
     let id = open(&service, None);
     backend.allow_stop.store(false, Ordering::Relaxed);
@@ -323,7 +323,7 @@ fn management_does_not_override_a_backends_stop_capability() {
 #[test]
 fn pool_upgrade_can_require_idle_terminal_sessions() {
     let (_dir, store, mut s) = setup();
-    let terminal = Arc::new(StructuredBackend::new("terminal", store.clone()));
+    let terminal = Arc::new(TestBackend::new("terminal", store.clone()));
     install(&mut s, "terminal", vec![terminal.clone()]);
     let id = open(&s, None);
     let set = |state: &str| {
@@ -355,7 +355,7 @@ fn pool_upgrade_can_require_idle_terminal_sessions() {
 fn execution_authority_uses_the_replacement_binding_before_registry_refresh() {
     use tower_sessions::execution::{Authorization, RuntimeBinding};
     let (_dir, store, mut s) = setup();
-    let backend = Arc::new(StructuredBackend::new("acp", store.clone()));
+    let backend = Arc::new(TestBackend::new("acp", store.clone()));
     install(&mut s, "acp", vec![backend]);
     let id = open(&s, None);
     store.set_enrollment("allgather", None).unwrap();
@@ -373,9 +373,9 @@ fn execution_authority_uses_the_replacement_binding_before_registry_refresh() {
         tower_session_id: id.clone(),
         owner_id: "owner".into(),
         protocol: "acp".into(),
-        harness: "structured-agent".into(),
+        harness: "test-agent".into(),
         cwd: s.paths.home.join("new").to_string_lossy().into_owned(),
-        resume_session_id: Some("history".into()),
+        resume_session_id: None,
     };
     store
         .replace_managed(
@@ -393,10 +393,7 @@ fn execution_authority_uses_the_replacement_binding_before_registry_refresh() {
     assert_eq!(store.agent(&id).unwrap().record.cwd, "~/work");
     let request = Authorization {
         binding: b,
-        command_id: "resume".into(),
-        kind: "resume".into(),
-        cleanup: false,
-        target: None,
+        command_id: "launch".into(),
     };
     assert_eq!(
         s.authorize_execution(&request).unwrap_err().data.code,

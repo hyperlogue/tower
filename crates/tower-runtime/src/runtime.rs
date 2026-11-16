@@ -37,9 +37,6 @@ impl Authority {
         authorize(Authorization {
             binding: b.clone(),
             command_id: c.command_id.clone(),
-            kind: c.kind.clone(),
-            cleanup: engine::cleanup_command(c),
-            target: None,
         })
         .await
     }
@@ -95,7 +92,7 @@ impl Runtime {
             ));
         }
         let journal = Arc::new(Journal::new(database, limits)?);
-        let live = recover(&paths, &journal).await?;
+        let live = recover(&journal).await?;
         journal.compact()?;
         let (changed, terminal_changes) = tokio::sync::watch::channel(0u64);
         terminal.watch(Arc::new(move || {
@@ -115,7 +112,7 @@ impl Runtime {
         for binding in live {
             let (handle, normal, control) = engine::channels();
             runtime.owners()?.insert(key(&binding), handle.clone());
-            runtime.spawn(binding, handle, normal, control, engine::Start::Continue);
+            runtime.spawn(binding, normal, control, engine::Start::Continue);
         }
         let weak = Arc::downgrade(&runtime);
         runtime.tasks.spawn(async move {
@@ -140,6 +137,9 @@ impl Runtime {
             journal: self.journal.clone(),
             authority: self.authority.clone(),
         }
+    }
+    pub(crate) fn harnesses(&self) -> Vec<tower_protocol::HarnessInfo> {
+        self.acp.harnesses()
     }
     pub(crate) fn paths(&self) -> &tower_pal::Paths {
         &self.paths
@@ -183,13 +183,12 @@ impl Runtime {
             .map_err(|_| error("runtime_capacity", "Runtime queue is full"))?;
         owners.insert(key(&b), handle.clone());
         drop(owners);
-        self.spawn(b, handle, normal, control, engine::Start::Launch);
+        self.spawn(b, normal, control, engine::Start::Launch);
         Ok(receipt)
     }
     fn spawn(
         &self,
         b: Binding,
-        _handle: Arc<engine::Handle>,
         normal: tokio::sync::mpsc::Receiver<ExecutionCommand>,
         control: tokio::sync::mpsc::Receiver<engine::Control>,
         start: engine::Start,
@@ -240,7 +239,19 @@ impl ExecutionHost for Runtime {
         self.journal.validate_new(b, c)
     }
     fn controls(&self) -> BTreeMap<String, HarnessControls> {
-        self.acp.available()
+        self.harnesses()
+            .into_iter()
+            .map(|h| {
+                (
+                    h.harness,
+                    HarnessControls {
+                        protocol: h.protocol,
+                        capabilities: vec![],
+                        cancel_mode: Some("runtime".into()),
+                    },
+                )
+            })
+            .collect()
     }
     fn acp_send(
         &self,
@@ -336,7 +347,7 @@ impl ExecutionHost for Runtime {
             }
         }
         let Some(handle) = self.owner(b)? else {
-            if !matches!(c.kind.as_str(), "launch" | "resume") {
+            if c.kind != "launch" {
                 return Err(error("runtime_lost", "Runtime owner is unavailable"));
             }
             return self.spawn_owner(b.clone(), c.clone());
@@ -347,26 +358,16 @@ impl ExecutionHost for Runtime {
                 "A terminal runtime already has a launch",
             ));
         }
-        if c.kind == "cancel" {
-            let permit = handle
-                .control
-                .clone()
-                .try_reserve_owned()
-                .map_err(|_| error("control_capacity", "Runtime control queue is full"))?;
-            let receipt = self.journal.admit(b, c)?;
-            permit.send(engine::Control::Command(c.clone()));
-            Ok(receipt)
-        } else {
-            let permit = handle
-                .normal
-                .clone()
-                .try_reserve_owned()
-                .map_err(|_| error("runtime_capacity", "Runtime command queue is full"))?;
-            let receipt = self.journal.admit(b, c)?;
-            permit.send(c.clone());
-            Ok(receipt)
-        }
+        let permit = handle
+            .control
+            .clone()
+            .try_reserve_owned()
+            .map_err(|_| error("control_capacity", "Runtime control queue is full"))?;
+        let receipt = self.journal.admit(b, c)?;
+        permit.send(engine::Control::Command(c.clone()));
+        Ok(receipt)
     }
+
     fn status(&self, ns: &str, c: &ExecutionStatus) -> Result<ExecutionReceipt> {
         self.journal.status(ns, c)
     }
@@ -550,7 +551,7 @@ impl ExecutionHost for Runtime {
 
 /// Settles generations left by a previous server and returns the live ones
 /// to continue: terminal generations whose pool sessions may still run.
-async fn recover(_paths: &tower_pal::Paths, journal: &Journal) -> Result<Vec<Binding>> {
+async fn recover(journal: &Journal) -> Result<Vec<Binding>> {
     let boot = tower_pal::boot_id().map_err(internal)?;
     let mut live = Vec::new();
     for binding in journal.bindings(None)? {
